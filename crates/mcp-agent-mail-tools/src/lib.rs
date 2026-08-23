@@ -2747,6 +2747,9 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Identity
     ("register_agent", clusters::IDENTITY),
     ("create_agent_identity", clusters::IDENTITY),
+    ("deregister_agent", clusters::IDENTITY),
+    ("retire_agent", clusters::IDENTITY),
+    ("unretire_agent", clusters::IDENTITY),
     ("whois", clusters::IDENTITY),
     ("resolve_pane_identity", clusters::IDENTITY),
     ("cleanup_pane_identities", clusters::IDENTITY),

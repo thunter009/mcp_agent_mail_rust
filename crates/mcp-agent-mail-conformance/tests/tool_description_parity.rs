@@ -408,6 +408,54 @@ fn tool_input_schemas_match_python_fixture() {
     }
 }
 
+#[test]
+fn send_message_auto_contact_uses_nullable_server_default_schema() {
+    fn assert_nullable_server_default(label: &str, schema: &Value) {
+        let property = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("auto_contact_if_blocked"))
+            .unwrap_or_else(|| panic!("{label}: missing auto_contact_if_blocked schema"));
+        assert_eq!(
+            property.get("default"),
+            Some(&Value::Null),
+            "{label}: omitted auto_contact_if_blocked must defer to server configuration"
+        );
+        let types: BTreeSet<&str> = property
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            types,
+            BTreeSet::from(["boolean", "null"]),
+            "{label}: auto_contact_if_blocked must accept boolean or null"
+        );
+        assert!(
+            !normalized_required(schema).contains("auto_contact_if_blocked"),
+            "{label}: auto_contact_if_blocked must remain optional"
+        );
+    }
+
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let rust_tools = get_rust_tools();
+    let rust_send = rust_tools
+        .iter()
+        .find(|tool| tool.name == "send_message")
+        .expect("Rust send_message tool");
+    assert_nullable_server_default("Rust schema", &rust_send.input_schema);
+
+    let fixture = load_fixture();
+    let python_send = fixture
+        .tools
+        .iter()
+        .find(|tool| tool.name == "send_message")
+        .expect("Python send_message fixture");
+    assert_nullable_server_default("Python fixture", &python_send.input_schema);
+}
+
 /// Verify the fixture itself is well-formed and non-empty.
 #[test]
 fn fixture_is_valid() {

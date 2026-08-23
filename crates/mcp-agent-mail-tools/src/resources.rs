@@ -761,6 +761,8 @@ pub struct AgentListEntry {
     pub task_description: String,
     pub inception_ts: Option<String>,
     pub last_active_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub project_id: i64,
     pub attachments_policy: String,
     pub unread_count: i64,
@@ -778,6 +780,7 @@ pub struct ProjectRef {
 pub struct AgentsListResponse {
     pub project: ProjectRef,
     pub agents: Vec<AgentListEntry>,
+    pub retired_agents: Vec<AgentListEntry>,
 }
 
 /// List agents in a project.
@@ -819,29 +822,42 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         unread_counts.insert(agent_id, count);
     }
 
+    let mut active_agents = Vec::new();
+    let mut retired_agents = Vec::new();
+    for agent in agents {
+        if agent.is_deregistered() {
+            continue;
+        }
+        let agent_id = agent.id.unwrap_or(0);
+        let retired_at = agent.retired_at.map(micros_to_iso);
+        let is_retired = retired_at.is_some();
+        let entry = AgentListEntry {
+            id: agent_id,
+            name: agent.name,
+            program: agent.program,
+            model: agent.model,
+            task_description: agent.task_description,
+            inception_ts: Some(micros_to_iso(agent.inception_ts)),
+            last_active_ts: Some(micros_to_iso(agent.last_active_ts)),
+            retired_at,
+            project_id: agent.project_id,
+            attachments_policy: agent.attachments_policy,
+            unread_count: *unread_counts.get(&agent_id).unwrap_or(&0),
+        };
+        if is_retired {
+            retired_agents.push(entry);
+        } else {
+            active_agents.push(entry);
+        }
+    }
+
     let response = AgentsListResponse {
         project: ProjectRef {
             slug: project.slug,
             human_key: project.human_key,
         },
-        agents: agents
-            .into_iter()
-            .map(|a| {
-                let agent_id = a.id.unwrap_or(0);
-                AgentListEntry {
-                    id: agent_id,
-                    name: a.name,
-                    program: a.program,
-                    model: a.model,
-                    task_description: a.task_description,
-                    inception_ts: Some(micros_to_iso(a.inception_ts)),
-                    last_active_ts: Some(micros_to_iso(a.last_active_ts)),
-                    project_id: a.project_id,
-                    attachments_policy: a.attachments_policy,
-                    unread_count: *unread_counts.get(&agent_id).unwrap_or(&0),
-                }
-            })
-            .collect(),
+        agents: active_agents,
+        retired_agents,
     };
 
     tracing::debug!("Listing agents in project {}", project_key);
@@ -1014,6 +1030,58 @@ fn build_tool_directory() -> ToolDirectory {
                     expected_frequency: "When minting fresh, short-lived identities.".to_string(),
                     required_capabilities: vec!["identity".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "New helper".to_string(), sample: "create_agent_identity(project_key='backend', name_hint='GreenCastle', program='codex', model='gpt5')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "deregister_agent".to_string(),
+                    summary: "Remove an agent from the active roster while preserving message history."
+                        .to_string(),
+                    use_when: "Ending an agent session without erasing its audit trail.".to_string(),
+                    related: vec![
+                        "register_agent".to_string(),
+                        "retire_agent".to_string(),
+                    ],
+                    expected_frequency: "At the end of short-lived automated sessions.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample {
+                        hint: "End session".to_string(),
+                        sample: "deregister_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string(),
+                    }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "retire_agent".to_string(),
+                    summary: "Mark an agent retired while preserving its profile and message history."
+                        .to_string(),
+                    use_when: "Temporarily preventing an identity from sending or receiving new mail."
+                        .to_string(),
+                    related: vec![
+                        "unretire_agent".to_string(),
+                        "deregister_agent".to_string(),
+                    ],
+                    expected_frequency: "Occasional identity lifecycle maintenance.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample {
+                        hint: "Pause identity".to_string(),
+                        sample: "retire_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string(),
+                    }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "unretire_agent".to_string(),
+                    summary: "Restore a retired agent so it can send and receive new mail again."
+                        .to_string(),
+                    use_when: "Resuming work with an intentionally retired identity.".to_string(),
+                    related: vec!["retire_agent".to_string(), "register_agent".to_string()],
+                    expected_frequency: "When a retired identity returns to active work.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample {
+                        hint: "Resume identity".to_string(),
+                        sample: "unretire_agent(project_key='backend', agent_name='BlueLake', registration_token='<token>')".to_string(),
+                    }],
                     capabilities: vec!["identity".to_string()],
                     complexity: "medium".to_string(),
                 },
@@ -5743,6 +5811,7 @@ mod resource_shape_tests {
                         Some("GreenCastle".to_string()),
                         Some("resource visibility regression".to_string()),
                         None,
+                        true,
                         None,
                         None,
                     )
@@ -5783,6 +5852,122 @@ mod resource_shape_tests {
                 );
                 assert_eq!(whois_created["id"], created_id);
                 assert_eq!(whois_created["name"], "GreenCastle");
+            });
+        });
+    }
+
+    #[test]
+    fn agents_resource_separates_retired_agents() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!("/tmp/resources-retired-{}", unique_suffix());
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure_project");
+                let created = parse_json(
+                    &crate::create_agent_identity(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("GreenCastle".to_string()),
+                        Some("retirement resource contract".to_string()),
+                        None,
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("create_agent_identity"),
+                );
+                let token = created["registration_token"]
+                    .as_str()
+                    .expect("registration token")
+                    .to_string();
+                crate::retire_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    Some(token),
+                    None,
+                )
+                .await
+                .expect("retire_agent");
+
+                let roster = parse_json(
+                    &agents_list(&ctx, project_key)
+                        .await
+                        .expect("agents resource"),
+                );
+                assert!(
+                    roster["agents"]
+                        .as_array()
+                        .expect("active agents")
+                        .iter()
+                        .all(|row| row["name"] != "GreenCastle")
+                );
+                let retired = roster["retired_agents"].as_array().expect("retired agents");
+                let row = retired
+                    .iter()
+                    .find(|row| row["name"] == "GreenCastle")
+                    .expect("retired agent");
+                assert!(row["retired_at"].as_str().is_some());
+            });
+        });
+    }
+
+    #[test]
+    fn agents_resource_omits_deregistered_agents_from_active_roster() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!("/tmp/resources-deregistered-{}", unique_suffix());
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure_project");
+                let created = parse_json(
+                    &crate::create_agent_identity(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("GreenCastle".to_string()),
+                        Some("deregistered resource contract".to_string()),
+                        None,
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("create_agent_identity"),
+                );
+                let token = created["registration_token"]
+                    .as_str()
+                    .expect("registration token")
+                    .to_string();
+                crate::deregister_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    Some(token),
+                    None,
+                )
+                .await
+                .expect("deregister_agent");
+
+                let roster = parse_json(
+                    &agents_list(&ctx, project_key)
+                        .await
+                        .expect("agents resource"),
+                );
+                assert!(
+                    roster["agents"]
+                        .as_array()
+                        .expect("active agents")
+                        .iter()
+                        .all(|row| row["name"] != "GreenCastle")
+                );
             });
         });
     }

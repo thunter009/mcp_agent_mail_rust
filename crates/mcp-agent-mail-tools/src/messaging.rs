@@ -266,6 +266,35 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
+fn agent_retired_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    let retired_at = agent.retired_at.map(micros_to_iso);
+    legacy_tool_error(
+        "AGENT_RETIRED",
+        format!(
+            "Agent '{}' is retired and no longer accepts new messages. \
+             Use unretire_agent to restore it first.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "retired_at": retired_at,
+        }),
+    )
+}
+
+fn agent_deregistered_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+    legacy_tool_error(
+        "AGENT_DEREGISTERED",
+        format!(
+            "Agent '{}' has been deregistered and can no longer send or receive new messages.",
+            agent.name
+        ),
+        false,
+        json!({ "agent_name": agent.name }),
+    )
+}
+
 /// Whether a failed auto-handshake attempt looks like transient engine/store
 /// contention (worth one bounded retry) rather than a policy or validation
 /// refusal that retrying cannot change. Under the fsqlite 0.3.4 registry
@@ -1137,6 +1166,13 @@ async fn push_recipient(
                 return Err(e);
             }
         };
+        if agent.is_deregistered() {
+            return Err(agent_deregistered_error(&agent));
+        }
+        if agent.retired_at.is_some() {
+            return Err(agent_retired_error(&agent));
+        }
+
         let key = agent.name.to_lowercase();
         recipient_map.insert(key, agent.clone());
         agent
@@ -1897,6 +1933,12 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    if sender.is_deregistered() {
+        return Err(agent_deregistered_error(&sender));
+    }
+    if sender.retired_at.is_some() {
+        return Err(agent_retired_error(&sender));
+    }
     let sender_id = sender.id.unwrap_or(0);
 
     // The opt-in fail-closed profile rejects missing/unavailable proof before
@@ -2898,6 +2940,12 @@ effective_free_bytes={free}"
         &project.human_key,
     )
     .await?;
+    if sender.is_deregistered() {
+        return Err(agent_deregistered_error(&sender));
+    }
+    if sender.retired_at.is_some() {
+        return Err(agent_retired_error(&sender));
+    }
     let sender_id = sender.id.unwrap_or(0);
 
     // ── Sender identity verification (issue #42; GH#237 fail-closed) ──

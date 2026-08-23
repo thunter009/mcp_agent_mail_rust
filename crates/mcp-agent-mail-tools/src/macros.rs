@@ -946,6 +946,7 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1090,6 +1091,7 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
             },
             thread: PreparedThread {
                 thread_id: "br-1".into(),
@@ -1276,6 +1278,7 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: vec![GrantedReservation {
@@ -1321,6 +1324,7 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1382,6 +1386,7 @@ mod tests {
                     .map(|s| (*s).to_string())
                     .collect(),
                 registration_token: None,
+                retired_at: None,
             },
             thread: PreparedThread {
                 thread_id: "nonexistent".into(),

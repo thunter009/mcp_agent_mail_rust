@@ -1578,6 +1578,8 @@ pub struct AgentResponse {
     pub task_description: String,
     pub inception_ts: String,
     pub last_active_ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub project_id: i64,
     pub attachments_policy: String,
     #[serde(default)]
@@ -1589,6 +1591,43 @@ pub struct AgentResponse {
     /// `sender_token` when sending messages to prove ownership of this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_token: Option<String>,
+}
+
+fn authenticate_lifecycle_agent(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    registration_token: Option<&str>,
+    pane_id: Option<&str>,
+    action: &str,
+) -> McpResult<()> {
+    let token_matches = registration_token.is_some_and(|provided| {
+        agent.registration_token.as_deref().is_some_and(|stored| {
+            mcp_agent_mail_core::setup::constant_time_str_eq(provided, stored)
+        })
+    });
+    let pane_matches = registration_token.is_none()
+        && mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+            &project.human_key,
+            pane_id,
+        )
+        .is_some_and(|resolved| resolved == agent.name);
+    if token_matches || pane_matches {
+        return Ok(());
+    }
+
+    Err(legacy_tool_error(
+        "AUTHENTICATION_REQUIRED",
+        format!(
+            "{action} requires registration_token for agent '{}', or a pane session bound to that agent.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "project_key": project.human_key,
+            "token_param": "registration_token",
+        }),
+    ))
 }
 
 /// Whois response with optional recent commits
@@ -2256,6 +2295,7 @@ Check that all parameters have valid values."
         task_description: row.task_description,
         inception_ts: micros_to_iso(row.inception_ts),
         last_active_ts: micros_to_iso(row.last_active_ts),
+        retired_at: row.retired_at.map(micros_to_iso),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
         reaper_exempt: row.reaper_exempt != 0,
@@ -2295,7 +2335,8 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed."
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.",
+    defaults(return_registration_token = true)
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -2305,6 +2346,7 @@ pub async fn create_agent_identity(
     name_hint: Option<String>,
     task_description: Option<String>,
     attachments_policy: Option<String>,
+    return_registration_token: bool,
     pane_id: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
@@ -2544,6 +2586,7 @@ Choose a different name (or omit the name to auto-generate one)."
         task_description: row.task_description,
         inception_ts: micros_to_iso(row.inception_ts),
         last_active_ts: micros_to_iso(row.last_active_ts),
+        retired_at: row.retired_at.map(micros_to_iso),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
         reaper_exempt: row.reaper_exempt != 0,
@@ -2551,11 +2594,156 @@ Choose a different name (or omit the name to auto-generate one)."
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        registration_token: Some(registration_token),
+        registration_token: return_registration_token.then_some(registration_token),
     };
 
+    let mut response = serde_json::to_value(response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
+    if !return_registration_token {
+        response["registration_token_returned"] = json!(false);
+    }
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Soft-delete an agent while preserving its message history.
+#[tool(
+    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views."
+)]
+pub async fn retire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "retire_agent",
+    )?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            Some(mcp_agent_mail_db::now_micros()),
+        )
+        .await,
+    )?;
+
+    Ok(json!({
+        "status": "retired",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
+}
+
+/// Restore a retired agent to active status.
+#[tool(
+    description = "Restore a retired agent back to active status. The agent will resume accepting new messages."
+)]
+pub async fn unretire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "unretire_agent",
+    )?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), &pool, agent_id, None).await,
+    )?;
+
+    Ok(json!({
+        "status": "active",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
+}
+
+/// Remove an agent from the active roster while preserving message history.
+#[tool(
+    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages."
+)]
+pub async fn deregister_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "deregister_agent",
+    )?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let deregistered_at = micros_to_iso(mcp_agent_mail_db::now_micros());
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::deregister_agent(ctx.cx(), &pool, agent_id, &deregistered_at)
+            .await,
+    )?;
+
+    Ok(json!({
+        "status": "deregistered",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
 }
 
 /// Validate `attachments_policy` value.
@@ -2666,6 +2854,7 @@ pub async fn whois(
             task_description: agent_row.task_description,
             inception_ts: micros_to_iso(agent_row.inception_ts),
             last_active_ts: micros_to_iso(agent_row.last_active_ts),
+            retired_at: agent_row.retired_at.map(micros_to_iso),
             project_id: agent_row.project_id,
             attachments_policy: agent_row.attachments_policy,
             reaper_exempt: agent_row.reaper_exempt != 0,
@@ -3343,6 +3532,7 @@ mod tests {
             task_description: "Testing".into(),
             inception_ts: "2026-02-06T00:00:00Z".into(),
             last_active_ts: "2026-02-06T01:00:00Z".into(),
+            retired_at: Some("2026-02-06T02:00:00Z".into()),
             project_id: 1,
             attachments_policy: "auto".into(),
             reaper_exempt: false,
@@ -3359,6 +3549,7 @@ mod tests {
         assert_eq!(json["attachments_policy"], "auto");
         assert_eq!(json["id"], 42);
         assert_eq!(json["project_id"], 1);
+        assert_eq!(json["retired_at"], "2026-02-06T02:00:00Z");
         assert!(json["capabilities"].as_array().unwrap().len() >= 4);
     }
 
@@ -3372,6 +3563,7 @@ mod tests {
             task_description: "Testing".into(),
             inception_ts: "2026-02-06T00:00:00Z".into(),
             last_active_ts: "2026-02-06T01:00:00Z".into(),
+            retired_at: None,
             project_id: 1,
             attachments_policy: "auto".into(),
             reaper_exempt: false,
@@ -3399,6 +3591,7 @@ mod tests {
                 task_description: String::new(),
                 inception_ts: "2026-02-06T00:00:00Z".into(),
                 last_active_ts: "2026-02-06T00:00:00Z".into(),
+                retired_at: None,
                 project_id: 1,
                 attachments_policy: "auto".into(),
                 reaper_exempt: false,
@@ -3434,6 +3627,7 @@ mod tests {
                 task_description: String::new(),
                 inception_ts: String::new(),
                 last_active_ts: String::new(),
+                retired_at: None,
                 project_id: 1,
                 attachments_policy: "none".into(),
                 reaper_exempt: false,

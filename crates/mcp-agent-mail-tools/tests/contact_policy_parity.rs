@@ -39,6 +39,7 @@ where
         &[
             ("DATABASE_URL", database_url.as_str()),
             ("STORAGE_ROOT", storage_root.as_str()),
+            ("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true"),
         ],
         || {
             Config::reset_cached();
@@ -142,6 +143,29 @@ async fn send_basic_message(
         None, // idempotency_key
     )
     .await
+}
+
+#[test]
+fn omitted_auto_contact_uses_server_default() {
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/auto-contact-server-default-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake"]).await;
+        set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            "contacts_only".to_string(),
+        )
+        .await
+        .expect("set contacts_only policy");
+
+        let response = send_basic_message(&ctx, &project_key, vec!["BlueLake".to_string()], None)
+            .await
+            .expect("omitted auto-contact should use enabled server default");
+        let response: Value = serde_json::from_str(&response).expect("send response JSON");
+        assert_eq!(response["count"], 1);
+    });
 }
 
 #[test]

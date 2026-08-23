@@ -972,7 +972,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 /// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
 /// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`, `reaper_exempt`,
-/// `registration_token`.
+/// `registration_token`, `retired_at`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx).and_then(value_as_i64).unwrap_or(0)
@@ -1014,6 +1014,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
         },
         reaper_exempt: get_opt_i64(row, 10).unwrap_or(0),
         registration_token: get_opt_string(row, 11),
+        retired_at: get_opt_i64(row, 12),
     }
 }
 
@@ -1793,7 +1794,7 @@ async fn verify_agent_visible_after_commit(
     // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -4661,10 +4662,10 @@ pub async fn register_agent(
                     || "auto".to_string(),
                     std::string::ToString::to_string,
                 );
-                let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                                 registration_token \
-                                 FROM agents \
+        let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                         registration_token, retired_at \
+                         FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC LIMIT 1";
                 let fetch_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
@@ -4857,9 +4858,9 @@ pub async fn create_agent(
             // deterministically so the duplicate check matches what get_agent
             // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                             inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                             registration_token \
-                             FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                         registration_token, retired_at \
+                         FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                              ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
@@ -5040,7 +5041,7 @@ pub async fn get_agent(
     // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5080,7 +5081,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5119,7 +5120,7 @@ pub async fn get_agent_by_id_fresh(
 
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5240,7 +5241,7 @@ pub async fn list_agents_bounded(
     // FrankenSQLite window-function dependency during mailbox recovery.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents \
                WHERE project_id = ? \
                ORDER BY last_active_ts DESC, id DESC";
@@ -5320,7 +5321,7 @@ pub async fn get_agents_by_ids(
         let sql = format!(
             "SELECT id, project_id, name, program, model, task_description, \
              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-             registration_token \
+             registration_token, retired_at \
              FROM agents WHERE id IN ({placeholders})"
         );
 
@@ -5626,7 +5627,7 @@ pub async fn set_agent_contact_policy(
         // Fetch updated agent using raw SQL with explicit column order.
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(agent_id)];
         let rows = try_in_tx!(
@@ -5649,6 +5650,148 @@ pub async fn set_agent_contact_policy(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+    Outcome::Ok(agent)
+}
+
+/// Set or clear an agent's retirement timestamp.
+pub async fn set_agent_retired_at(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    retired_at: Option<i64>,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let retired_at = retired_at.map_or(Value::Null, Value::BigInt);
+        let params = [retired_at, Value::BigInt(agent_id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET retired_at = ? WHERE id = ?",
+                    &params,
+                )
+                .await
+            )
+        );
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+    Outcome::Ok(agent)
+}
+
+/// Remove an agent from active contact by blocking all contact and marking its task.
+pub async fn deregister_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    deregistered_at: &str,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let prefix = format!("[DEREGISTERED at {deregistered_at}] ");
+        let params = [Value::Text(prefix), Value::BigInt(agent_id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents \
+                     SET contact_policy = 'block_all', task_description = ? || task_description \
+                     WHERE id = ?",
+                    &params,
+                )
+                .await
+            )
+        );
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
@@ -5687,7 +5830,7 @@ pub async fn set_agent_contact_policy_by_name(
         // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                           registration_token \
+                           registration_token, retired_at \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                            ORDER BY id ASC LIMIT 1";
         let current_params = [
@@ -5728,7 +5871,7 @@ pub async fn set_agent_contact_policy_by_name(
 
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(current_id)];
         let rows = try_in_tx!(
@@ -13612,7 +13755,7 @@ pub async fn insert_system_agent(
 
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                          registration_token \
+                          registration_token, retired_at \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];

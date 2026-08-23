@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS agents (
     contact_policy TEXT NOT NULL DEFAULT 'auto',
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
     registration_token TEXT,
+    retired_at INTEGER,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
@@ -2294,6 +2295,27 @@ pub fn schema_migrations() -> Vec<Migration> {
         "CREATE INDEX IF NOT EXISTS idx_message_delivery_signal_receipts_message \
          ON message_delivery_signal_receipts(message_id, agent_id)"
             .to_string(),
+        String::new(),
+    ));
+
+    // ── v27: Agent retirement lifecycle parity ─────────────────────
+    //
+    // Python databases may already carry this column with DATETIME/TEXT
+    // values. The migration runner reconciles the duplicate ADD COLUMN, then
+    // the follow-up normalizes preserved retirement state to microseconds.
+    migrations.push(Migration::new(
+        "v27_agents_retired_at".to_string(),
+        "add nullable retired_at column for agent lifecycle state".to_string(),
+        "ALTER TABLE agents ADD COLUMN retired_at INTEGER DEFAULT NULL".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v27_fix_agents_retired_at_text_timestamp".to_string(),
+        "convert imported retired_at TEXT timestamps to integer microseconds".to_string(),
+        format!(
+            "UPDATE agents SET retired_at = ({}) WHERE typeof(retired_at) = 'text'",
+            legacy_text_timestamp_to_micros_sql("retired_at")
+        ),
         String::new(),
     ));
 
@@ -6528,6 +6550,91 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
     fn derive_migration_id_unknown_returns_none() {
         assert_eq!(derive_migration_id_and_description("SELECT 1"), None);
         assert_eq!(derive_migration_id_and_description(""), None);
+    }
+
+    #[test]
+    fn v27_migration_preserves_imported_retired_at_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v27_retired_at.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                retired_at DATETIME\
+            )",
+        )
+        .expect("create imported agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (retired_at) VALUES (?), (?)",
+            &[
+                Value::Text("1970-01-01 00:00:01.123456".to_string()),
+                Value::Null,
+            ],
+        )
+        .expect("insert imported retirement state");
+
+        let migrations: Vec<_> = schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v27_"))
+            .collect();
+        assert_eq!(
+            migrations.len(),
+            2,
+            "expected add-and-convert v27 migrations"
+        );
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_specific_migrations(&cx, conn, migrations)
+                    .await
+                    .into_result()
+                    .expect("run v27 migrations");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT retired_at, typeof(retired_at) AS retired_at_type \
+                 FROM agents ORDER BY id",
+                &[],
+            )
+            .expect("query migrated retirement state");
+        assert_eq!(rows[0].get_named::<i64>("retired_at").unwrap(), 1_123_456);
+        assert_eq!(
+            rows[0].get_named::<String>("retired_at_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            rows[1].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn base_agents_schema_declares_nullable_retired_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("base_retired_at.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(&init_schema_sql_base())
+            .expect("create base schema");
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("inspect agents schema");
+        let retired_at = columns
+            .iter()
+            .find(|row| row.get_named::<String>("name").ok().as_deref() == Some("retired_at"))
+            .expect("agents.retired_at column");
+
+        assert_eq!(retired_at.get_named::<String>("type").unwrap(), "INTEGER");
+        assert_eq!(retired_at.get_named::<i64>("notnull").unwrap(), 0);
     }
 
     // ── br-3h13.17.3 addendum: additional edge case (RubyPrairie) ──────

@@ -163,22 +163,22 @@ use mcp_agent_mail_db::{
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
-    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
-    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
+    CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
+    FetchInboxEvents, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
+    ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource,
+    InboxResource, InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
     MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
     MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
     ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
     ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
     RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
-    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
+    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
     ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
     ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
     ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
     ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -219,7 +219,26 @@ impl Drop for InflightGuard {
 
 impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
     fn definition(&self) -> Tool {
-        self.inner.definition()
+        let mut definition = self.inner.definition();
+        if self.tool_name == "send_message"
+            && let Some(property) = definition
+                .input_schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("auto_contact_if_blocked"))
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            property.remove("type");
+            property.insert(
+                "anyOf".to_string(),
+                serde_json::json!([
+                    { "type": "boolean" },
+                    { "type": "null" }
+                ]),
+            );
+            property.insert("default".to_string(), serde_json::Value::Null);
+        }
+        definition
     }
 
     fn icon(&self) -> Option<&Icon> {
@@ -612,6 +631,27 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "create_agent_identity",
         clusters::IDENTITY,
         CreateAgentIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "deregister_agent",
+        clusters::IDENTITY,
+        DeregisterAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "retire_agent",
+        clusters::IDENTITY,
+        RetireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "unretire_agent",
+        clusters::IDENTITY,
+        UnretireAgent,
     );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
     let server = add_tool(
@@ -16233,6 +16273,9 @@ fn accepts_pane_id_header(tool_name: &str) -> bool {
         tool_name,
         "register_agent"
             | "create_agent_identity"
+            | "deregister_agent"
+            | "retire_agent"
+            | "unretire_agent"
             | "macro_start_session"
             | "resolve_pane_identity"
     )

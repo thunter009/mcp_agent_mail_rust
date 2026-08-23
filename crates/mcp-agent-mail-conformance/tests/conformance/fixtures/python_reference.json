@@ -410,6 +410,54 @@
         }
       ]
     },
+    "deregister_agent": {
+      "cases": [
+        {
+          "name": "project_not_found_error",
+          "input": {
+            "project_key": "ZzzNonExistentProject",
+            "agent_name": "BlueLake"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "retire_agent": {
+      "cases": [
+        {
+          "name": "project_not_found_error",
+          "input": {
+            "project_key": "ZzzNonExistentProject",
+            "agent_name": "BlueLake"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "unretire_agent": {
+      "cases": [
+        {
+          "name": "project_not_found_error",
+          "input": {
+            "project_key": "ZzzNonExistentProject",
+            "agent_name": "BlueLake"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
     "request_contact": {
       "cases": [
         {
@@ -2379,9 +2427,9 @@
                   "project_id": 1,
                   "attachments_policy": "auto"
                 },
-                {
-                  "id": 3,
-                  "name": "OrangeFox",
+            {
+              "id": 3,
+              "name": "OrangeFox",
                   "program": "codex-cli",
                   "model": "gpt-5",
                   "task_description": "fresh identity",
@@ -2430,8 +2478,11 @@
           },
           "normalize": {
             "ignore_json_pointers": [
+              "/slug",
               "/canonical_path",
-              "/git_common_dir"
+              "/human_key",
+              "/git_common_dir",
+              "/project_uid"
             ]
           }
         }
@@ -2482,11 +2533,12 @@
                   "inception_ts": null,
                   "last_active_ts": null,
                   "project_id": 1,
-                  "attachments_policy": "auto",
-                  "unread_count": 0
-                }
-              ]
+              "attachments_policy": "auto",
+              "unread_count": 0
             }
+          ],
+          "retired_agents": []
+        }
           },
           "normalize": {
             "ignore_json_pointers": [

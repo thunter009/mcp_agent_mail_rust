@@ -896,7 +896,12 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
 }
 
 fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
-    BTreeSet::from(["force_release_file_reservation"])
+    BTreeSet::from([
+        "deregister_agent",
+        "force_release_file_reservation",
+        "retire_agent",
+        "unretire_agent",
+    ])
 }
 
 fn rust_native_tool_case_shapes() -> BTreeMap<String, (bool, bool)> {
@@ -1112,6 +1117,17 @@ fn init_fixture_repo(repo_dir: &Path) {
         "git init failed for {} with status {status}",
         repo_dir.display()
     );
+
+    let config_status = std::process::Command::new("git")
+        .args(["config", "--local", "core.hooksPath", ".git/hooks"])
+        .current_dir(repo_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("git config {}: {e}", repo_dir.display()));
+    assert!(
+        config_status.success(),
+        "git config failed for {} with status {config_status}",
+        repo_dir.display()
+    );
 }
 
 fn initialize_runtime_mailbox(database_url: &str) {
@@ -1256,22 +1272,48 @@ fn insert_test_message(
 
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
 fn setup_fixture_env() -> FixtureEnv {
-    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("failed to canonicalize tempdir root");
+    let tmp = tempfile::Builder::new()
+        .prefix("mcp-agent-mail-conformance-")
+        .tempdir_in(temp_root)
+        .expect("failed to create tempdir");
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
     let fixture_repos_root = tmp.path().join("agent-mail-fixtures");
     let repo_install_dir = fixture_repos_root.join("repo_install");
     let repo_uninstall_dir = fixture_repos_root.join("repo_uninstall");
+    let fixture_home = tmp.path().join("home");
+    let fixture_xdg_config_home = tmp.path().join("xdg");
+    std::fs::create_dir_all(&fixture_home).expect("failed to create isolated home");
+    std::fs::create_dir_all(&fixture_xdg_config_home)
+        .expect("failed to create isolated XDG config home");
+    let git_config_global = tmp.path().join("gitconfig");
+    std::fs::write(&git_config_global, "").expect("failed to create isolated gitconfig");
     let storage_root_str = storage_root
         .to_str()
         .expect("storage_root must be valid UTF-8");
+    let git_config_global_str = git_config_global
+        .to_str()
+        .expect("git_config_global must be valid UTF-8");
+    let fixture_home_str = fixture_home
+        .to_str()
+        .expect("fixture_home must be valid UTF-8");
+    let fixture_xdg_config_home_str = fixture_xdg_config_home
+        .to_str()
+        .expect("fixture_xdg_config_home must be valid UTF-8");
     // Ensure fixtures run deterministically regardless of developer shell env.
     // Also explicitly disable tool filtering (otherwise tools may not be registered).
     let env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
         ("WORKTREES_ENABLED", "1"),
         ("STORAGE_ROOT", storage_root_str),
+        ("HOME", fixture_home_str),
+        ("XDG_CONFIG_HOME", fixture_xdg_config_home_str),
+        ("GIT_CONFIG_GLOBAL", git_config_global_str),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
@@ -1332,6 +1374,21 @@ fn parse_frontmatter(content: &str) -> Option<Value> {
     let end_idx = after_start.find("\n---")?;
     let json_str = &after_start[..end_idx];
     serde_json::from_str(json_str.trim()).ok()
+}
+
+#[test]
+fn install_precommit_guard_fixture_path_is_hermetic() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let repo_path = env
+        .tokens
+        .get(LEGACY_FIXTURE_REPO_INSTALL_PATH)
+        .expect("fixture install repository token")
+        .clone();
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+
+    mcp_agent_mail_tools::install_precommit_guard(&ctx, "abs-path-backend".to_string(), repo_path)
+        .expect("fixture install_precommit_guard should succeed");
 }
 
 #[test]
@@ -2037,7 +2094,13 @@ fn run_fixtures_against_rust_server_router() {
     );
 
     // --- Notification signal assertions (tool flow) ---
-    let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
+    let notif_temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("failed to canonicalize notifications tempdir root");
+    let notif_tmp = tempfile::Builder::new()
+        .prefix("mcp-agent-mail-notifications-")
+        .tempdir_in(notif_temp_root)
+        .expect("failed to create notifications tempdir");
     let notif_db_path = notif_tmp.path().join("db.sqlite3");
     let notif_db_url = format!("sqlite://{}", notif_db_path.display());
     let notif_storage_root = notif_tmp.path().join("archive");
@@ -3068,6 +3131,124 @@ fn handwritten_tool_failure_cases_match_rust_router() {
             }
         }
     }
+}
+
+#[test]
+fn lifecycle_tools_match_python_happy_shapes() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+    let project_key = env
+        .tmp
+        .path()
+        .join("lifecycle-happy")
+        .to_string_lossy()
+        .to_string();
+    let agent_name = "BlueLake";
+
+    execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "ensure_project",
+        Some(serde_json::json!({ "human_key": project_key })),
+    )
+    .expect("ensure_project router call")
+    .expect("ensure_project should succeed");
+
+    let registration = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "register_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": agent_name,
+            "return_registration_token": true
+        })),
+    )
+    .expect("register_agent router call")
+    .expect("register_agent should succeed");
+    let registration_token = registration
+        .get("registration_token")
+        .and_then(Value::as_str)
+        .expect("explicit token return should produce registration_token")
+        .to_string();
+
+    let retired = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "retire_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("retire_agent router call")
+    .expect("retire_agent should succeed");
+    assert_eq!(
+        retired,
+        serde_json::json!({
+            "status": "retired",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
+
+    let active = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "unretire_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("unretire_agent router call")
+    .expect("unretire_agent should succeed");
+    assert_eq!(
+        active,
+        serde_json::json!({
+            "status": "active",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
+
+    let deregistered = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "deregister_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("deregister_agent router call")
+    .expect("deregister_agent should succeed");
+    assert_eq!(
+        deregistered,
+        serde_json::json!({
+            "status": "deregistered",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
 }
 
 #[test]

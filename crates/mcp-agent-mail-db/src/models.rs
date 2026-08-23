@@ -149,6 +149,10 @@ pub struct AgentRow {
     /// when sending messages to prove they own this agent identity.
     #[sqlmodel(nullable)]
     pub registration_token: Option<String>,
+
+    /// Retirement timestamp in UTC microseconds; `None` means active.
+    #[sqlmodel(nullable)]
+    pub retired_at: Option<i64>,
 }
 
 /// Compact agent projection used to hydrate the in-process ATC population.
@@ -182,6 +186,7 @@ impl Default for AgentRow {
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         }
     }
 }
@@ -204,12 +209,19 @@ impl AgentRow {
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         }
     }
 
     /// Update `last_active` timestamp to now
     pub fn touch(&mut self) {
         self.last_active_ts = now_micros();
+    }
+
+    /// Whether this agent was permanently removed from the active roster.
+    #[must_use]
+    pub fn is_deregistered(&self) -> bool {
+        self.task_description.starts_with("[DEREGISTERED at ")
     }
 }
 
