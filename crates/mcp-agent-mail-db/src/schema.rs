@@ -520,6 +520,52 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
              FROM messages AS m WHERE m.id = NEW.message_id; \
          END";
 
+/// Build the exact legacy TEXT-timestamp conversion used by the v3 migrations.
+///
+/// The fraction is removed before `strftime('%s', ...)` so engines cannot round
+/// the whole-second value and then have the original fraction added a second
+/// time. Numeric microsecond strings bypass date parsing unchanged.
+fn legacy_text_timestamp_to_micros_sql(column: &str) -> String {
+    let value = format!("trim({column})");
+    let fraction_tail = format!("substr({value}, instr({value}, '.') + 1)");
+    let suffix_offset = format!(
+        "CASE \
+         WHEN instr({fraction_tail}, 'Z') > 0 THEN instr({fraction_tail}, 'Z') \
+         WHEN instr({fraction_tail}, '+') > 0 THEN instr({fraction_tail}, '+') \
+         WHEN instr({fraction_tail}, '-') > 0 THEN instr({fraction_tail}, '-') \
+         ELSE length({fraction_tail}) + 1 \
+         END"
+    );
+    let whole_second_value = format!(
+        "substr({value}, 1, instr({value}, '.') - 1) || \
+         substr({fraction_tail}, ({suffix_offset}))"
+    );
+    let fraction_digits = format!("substr({fraction_tail}, 1, ({suffix_offset}) - 1)");
+
+    format!(
+        "CASE \
+         WHEN {value} <> '' AND ( \
+              {value} NOT GLOB '*[^0-9]*' OR ( \
+                  length({value}) > 1 AND \
+                  substr({value}, 1, 1) IN ('+', '-') AND \
+                  substr({value}, 2) NOT GLOB '*[^0-9]*' \
+              ) \
+         ) \
+         THEN CAST({value} AS INTEGER) \
+         ELSE CAST(strftime('%s', \
+                  CASE WHEN instr({value}, '.') > 0 \
+                       THEN {whole_second_value} \
+                       ELSE {value} \
+                  END \
+              ) AS INTEGER) * 1000000 + \
+              CASE WHEN instr({value}, '.') > 0 \
+                   THEN CAST(substr(({fraction_digits}) || '000000', 1, 6) AS INTEGER) \
+                   ELSE 0 \
+              END \
+         END"
+    )
+}
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -570,20 +616,8 @@ pub fn schema_migrations() -> Vec<Migration> {
     // v3: Convert legacy Python TEXT timestamps to INTEGER (i64 microseconds).
     // The Python schema used SQLAlchemy DATETIME columns that store ISO-8601 strings
     // like "2026-02-04 22:13:11.079199", but the Rust port expects i64 microseconds.
-    // The conversion: strftime('%s', text) * 1000000 + fractional_micros
-    let ts_conversion = |col: &str| -> String {
-        format!(
-            "CASE \
-                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
-                 THEN CAST(trim({col}) AS INTEGER) \
-                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-                      CASE WHEN instr({col}, '.') > 0 \
-                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                           ELSE 0 \
-                      END \
-             END"
-        )
-    };
+    // Parse whole seconds first, then add an independently normalized fraction.
+    let ts_conversion = legacy_text_timestamp_to_micros_sql;
 
     // projects.created_at
     migrations.push(Migration::new(
@@ -3576,16 +3610,17 @@ async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>
 /// `VACUUM INTO` rebuild), so the data is valid — this is an engine defect, not
 /// corruption.
 ///
-/// Sidestep the buggy index-maintenance path deterministically and
-/// page-layout-independently: snapshot and DROP every secondary index on
-/// `messages`, run the timestamp-conversion UPDATE with no index btrees to
-/// maintain, then rebuild each captured index from its original DDL. A fresh
+/// Sidestep the buggy maintenance paths deterministically and
+/// page-layout-independently: snapshot and DROP every secondary index and
+/// trigger on `messages`, run the timestamp-conversion UPDATE with no index
+/// btrees or trigger side effects to maintain, then rebuild each captured
+/// schema object from its original DDL. A fresh
 /// `CREATE INDEX` scans the table and builds the btree bottom-up; it does not
 /// exercise the UPDATE-cursor path, which is the same reason the `v3b` /`v15`
 /// table rebuilds already work on these stores.
 ///
 /// On a canonical/fresh DB (no TEXT `created_ts`) this is a no-op guarded by a
-/// cheap `COUNT` so it never churns the `messages` indexes.
+/// cheap `COUNT` so it never churns the `messages` schema objects.
 async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -3644,7 +3679,38 @@ async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
         indexes.push((name, sql));
     }
 
-    // 2. DROP each captured index so the UPDATE maintains no secondary btrees.
+    // 2. Snapshot every trigger on `messages`. The conversion changes only
+    //    `created_ts`, so replaying FTS and other derived-data side effects is
+    //    unnecessary. Legacy FTS triggers make this UPDATE pathologically slow.
+    let trigger_rows = match conn
+        .query(
+            cx,
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = 'messages' AND sql IS NOT NULL",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut triggers: Vec<(String, String)> = Vec::with_capacity(trigger_rows.len());
+    for row in trigger_rows {
+        let name = match row.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(err) => return Outcome::Err(err),
+        };
+        let sql = match row.get_named::<String>("sql") {
+            Ok(sql) => sql,
+            Err(err) => return Outcome::Err(err),
+        };
+        triggers.push((name, sql));
+    }
+
+    // 3. DROP each captured index and trigger so the UPDATE maintains no
+    //    secondary btrees or derived-data side effects.
     for (name, _sql) in &indexes {
         let drop_sql = format!("DROP INDEX IF EXISTS \"{}\"", name.replace('"', "\"\""));
         match conn.execute(cx, &drop_sql, &[]).await {
@@ -3654,9 +3720,18 @@ async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
     }
+    for (name, _sql) in &triggers {
+        let drop_sql = format!("DROP TRIGGER IF EXISTS \"{}\"", name.replace('"', "\"\""));
+        match conn.execute(cx, &drop_sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
 
-    // 3. Run the timestamp-conversion UPDATE (identical SQL the migration would
-    //    have run in-place), now with no index maintenance to trip the engine.
+    // 4. Run the timestamp-conversion UPDATE (identical SQL the migration would
+    //    have run in-place), now with no maintenance path to trip the engine.
     match conn.execute(cx, update_sql, &[]).await {
         Outcome::Ok(_) => {}
         Outcome::Err(err) => return Outcome::Err(err),
@@ -3664,8 +3739,18 @@ async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     }
 
-    // 4. Rebuild each captured index from its original DDL (a fresh, safe build).
+    // 5. Rebuild each captured schema object from its original DDL. The outer
+    //    migration transaction makes failure atomic: all DROPs roll back if any
+    //    UPDATE or rebuild step fails.
     for (_name, sql) in &indexes {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    for (_name, sql) in &triggers {
         match conn.execute(cx, sql, &[]).await {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => return Outcome::Err(err),
@@ -5191,6 +5276,232 @@ mod tests {
     }
 
     #[test]
+    fn v3_message_timestamp_conversion_suspends_and_restores_triggers() {
+        let conn = DbConn::open_memory().expect("open in-memory sqlite connection");
+
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                created_ts DATETIME NOT NULL\
+            )",
+        )
+        .expect("create legacy messages table");
+        conn.execute_raw("CREATE INDEX idx_messages_created_ts ON messages(created_ts)")
+            .expect("create message timestamp index");
+        conn.execute_raw("CREATE TABLE migration_update_audit (updates INTEGER NOT NULL)")
+            .expect("create update audit table");
+        conn.execute_raw("INSERT INTO migration_update_audit (updates) VALUES (0)")
+            .expect("seed update audit table");
+        conn.execute_raw(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(\
+                message_id UNINDEXED, subject, body\
+            )",
+        )
+        .expect("create legacy message FTS table");
+        conn.execute_raw(
+            "CREATE TRIGGER fts_messages_au AFTER UPDATE ON messages BEGIN \
+                UPDATE migration_update_audit SET updates = updates + 1; \
+                DELETE FROM fts_messages WHERE message_id = OLD.id; \
+                INSERT INTO fts_messages(message_id, subject, body) \
+                VALUES (NEW.id, NEW.subject, NEW.body_md); \
+            END",
+        )
+        .expect("create legacy message FTS update trigger");
+        conn.execute_raw(
+            "INSERT INTO messages (id, subject, body_md, created_ts) \
+             VALUES (1, 'before', 'body', '2026-08-22 12:34:56.123456')",
+        )
+        .expect("insert legacy message");
+        conn.execute_raw(
+            "INSERT INTO fts_messages(message_id, subject, body) \
+             VALUES (1, 'before', 'body')",
+        )
+        .expect("seed legacy FTS row");
+        let rows = conn
+            .query_sync(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'fts_messages_au'",
+                &[],
+            )
+            .expect("query original trigger DDL");
+        let original_trigger_sql = rows[0]
+            .get_named::<String>("sql")
+            .expect("original trigger SQL");
+
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v3_fix_messages_text_timestamps")
+            .expect("message timestamp migration");
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(&cx, conn, &migration)
+                    .await
+                    .into_result()
+                    .expect("run message timestamp migration");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) AS storage_type FROM messages WHERE id = 1",
+                &[],
+            )
+            .expect("query migrated timestamp type");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("storage_type")
+                .expect("timestamp storage type"),
+            "integer"
+        );
+
+        let rows = conn
+            .query_sync("SELECT updates FROM migration_update_audit", &[])
+            .expect("query migration trigger audit");
+        assert_eq!(
+            rows[0].get_named::<i64>("updates").expect("update count"),
+            0,
+            "message triggers must be suspended during timestamp conversion"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE type = 'trigger' AND tbl_name = 'messages' ORDER BY name",
+                &[],
+            )
+            .expect("query restored message triggers");
+        let trigger_names: Vec<String> = rows
+            .iter()
+            .map(|row| row.get_named::<String>("name").expect("trigger name"))
+            .collect();
+        assert_eq!(trigger_names, vec!["fts_messages_au".to_string()]);
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("sql")
+                .expect("restored trigger SQL"),
+            original_trigger_sql,
+            "trigger DDL must be restored byte-for-byte"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_created_ts'",
+                &[],
+            )
+            .expect("query restored message index");
+        assert_eq!(rows.len(), 1, "message index must be restored");
+
+        conn.execute_raw("UPDATE messages SET subject = 'after' WHERE id = 1")
+            .expect("exercise restored message triggers");
+        let rows = conn
+            .query_sync("SELECT updates FROM migration_update_audit", &[])
+            .expect("query post-migration trigger audit");
+        assert_eq!(
+            rows[0].get_named::<i64>("updates").expect("update count"),
+            1,
+            "restored audit trigger must fire after migration"
+        );
+    }
+
+    #[test]
+    fn v3_message_timestamp_conversion_preserves_exact_microseconds() {
+        let conn = DbConn::open_memory().expect("open in-memory sqlite connection");
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY,\
+                created_ts DATETIME NOT NULL\
+            )",
+        )
+        .expect("create legacy messages table");
+
+        let base = 1_778_260_960_000_000_i64;
+        let cases = [
+            ("2026-05-08 17:22:40", base),
+            ("2026-05-08T17:22:40Z", base),
+            ("2026-05-08T17:22:40.1Z", base + 100_000),
+            ("2026-05-08T17:22:40.12Z", base + 120_000),
+            ("2026-05-08T17:22:40.123Z", base + 123_000),
+            ("2026-05-08T17:22:40.1234Z", base + 123_400),
+            ("2026-05-08T17:22:40.12345Z", base + 123_450),
+            ("2026-05-08T17:22:40.123456Z", base + 123_456),
+            ("2026-05-08T17:22:40.999499Z", base + 999_499),
+            ("2026-05-08T17:22:40.999500Z", base + 999_500),
+            ("2026-05-08T17:22:40.999999Z", base + 999_999),
+            ("2026-05-08T17:22:40.211+00:00", base + 211_000),
+            ("2026-05-08T19:52:40.654321+02:30", base + 654_321),
+            ("2026-05-08T13:22:40.654321-04:00", base + 654_321),
+            (" 2026-05-08T17:22:40.000001Z ", base + 1),
+            ("1778260960211000", base + 211_000),
+            ("+1778260960211000", base + 211_000),
+            ("-210789", -210_789),
+        ];
+
+        for (index, (text, _expected)) in cases.iter().enumerate() {
+            conn.execute_sync(
+                "INSERT INTO messages (id, created_ts) VALUES (?, ?)",
+                &[
+                    Value::BigInt(i64::try_from(index + 1).expect("case id fits i64")),
+                    Value::Text((*text).to_string()),
+                ],
+            )
+            .expect("insert legacy timestamp case");
+        }
+
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v3_fix_messages_text_timestamps")
+            .expect("message timestamp migration");
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(&cx, conn, &migration)
+                    .await
+                    .into_result()
+                    .expect("run message timestamp migration");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) AS storage_type, created_ts \
+                 FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("query migrated timestamps");
+        assert_eq!(rows.len(), cases.len());
+        for (row, (text, expected)) in rows.iter().zip(cases.iter()) {
+            assert_eq!(
+                row.get_named::<String>("storage_type")
+                    .expect("timestamp storage type"),
+                "integer",
+                "{text} must migrate to INTEGER storage"
+            );
+            assert_eq!(
+                row.get_named::<i64>("created_ts")
+                    .expect("migrated timestamp"),
+                *expected,
+                "wrong exact microsecond instant for {text}"
+            );
+        }
+    }
+
+    #[test]
     fn base_migrations_drop_existing_message_fts_triggers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_drop_fts_triggers.db");
@@ -5508,30 +5819,14 @@ mod tests {
             values.push(row.get_named::<i64>("expires_ts").unwrap());
         }
 
-        // The per-row values canonical SQLite produces for these inputs (the
-        // truncating `strftime('%s')` whole-second epoch + the 6-digit
-        // fractional micros). The migration runs on the bespoke engine, whose
-        // `strftime('%s')` rounds the whole-second component to nearest instead
-        // of truncating, so a fractional component >= 0.5s lands one second
-        // (1_000_000 us) high relative to canonical SQLite. That ~1s engine
-        // divergence is tracked with the other frankensqlite strftime/integrity
-        // divergences (#151/#152) and is orthogonal to defect 2 (the per-row
-        // value must not collapse to a shared constant). Assert each row stayed
-        // anchored to its own canonical instant within that 1s tolerance rather
-        // than pinning one engine's rounding.
+        // Exact canonical instants. The conversion removes the fraction before
+        // `strftime`, preventing engine rounding from shifting values >= 0.5s.
         let canonical_expected = [
-            1_781_737_941_295_382_i64, // ...23:12:21.295382 (frac < 0.5 -> exact)
-            1_781_737_922_904_292_i64, // ...23:12:02.904292 (frac >= 0.5 -> +1s on bespoke)
-            1_781_741_029_589_340_i64, // ...00:03:49.589340 (frac >= 0.5 -> +1s on bespoke)
+            1_781_737_941_295_382_i64, // ...23:12:21.295382
+            1_781_737_922_904_292_i64, // ...23:12:02.904292
+            1_781_741_029_589_340_i64, // ...00:03:49.589340
         ];
-        const SECOND_US: i64 = 1_000_000;
-        for (got, expected) in values.iter().zip(canonical_expected.iter()) {
-            assert!(
-                (got - expected).abs() <= SECOND_US,
-                "each reservation must keep its own converted expiry, not a shared \
-                 constant: got {got}, expected ~{expected} (within {SECOND_US}us)"
-            );
-        }
+        assert_eq!(values, canonical_expected);
 
         let distinct: std::collections::HashSet<i64> = values.iter().copied().collect();
         assert_eq!(
