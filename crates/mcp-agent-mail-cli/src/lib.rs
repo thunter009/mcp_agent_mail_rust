@@ -7685,7 +7685,11 @@ where
     G: FnMut(&Config) -> CliResult<()>,
 {
     auto_clear(config)?;
-    self_heal(config)
+    if config.integrity_check_on_startup {
+        self_heal(config)
+    } else {
+        Ok(())
+    }
 }
 
 /// Prepare a server runtime to start against the mailbox by clearing stale
@@ -53288,6 +53292,28 @@ startup_timeout_sec = 42
         .expect("startup prep should succeed");
 
         assert_eq!(calls.into_inner(), vec!["clear", "heal"]);
+    }
+
+    #[test]
+    fn prepare_runtime_server_startup_skips_self_heal_when_integrity_check_is_disabled() {
+        let mut config = Config::default();
+        config.integrity_check_on_startup = false;
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        run_runtime_server_startup_prep_with(
+            &config,
+            |_| {
+                calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("heal");
+                Ok(())
+            },
+        )
+        .expect("startup prep should honor the disabled integrity check");
+
+        assert_eq!(calls.into_inner(), vec!["clear"]);
     }
 
     #[test]
