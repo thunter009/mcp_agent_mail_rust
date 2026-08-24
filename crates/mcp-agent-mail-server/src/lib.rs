@@ -15643,7 +15643,7 @@ fn startup_integrity_cache_is_fresh(
 
 #[allow(dead_code)]
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
-    readiness_check_with_integrity(config, true)
+    readiness_check_with_integrity(config, config.integrity_check_on_startup)
 }
 
 #[cfg(test)]
@@ -16193,6 +16193,14 @@ fn readiness_check_with_integrity(
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
+    // Pool bootstrap normally reconciles an archive-ahead SQLite file before
+    // the first acquire. The explicit startup-integrity opt-out must cover
+    // that mutation as well as the later quick-check. Read-only intent keeps
+    // normal schema initialization available while suppressing reconstruction
+    // for this readiness probe; the resulting pool remains writable for the
+    // server after startup.
+    let _read_only_intent =
+        (!run_integrity_check).then(mcp_agent_mail_db::ReadOnlyIntentGuard::enter);
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,
@@ -18282,6 +18290,74 @@ mod tests {
             !db_path.exists(),
             "quick readiness must not create a missing sqlite file"
         );
+    }
+
+    #[test]
+    fn readiness_check_honors_integrity_opt_out_without_archive_reconcile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("startup-opt-out.sqlite3");
+        let project_dir = storage_root.join("projects").join("archive-only-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("08");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-08-24T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-08-24T00-00-00Z__archive-only__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Archive only",
+  "importance": "normal",
+  "created_ts": "2026-08-24T00:00:00Z"
+}
+---
+
+archive-only body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        readiness_check(&config).expect("startup opt-out should open the validated database");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("reopen validated database");
+        let rows = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM projects) AS project_count, \
+                        (SELECT COUNT(*) FROM agents) AS agent_count, \
+                        (SELECT COUNT(*) FROM messages) AS message_count",
+                &[],
+            )
+            .expect("query validated inventory");
+        let row = rows.first().expect("inventory row");
+        assert_eq!(row.get_named::<i64>("project_count").unwrap_or(-1), 0);
+        assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(-1), 0);
+        assert_eq!(row.get_named::<i64>("message_count").unwrap_or(-1), 0);
     }
 
     #[test]
