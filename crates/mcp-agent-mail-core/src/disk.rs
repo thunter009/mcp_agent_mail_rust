@@ -22,6 +22,7 @@ const MIB: u64 = 1024 * 1024;
 /// spelling and its canonical destination are verified, so this exception does
 /// not extend to arbitrary symlinks.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)] // macOS branch performs non-const canonicalization.
 pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
