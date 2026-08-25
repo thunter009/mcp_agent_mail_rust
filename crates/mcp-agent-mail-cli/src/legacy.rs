@@ -1037,30 +1037,73 @@ fn run_setup_refresh_once(project_dir: Option<PathBuf>) -> CliResult<()> {
 fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
     use asupersync::runtime::RuntimeBuilder;
 
-    let conn = DbConn::open_file(path.display().to_string())
+    let base_conn = DbConn::open_file(path.display().to_string())
         .map_err(|e| CliError::Other(format!("cannot open sqlite DB {}: {e}", path.display())))?;
-    conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+    base_conn
+        .execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
     let cx = asupersync::Cx::for_request();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
-    match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
-        asupersync::Outcome::Ok(ids) => {
-            schema::enforce_runtime_fts_cleanup(&conn)
-                .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
-            let _ = conn.execute_raw("PRAGMA journal_mode = WAL;");
-            Ok(ids)
-        }
-        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("migration failed: {e}"))),
-        asupersync::Outcome::Cancelled(r) => {
-            Err(CliError::Other(format!("migration cancelled: {r:?}")))
-        }
-        asupersync::Outcome::Panicked(p) => {
-            Err(CliError::Other(format!("migration panicked: {p}")))
-        }
-    }
+    let mut applied =
+        match rt.block_on(async { schema::migrate_to_latest_base(&cx, &base_conn).await }) {
+            asupersync::Outcome::Ok(ids) => ids,
+            asupersync::Outcome::Err(e) => {
+                return Err(CliError::Other(format!("base migration failed: {e}")));
+            }
+            asupersync::Outcome::Cancelled(r) => {
+                return Err(CliError::Other(format!("base migration cancelled: {r:?}")));
+            }
+            asupersync::Outcome::Panicked(p) => {
+                return Err(CliError::Other(format!("base migration panicked: {p}")));
+            }
+        };
+    drop(base_conn);
+
+    let canonical_conn = CanonicalDbConn::open_file(path.display().to_string()).map_err(|e| {
+        CliError::Other(format!(
+            "cannot open sqlite DB {} for canonical migrations: {e}",
+            path.display()
+        ))
+    })?;
+    canonical_conn
+        .execute_raw(schema::PRAGMA_DB_INIT_SQL)
+        .map_err(|e| CliError::Other(format!("failed to apply canonical init PRAGMAs: {e}")))?;
+    let canonical_applied =
+        match rt.block_on(async { schema::migrate_to_latest(&cx, &canonical_conn).await }) {
+            asupersync::Outcome::Ok(ids) => ids,
+            asupersync::Outcome::Err(e) => {
+                return Err(CliError::Other(format!("canonical migration failed: {e}")));
+            }
+            asupersync::Outcome::Cancelled(r) => {
+                return Err(CliError::Other(format!(
+                    "canonical migration cancelled: {r:?}"
+                )));
+            }
+            asupersync::Outcome::Panicked(p) => {
+                return Err(CliError::Other(format!(
+                    "canonical migration panicked: {p}"
+                )));
+            }
+        };
+    drop(canonical_conn);
+    applied.extend(canonical_applied);
+
+    let runtime_conn = DbConn::open_file(path.display().to_string()).map_err(|e| {
+        CliError::Other(format!(
+            "cannot reopen sqlite DB {} after canonical migrations: {e}",
+            path.display()
+        ))
+    })?;
+    schema::enforce_runtime_fts_cleanup(&runtime_conn)
+        .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
+    runtime_conn
+        .execute_raw("PRAGMA journal_mode = WAL;")
+        .map_err(|e| CliError::Other(format!("failed to restore WAL journal mode: {e}")))?;
+
+    Ok(applied)
 }
 
 fn integrity_check_ok(path: &Path) -> CliResult<bool> {
@@ -2672,6 +2715,125 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
 
         assert!(!paths_overlap(&source, &sibling_via_parent));
+    }
+
+    #[test]
+    fn migrate_sqlite_db_runs_canonical_v15_and_preserves_message_extensions() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("legacy-v15.sqlite3");
+        let conn = CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open canonical legacy fixture DB");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable fixture foreign keys");
+        conn.execute_raw(&schema::init_schema_sql_base())
+            .expect("create current base tables");
+        conn.execute_raw("DROP TABLE messages")
+            .expect("replace messages with Python legacy shape");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL DEFAULT 'normal',\
+                ack_required INTEGER NOT NULL DEFAULT 0,\
+                created_ts INTEGER NOT NULL,\
+                attachments TEXT NOT NULL DEFAULT '[]',\
+                topic VARCHAR(64),\
+                reply_to INTEGER\
+            )",
+        )
+        .expect("create Python legacy messages table");
+        conn.execute_raw("CREATE INDEX idx_messages_project_topic ON messages(project_id, topic)")
+            .expect("create Python topic index");
+        conn.execute_raw("CREATE INDEX ix_messages_reply_to ON messages(reply_to)")
+            .expect("create Python reply index");
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, \
+              ack_required, created_ts, attachments, topic, reply_to) \
+             VALUES (1, 1, 1, 'thread', 'subject', 'body', 'normal', 0, 123, \
+                     '[]', 'import-topic', 77)",
+        )
+        .expect("insert Python legacy message");
+        conn.execute_raw(
+            "CREATE TABLE mcp_agent_mail_migrations (\
+                id TEXT PRIMARY KEY,\
+                description TEXT NOT NULL,\
+                applied_at INTEGER NOT NULL\
+            )",
+        )
+        .expect("create migration ledger");
+        for migration in schema::schema_migrations_base() {
+            conn.execute_sync(
+                "INSERT INTO mcp_agent_mail_migrations (id, description, applied_at) \
+                 VALUES (?, ?, ?)",
+                &[
+                    Value::Text(migration.id),
+                    Value::Text(migration.description),
+                    Value::BigInt(0),
+                ],
+            )
+            .expect("seed base migration ledger");
+        }
+        drop(conn);
+
+        let migrated_ids = migrate_sqlite_db(&db_path).expect("migrate legacy fixture");
+        assert!(
+            migrated_ids
+                .iter()
+                .any(|id| id == "v15_add_recipients_json_to_messages"),
+            "canonical v15 migration must be reported"
+        );
+
+        let migrated = open_canonical_read_only(&db_path).expect("open migrated fixture");
+        let rows = migrated
+            .query_sync(
+                "SELECT recipients_json, topic, reply_to FROM messages WHERE id = 1",
+                &[],
+            )
+            .expect("query migrated message");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("recipients_json")
+                .expect("recipients_json value"),
+            "{}"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("topic").expect("topic value"),
+            "import-topic"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<i64>("reply_to")
+                .expect("reply_to value"),
+            77
+        );
+        let index_rows = migrated
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_messages_project_topic', 'ix_messages_reply_to')",
+                &[],
+            )
+            .expect("query migrated message indexes");
+        assert_eq!(index_rows.len(), 2, "both Python message indexes survive");
+        let migration_rows = migrated
+            .query_sync(
+                "SELECT id FROM mcp_agent_mail_migrations \
+                 WHERE id = 'v15_add_recipients_json_to_messages'",
+                &[],
+            )
+            .expect("query canonical migration ledger");
+        assert_eq!(migration_rows.len(), 1, "canonical v15 must be recorded");
+        drop(migrated);
+
+        verify_runtime_sqlite_readable(&db_path, "migrated fixture")
+            .expect("migrated fixture remains runtime-readable");
     }
 
     fn seed_v20_agents_fixture(path: &Path) {

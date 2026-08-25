@@ -3518,7 +3518,22 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    const REBUILD_SQL: [&str; 25] = [
+    let columns = match conn.query(cx, "PRAGMA table_info(messages)", &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let has_column = |column: &str| {
+        columns.iter().any(|row| {
+            row.get_named::<String>("name")
+                .is_ok_and(|name| name.eq_ignore_ascii_case(column))
+        })
+    };
+    let has_topic = has_column("topic");
+    let has_reply_to = has_column("reply_to");
+
+    const PRE_REBUILD_SQL: [&str; 12] = [
         "DROP TRIGGER IF EXISTS fts_messages_ai",
         "DROP TRIGGER IF EXISTS fts_messages_ad",
         "DROP TRIGGER IF EXISTS fts_messages_au",
@@ -3535,6 +3550,30 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
         "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
         "DROP TABLE IF EXISTS messages_v15_rebuild",
+    ];
+
+    for sql in PRE_REBUILD_SQL {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    let optional_definitions = match (has_topic, has_reply_to) {
+        (true, true) => ", topic VARCHAR(64), reply_to INTEGER",
+        (true, false) => ", topic VARCHAR(64)",
+        (false, true) => ", reply_to INTEGER",
+        (false, false) => "",
+    };
+    let optional_columns = match (has_topic, has_reply_to) {
+        (true, true) => ", topic, reply_to",
+        (true, false) => ", topic",
+        (false, true) => ", reply_to",
+        (false, false) => "",
+    };
+    let create_sql = format!(
         "CREATE TABLE messages_v15_rebuild (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
             project_id INTEGER NOT NULL,\
@@ -3545,19 +3584,34 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
             importance TEXT NOT NULL DEFAULT 'normal',\
             ack_required INTEGER NOT NULL DEFAULT 0,\
             created_ts INTEGER NOT NULL,\
-            recipients_json TEXT NOT NULL DEFAULT '{}',\
+            recipients_json TEXT NOT NULL DEFAULT '{{}}',\
             attachments TEXT NOT NULL DEFAULT '[]'\
-        )",
+            {optional_definitions}\
+        )"
+    );
+    let insert_sql = format!(
         "INSERT INTO messages_v15_rebuild \
             (id, project_id, sender_id, thread_id, subject, body_md, importance, \
-             ack_required, created_ts, recipients_json, attachments) \
+             ack_required, created_ts, recipients_json, attachments{optional_columns}) \
          SELECT id, project_id, sender_id, thread_id, subject, body_md, \
                 COALESCE(NULLIF(importance, ''), 'normal'), \
                 COALESCE(ack_required, 0), \
                 created_ts, \
-                '{}', \
-                COALESCE(NULLIF(attachments, ''), '[]') \
-         FROM messages",
+                '{{}}', \
+                COALESCE(NULLIF(attachments, ''), '[]'){optional_columns} \
+         FROM messages"
+    );
+
+    for sql in [&create_sql, &insert_sql] {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    const POST_REBUILD_SQL: [&str; 11] = [
         "DROP TABLE messages",
         "ALTER TABLE messages_v15_rebuild RENAME TO messages",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts)",
@@ -3571,8 +3625,39 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TABLE IF EXISTS messages_v15_rebuild",
     ];
 
-    for sql in REBUILD_SQL {
+    for sql in POST_REBUILD_SQL {
         match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    if has_topic {
+        match conn
+            .execute(
+                cx,
+                "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic)",
+                &[],
+            )
+            .await
+        {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    if has_reply_to {
+        match conn
+            .execute(
+                cx,
+                "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages(reply_to)",
+                &[],
+            )
+            .await
+        {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => return Outcome::Err(err),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -4928,10 +5013,16 @@ mod tests {
                 importance TEXT NOT NULL,\
                 ack_required INTEGER NOT NULL,\
                 created_ts INTEGER NOT NULL,\
+                topic VARCHAR(64),\
+                reply_to INTEGER,\
                 attachments TEXT NOT NULL DEFAULT '[]'\
             )",
         )
         .expect("create legacy messages table");
+        conn.execute_raw("CREATE INDEX idx_messages_project_topic ON messages(project_id, topic)")
+            .expect("create legacy topic index");
+        conn.execute_raw("CREATE INDEX ix_messages_reply_to ON messages(reply_to)")
+            .expect("create legacy reply index");
         conn.execute_raw(
             "CREATE TABLE message_recipients (\
                 message_id INTEGER NOT NULL,\
@@ -4955,8 +5046,8 @@ mod tests {
         .expect("create inbox_stats table");
         conn.execute_raw(
             "INSERT INTO messages \
-                (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-             VALUES (1, 1, 'thread', 'subject', 'body', 'normal', 0, 123, '[]')",
+             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, topic, reply_to, attachments) \
+             VALUES (1, 1, 'thread', 'subject', 'body', 'normal', 0, 123, 'migration-topic', 77, '[]')",
         )
         .expect("insert legacy message row");
         conn.execute_raw(TRG_INBOX_STATS_INSERT_COMPAT_SQL)
@@ -4986,13 +5077,46 @@ mod tests {
         });
 
         let rows = conn
-            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .query_sync(
+                "SELECT recipients_json, topic, reply_to FROM messages WHERE id = 1",
+                &[],
+            )
             .expect("query messages");
         assert_eq!(
             rows[0]
                 .get_named::<String>("recipients_json")
                 .expect("recipients_json value"),
             "{}"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("topic").expect("topic value"),
+            "migration-topic"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<i64>("reply_to")
+                .expect("reply_to value"),
+            77
+        );
+        let index_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_messages_project_topic', 'ix_messages_reply_to') \
+                 ORDER BY name",
+                &[],
+            )
+            .expect("query preserved message indexes");
+        let index_names: Vec<String> = index_rows
+            .iter()
+            .map(|row| row.get_named::<String>("name").expect("index name"))
+            .collect();
+        assert_eq!(
+            index_names,
+            vec![
+                "idx_messages_project_topic".to_string(),
+                "ix_messages_reply_to".to_string()
+            ]
         );
 
         let trigger_rows = conn
