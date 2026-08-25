@@ -29,6 +29,8 @@ jobs:
           # beads_rust (path patch) are sibling checkouts; everything else
           # resolves from crates.io.
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git -C ../frankensearch fetch --depth 1 origin f4f3faf7d610c355c28e83939ceea3c0d8481cc5
+          git -C ../frankensearch checkout --detach FETCH_HEAD
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
