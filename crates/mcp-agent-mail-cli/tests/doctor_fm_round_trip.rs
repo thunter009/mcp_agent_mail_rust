@@ -633,7 +633,12 @@ fn round_trip_guard_plugin_not_executable_op_chmod() {
     // fix() chmods to 0o755 via the chokepoint; undo() restores
     // the original 0o644.
     let td = TempDir::new().expect("tempdir");
-    git2::Repository::init(td.path()).expect("git init");
+    let git_repo = git2::Repository::init(td.path()).expect("git init");
+    git_repo
+        .config()
+        .expect("git config")
+        .set_str("core.hooksPath", ".git/hooks")
+        .expect("isolate hooks path");
     let hooks_dir = td.path().join(".git").join("hooks");
     fs::create_dir_all(&hooks_dir).expect("mkdir .git/hooks");
 

@@ -1235,6 +1235,25 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
     );
 }
 
+fn agent_archive_profile_json(
+    agent: &mcp_agent_mail_db::AgentRow,
+    deregistered_at: Option<i64>,
+) -> serde_json::Value {
+    json!({
+        "name": &agent.name,
+        "program": &agent.program,
+        "model": &agent.model,
+        "task_description": &agent.task_description,
+        "inception_ts": micros_to_iso(agent.inception_ts),
+        "last_active_ts": micros_to_iso(agent.last_active_ts),
+        "attachments_policy": &agent.attachments_policy,
+        "contact_policy": &agent.contact_policy,
+        "reaper_exempt": agent.reaper_exempt != 0,
+        "retired_at": agent.retired_at.map(micros_to_iso),
+        "deregistered_at": deregistered_at.map(micros_to_iso),
+    })
+}
+
 /// If the project root is ephemeral and the current storage root is the
 /// default global mailbox, compute an isolated storage root and return a
 /// rerouted clone of `config`.  Returns `None` when no reroute is needed
@@ -1578,6 +1597,8 @@ pub struct AgentResponse {
     pub task_description: String,
     pub inception_ts: String,
     pub last_active_ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub project_id: i64,
     pub attachments_policy: String,
     #[serde(default)]
@@ -1589,6 +1610,76 @@ pub struct AgentResponse {
     /// `sender_token` when sending messages to prove ownership of this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_token: Option<String>,
+}
+
+fn authenticate_lifecycle_agent(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    registration_token: Option<&str>,
+    pane_id: Option<&str>,
+    action: &str,
+) -> McpResult<()> {
+    let token_matches = registration_token.is_some_and(|provided| {
+        agent.registration_token.as_deref().is_some_and(|stored| {
+            mcp_agent_mail_core::setup::constant_time_str_eq(provided, stored)
+        })
+    });
+    let pane_matches = registration_token.is_none()
+        && mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+            &project.human_key,
+            pane_id,
+        )
+        .is_some_and(|resolved| resolved == agent.name);
+    if token_matches || pane_matches {
+        return Ok(());
+    }
+
+    Err(legacy_tool_error(
+        "AUTHENTICATION_REQUIRED",
+        format!(
+            "{action} requires registration_token for agent '{}', or a pane session bound to that agent.",
+            agent.name
+        ),
+        true,
+        json!({
+            "agent_name": agent.name,
+            "project_key": project.human_key,
+            "token_param": "registration_token",
+        }),
+    ))
+}
+
+async fn reject_deregistered_lifecycle_transition(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &mcp_agent_mail_db::AgentRow,
+    action: &str,
+) -> McpResult<()> {
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let deregistered_at = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+    )?;
+    let Some(deregistered_at) = deregistered_at else {
+        return Ok(());
+    };
+
+    Err(legacy_tool_error(
+        "INVALID_ARGUMENT",
+        format!(
+            "Agent '{}' was deregistered and cannot be {action}; create a new identity instead.",
+            agent.name
+        ),
+        false,
+        json!({
+            "field": "agent_name",
+            "agent_name": agent.name,
+            "state": "deregistered",
+            "action": action,
+            "deregistered_at": micros_to_iso(deregistered_at),
+        }),
+    ))
 }
 
 /// Whois response with optional recent commits
@@ -2221,15 +2312,7 @@ Check that all parameters have valid values."
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
-    let agent_json = serde_json::json!({
-        "name": row.name,
-        "program": row.program,
-        "model": row.model,
-        "task_description": row.task_description,
-        "inception_ts": micros_to_iso(row.inception_ts),
-        "last_active_ts": micros_to_iso(row.last_active_ts),
-        "attachments_policy": row.attachments_policy,
-    });
+    let agent_json = agent_archive_profile_json(&row, None);
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
@@ -2256,6 +2339,7 @@ Check that all parameters have valid values."
         task_description: row.task_description,
         inception_ts: micros_to_iso(row.inception_ts),
         last_active_ts: micros_to_iso(row.last_active_ts),
+        retired_at: row.retired_at.map(micros_to_iso),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
         reaper_exempt: row.reaper_exempt != 0,
@@ -2517,15 +2601,7 @@ Choose a different name (or omit the name to auto-generate one)."
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
-    let agent_json = serde_json::json!({
-        "name": row.name,
-        "program": row.program,
-        "model": row.model,
-        "task_description": row.task_description,
-        "inception_ts": micros_to_iso(row.inception_ts),
-        "last_active_ts": micros_to_iso(row.last_active_ts),
-        "attachments_policy": row.attachments_policy,
-    });
+    let agent_json = agent_archive_profile_json(&row, None);
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
@@ -2560,6 +2636,7 @@ Choose a different name (or omit the name to auto-generate one)."
         task_description: row.task_description,
         inception_ts: micros_to_iso(row.inception_ts),
         last_active_ts: micros_to_iso(row.last_active_ts),
+        retired_at: row.retired_at.map(micros_to_iso),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
         reaper_exempt: row.reaper_exempt != 0,
@@ -2583,6 +2660,154 @@ Choose a different name (or omit the name to auto-generate one)."
         serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
     }
+}
+
+/// Soft-delete an agent while preserving its message history.
+#[tool(
+    description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views."
+)]
+pub async fn retire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "retire_agent",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "retired").await?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let updated_agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            Some(mcp_agent_mail_db::now_micros()),
+        )
+        .await,
+    )?;
+    let agent_json = agent_archive_profile_json(&updated_agent, None);
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    Ok(json!({
+        "status": "retired",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
+}
+
+/// Restore a retired agent to active status.
+#[tool(
+    description = "Restore a retired agent back to active status. The agent will resume accepting new messages."
+)]
+pub async fn unretire_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "unretire_agent",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &agent, "unretired").await?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let updated_agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), &pool, agent_id, None).await,
+    )?;
+    let agent_json = agent_archive_profile_json(&updated_agent, None);
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    Ok(json!({
+        "status": "active",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
+}
+
+/// Remove an agent from the active roster while preserving message history.
+#[tool(
+    description = "Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages."
+)]
+pub async fn deregister_agent(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &agent,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "deregister_agent",
+    )?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let deregistered_at = mcp_agent_mail_db::now_micros();
+    let updated_agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::deregister_agent(ctx.cx(), &pool, agent_id, deregistered_at)
+            .await,
+    )?;
+    let agent_json = agent_archive_profile_json(&updated_agent, Some(deregistered_at));
+    try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
+
+    Ok(json!({
+        "status": "deregistered",
+        "agent_name": agent_name,
+        "project_key": project_key,
+    })
+    .to_string())
 }
 
 /// Validate `attachments_policy` value.
@@ -2693,6 +2918,7 @@ pub async fn whois(
             task_description: agent_row.task_description,
             inception_ts: micros_to_iso(agent_row.inception_ts),
             last_active_ts: micros_to_iso(agent_row.last_active_ts),
+            retired_at: agent_row.retired_at.map(micros_to_iso),
             project_id: agent_row.project_id,
             attachments_policy: agent_row.attachments_policy,
             reaper_exempt: agent_row.reaper_exempt != 0,
@@ -2836,7 +3062,7 @@ pub fn cleanup_pane_identities(
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
-/// List all registered agents in a project.
+/// List active registered agents in a project.
 ///
 /// # Parameters
 /// - `project_key`: Project slug or human key
@@ -2884,7 +3110,7 @@ pub async fn list_agents(
     });
 
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents_bounded(
+        mcp_agent_mail_db::queries::list_active_agents_bounded(
             ctx.cx(),
             &pool,
             project_id,
@@ -3375,6 +3601,7 @@ mod tests {
             task_description: "Testing".into(),
             inception_ts: "2026-02-06T00:00:00Z".into(),
             last_active_ts: "2026-02-06T01:00:00Z".into(),
+            retired_at: Some("2026-02-06T02:00:00Z".into()),
             project_id: 1,
             attachments_policy: "auto".into(),
             reaper_exempt: false,
@@ -3391,6 +3618,7 @@ mod tests {
         assert_eq!(json["attachments_policy"], "auto");
         assert_eq!(json["id"], 42);
         assert_eq!(json["project_id"], 1);
+        assert_eq!(json["retired_at"], "2026-02-06T02:00:00Z");
         assert!(json["capabilities"].as_array().unwrap().len() >= 4);
     }
 
@@ -3404,6 +3632,7 @@ mod tests {
             task_description: "Testing".into(),
             inception_ts: "2026-02-06T00:00:00Z".into(),
             last_active_ts: "2026-02-06T01:00:00Z".into(),
+            retired_at: None,
             project_id: 1,
             attachments_policy: "auto".into(),
             reaper_exempt: false,
@@ -3431,6 +3660,7 @@ mod tests {
                 task_description: String::new(),
                 inception_ts: "2026-02-06T00:00:00Z".into(),
                 last_active_ts: "2026-02-06T00:00:00Z".into(),
+                retired_at: None,
                 project_id: 1,
                 attachments_policy: "auto".into(),
                 reaper_exempt: false,
@@ -3466,6 +3696,7 @@ mod tests {
                 task_description: String::new(),
                 inception_ts: String::new(),
                 last_active_ts: String::new(),
+                retired_at: None,
                 project_id: 1,
                 attachments_policy: "none".into(),
                 reaper_exempt: false,

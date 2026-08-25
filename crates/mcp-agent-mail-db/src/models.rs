@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sqlmodel::Model;
 
-use crate::timestamps::{micros_to_naive, now_micros};
+use crate::timestamps::{iso_to_micros, micros_to_naive, now_micros};
 
 // =============================================================================
 // Project
@@ -149,6 +149,10 @@ pub struct AgentRow {
     /// when sending messages to prove they own this agent identity.
     #[sqlmodel(nullable)]
     pub registration_token: Option<String>,
+
+    /// Retirement timestamp in UTC microseconds; `None` means active.
+    #[sqlmodel(nullable)]
+    pub retired_at: Option<i64>,
 }
 
 /// Compact agent projection used to hydrate the in-process ATC population.
@@ -182,6 +186,7 @@ impl Default for AgentRow {
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         }
     }
 }
@@ -204,6 +209,7 @@ impl AgentRow {
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
             registration_token: None,
+            retired_at: None,
         }
     }
 
@@ -211,6 +217,25 @@ impl AgentRow {
     pub fn touch(&mut self) {
         self.last_active_ts = now_micros();
     }
+}
+
+/// System-owned task-description namespace used to preserve Python archive parity.
+pub const DEREGISTERED_TASK_PREFIX: &str = "[DEREGISTERED ";
+
+/// Whether a task description collides with the system-owned deregistration tombstone.
+#[must_use]
+pub fn task_description_uses_reserved_deregistered_prefix(description: &str) -> bool {
+    description.starts_with(DEREGISTERED_TASK_PREFIX)
+}
+
+/// Parse event time from Python or legacy Rust deregistration tombstone.
+#[must_use]
+pub fn deregistered_task_timestamp_micros(description: &str) -> Option<i64> {
+    let (raw_timestamp, _) = description
+        .strip_prefix(DEREGISTERED_TASK_PREFIX)?
+        .split_once(']')?;
+    let raw_timestamp = raw_timestamp.strip_prefix("at ").unwrap_or(raw_timestamp);
+    iso_to_micros(&raw_timestamp.replacen(' ', "T", 1))
 }
 
 // =============================================================================
@@ -580,6 +605,29 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         agent.touch();
         assert!(agent.last_active_ts >= original);
+    }
+
+    #[test]
+    fn deregistered_task_namespace_covers_python_and_legacy_rust_markers() {
+        assert!(!task_description_uses_reserved_deregistered_prefix(
+            "ordinary blocked agent"
+        ));
+        assert!(task_description_uses_reserved_deregistered_prefix(
+            "[DEREGISTERED 2026-08-24T00:00:00Z] python"
+        ));
+        assert!(task_description_uses_reserved_deregistered_prefix(
+            "[DEREGISTERED at 2026-08-24T00:00:00Z] legacy rust"
+        ));
+        assert_eq!(
+            deregistered_task_timestamp_micros("[DEREGISTERED 1970-01-01T00:00:01.234567Z] python"),
+            Some(1_234_567)
+        );
+        assert_eq!(
+            deregistered_task_timestamp_micros(
+                "[DEREGISTERED at 1970-01-01 00:00:01.234567] legacy rust"
+            ),
+            Some(1_234_567)
+        );
     }
 
     // ── MessageRow ──────────────────────────────────────────────────

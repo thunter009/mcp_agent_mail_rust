@@ -459,6 +459,32 @@ pub mod tool_util {
                     _ => db_error_to_mcp_error(*inner),
                 }
             }
+            DbError::AgentRetired { name, retired_at } => legacy_tool_error(
+                "AGENT_RETIRED",
+                format!(
+                    "Agent '{name}' is retired and no longer accepts new messages. \
+                 Use unretire_agent to restore it first."
+                ),
+                true,
+                json!({
+                    "agent_name": name,
+                    "retired_at": mcp_agent_mail_db::micros_to_iso(retired_at),
+                }),
+            ),
+            DbError::AgentDeregistered {
+                name,
+                deregistered_at,
+            } => legacy_tool_error(
+                "AGENT_DEREGISTERED",
+                format!(
+                    "Agent '{name}' has been deregistered and can no longer send new messages."
+                ),
+                false,
+                json!({
+                    "agent_name": name,
+                    "deregistered_at": mcp_agent_mail_db::micros_to_iso(deregistered_at),
+                }),
+            ),
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
@@ -2826,6 +2852,9 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Identity
     ("register_agent", clusters::IDENTITY),
     ("create_agent_identity", clusters::IDENTITY),
+    ("deregister_agent", clusters::IDENTITY),
+    ("retire_agent", clusters::IDENTITY),
+    ("unretire_agent", clusters::IDENTITY),
     ("whois", clusters::IDENTITY),
     ("resolve_pane_identity", clusters::IDENTITY),
     ("cleanup_pane_identities", clusters::IDENTITY),

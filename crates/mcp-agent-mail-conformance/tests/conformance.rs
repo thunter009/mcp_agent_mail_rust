@@ -195,6 +195,51 @@ fn align_metrics_tools(actual: &mut Value, expected: &Value) {
     });
 }
 
+/// Fold Rust's client-refusal counter into the legacy Python error counter.
+///
+/// Rust exposes `rejections` separately, while captured Python fixtures only
+/// have `errors`. Preserve fixtures that explicitly opt into the split field.
+fn align_metrics_error_counters(actual: &mut Value, expected: &Value) {
+    let Some(expected_tools) = expected.get("tools").and_then(Value::as_array) else {
+        return;
+    };
+    let split_counter_tools: std::collections::HashSet<String> = expected_tools
+        .iter()
+        .filter(|tool| tool.get("rejections").is_some())
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(String::from))
+        .collect();
+
+    let Some(actual_tools) = actual.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in actual_tools {
+        let Some(fields) = tool.as_object_mut() else {
+            continue;
+        };
+        if fields
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| split_counter_tools.contains(name))
+        {
+            continue;
+        }
+        let rejections = fields
+            .remove("rejections")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        // `remove` runs before this branch, so legacy fixtures also omit an
+        // explicitly serialized zero-valued Rust rejection counter.
+        if rejections == 0 {
+            continue;
+        }
+        let errors = fields.get("errors").and_then(Value::as_u64).unwrap_or(0);
+        fields.insert(
+            "errors".to_string(),
+            Value::from(errors.saturating_add(rejections)),
+        );
+    }
+}
+
 fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (Value, Value) {
     // Always null out auto-increment IDs since they're non-deterministic
     null_auto_increment_ids(&mut actual);
@@ -202,6 +247,7 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
 
     // Align tool lists (handle tools added after fixture generation)
     align_cluster_tools(&mut actual, &expected);
+    align_metrics_error_counters(&mut actual, &expected);
     align_metrics_tools(&mut actual, &expected);
 
     for ptr in &norm.ignore_json_pointers {
@@ -246,6 +292,95 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
     }
 
     (actual, expected)
+}
+
+#[test]
+fn metrics_rejections_match_legacy_python_error_counts() {
+    let actual = serde_json::json!({
+        "tools": [{
+            "name": "retire_agent",
+            "calls": 1,
+            "errors": 0,
+            "rejections": 1
+        }]
+    });
+    let expected = serde_json::json!({
+        "tools": [{
+            "name": "retire_agent",
+            "calls": 1,
+            "errors": 1
+        }]
+    });
+
+    let (actual, expected) = normalize_pair(actual, expected, &Normalize::default());
+    assert_eq!(actual, expected);
+
+    let zero_actual = serde_json::json!({
+        "tools": [{
+            "name": "retire_agent",
+            "calls": 1,
+            "errors": 0,
+            "rejections": 0
+        }]
+    });
+    let zero_expected = serde_json::json!({
+        "tools": [{
+            "name": "retire_agent",
+            "calls": 1,
+            "errors": 0
+        }]
+    });
+    let (actual, expected) = normalize_pair(zero_actual, zero_expected, &Normalize::default());
+    assert_eq!(actual, expected);
+
+    let split_expected = serde_json::json!({
+        "tools": [{
+            "name": "retire_agent",
+            "calls": 1,
+            "errors": 0,
+            "rejections": 1
+        }]
+    });
+    let (actual, expected) = normalize_pair(
+        split_expected.clone(),
+        split_expected,
+        &Normalize::default(),
+    );
+    assert_eq!(actual, expected);
+
+    let mixed_actual = serde_json::json!({
+        "tools": [
+            {
+                "name": "retire_agent",
+                "calls": 1,
+                "errors": 0,
+                "rejections": 1
+            },
+            {
+                "name": "send_message",
+                "calls": 2,
+                "errors": 0,
+                "rejections": 2
+            }
+        ]
+    });
+    let mixed_expected = serde_json::json!({
+        "tools": [
+            {
+                "name": "retire_agent",
+                "calls": 1,
+                "errors": 0,
+                "rejections": 1
+            },
+            {
+                "name": "send_message",
+                "calls": 2,
+                "errors": 2
+            }
+        ]
+    });
+    let (actual, expected) = normalize_pair(mixed_actual, mixed_expected, &Normalize::default());
+    assert_eq!(actual, expected);
 }
 
 fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, String> {
@@ -895,8 +1030,16 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
     ]
 }
 
+// Static Python-reference inputs cannot carry registration tokens minted by
+// this test server. Dynamic-token lifecycle parity is covered by
+// `lifecycle_tools_match_python_happy_shapes`, including auth and retry cases.
 fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
-    BTreeSet::from(["force_release_file_reservation"])
+    BTreeSet::from([
+        "deregister_agent",
+        "force_release_file_reservation",
+        "retire_agent",
+        "unretire_agent",
+    ])
 }
 
 fn rust_native_tool_case_shapes() -> BTreeMap<String, (bool, bool)> {
@@ -1112,6 +1255,17 @@ fn init_fixture_repo(repo_dir: &Path) {
         "git init failed for {} with status {status}",
         repo_dir.display()
     );
+
+    let config_status = std::process::Command::new("git")
+        .args(["config", "--local", "core.hooksPath", ".git/hooks"])
+        .current_dir(repo_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("git config {}: {e}", repo_dir.display()));
+    assert!(
+        config_status.success(),
+        "git config failed for {} with status {config_status}",
+        repo_dir.display()
+    );
 }
 
 fn initialize_runtime_mailbox(database_url: &str) {
@@ -1256,22 +1410,48 @@ fn insert_test_message(
 
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
 fn setup_fixture_env() -> FixtureEnv {
-    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("failed to canonicalize tempdir root");
+    let tmp = tempfile::Builder::new()
+        .prefix("mcp-agent-mail-conformance-")
+        .tempdir_in(temp_root)
+        .expect("failed to create tempdir");
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
     let fixture_repos_root = tmp.path().join("agent-mail-fixtures");
     let repo_install_dir = fixture_repos_root.join("repo_install");
     let repo_uninstall_dir = fixture_repos_root.join("repo_uninstall");
+    let fixture_home = tmp.path().join("home");
+    let fixture_xdg_config_home = tmp.path().join("xdg");
+    std::fs::create_dir_all(&fixture_home).expect("failed to create isolated home");
+    std::fs::create_dir_all(&fixture_xdg_config_home)
+        .expect("failed to create isolated XDG config home");
+    let git_config_global = tmp.path().join("gitconfig");
+    std::fs::write(&git_config_global, "").expect("failed to create isolated gitconfig");
     let storage_root_str = storage_root
         .to_str()
         .expect("storage_root must be valid UTF-8");
+    let git_config_global_str = git_config_global
+        .to_str()
+        .expect("git_config_global must be valid UTF-8");
+    let fixture_home_str = fixture_home
+        .to_str()
+        .expect("fixture_home must be valid UTF-8");
+    let fixture_xdg_config_home_str = fixture_xdg_config_home
+        .to_str()
+        .expect("fixture_xdg_config_home must be valid UTF-8");
     // Ensure fixtures run deterministically regardless of developer shell env.
     // Also explicitly disable tool filtering (otherwise tools may not be registered).
     let env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
         ("WORKTREES_ENABLED", "1"),
         ("STORAGE_ROOT", storage_root_str),
+        ("HOME", fixture_home_str),
+        ("XDG_CONFIG_HOME", fixture_xdg_config_home_str),
+        ("GIT_CONFIG_GLOBAL", git_config_global_str),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
@@ -1332,6 +1512,21 @@ fn parse_frontmatter(content: &str) -> Option<Value> {
     let end_idx = after_start.find("\n---")?;
     let json_str = &after_start[..end_idx];
     serde_json::from_str(json_str.trim()).ok()
+}
+
+#[test]
+fn install_precommit_guard_fixture_path_is_hermetic() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let repo_path = env
+        .tokens
+        .get(LEGACY_FIXTURE_REPO_INSTALL_PATH)
+        .expect("fixture install repository token")
+        .clone();
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+
+    mcp_agent_mail_tools::install_precommit_guard(&ctx, "abs-path-backend".to_string(), repo_path)
+        .expect("fixture install_precommit_guard should succeed");
 }
 
 #[test]
@@ -2037,7 +2232,13 @@ fn run_fixtures_against_rust_server_router() {
     );
 
     // --- Notification signal assertions (tool flow) ---
-    let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
+    let notif_temp_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("failed to canonicalize notifications tempdir root");
+    let notif_tmp = tempfile::Builder::new()
+        .prefix("mcp-agent-mail-notifications-")
+        .tempdir_in(notif_temp_root)
+        .expect("failed to create notifications tempdir");
     let notif_db_path = notif_tmp.path().join("db.sqlite3");
     let notif_db_url = format!("sqlite://{}", notif_db_path.display());
     let notif_storage_root = notif_tmp.path().join("archive");
@@ -3068,6 +3269,166 @@ fn handwritten_tool_failure_cases_match_rust_router() {
             }
         }
     }
+}
+
+#[test]
+fn lifecycle_tools_match_python_happy_shapes() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+    let project_key = env
+        .tmp
+        .path()
+        .join("lifecycle-happy")
+        .to_string_lossy()
+        .to_string();
+    let agent_name = "BlueLake";
+
+    execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "ensure_project",
+        Some(serde_json::json!({ "human_key": project_key })),
+    )
+    .expect("ensure_project router call")
+    .expect("ensure_project should succeed");
+
+    let registration = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "register_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "name": agent_name,
+            "return_registration_token": true
+        })),
+    )
+    .expect("register_agent router call")
+    .expect("register_agent should succeed");
+    let registration_token = registration
+        .get("registration_token")
+        .and_then(Value::as_str)
+        .expect("explicit token return should produce registration_token")
+        .to_string();
+
+    let wrong_token = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "retire_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": "wrong-token"
+        })),
+    )
+    .expect("retire_agent wrong-token router call")
+    .expect_err("retire_agent must reject a wrong token");
+    assert!(
+        wrong_token.contains("requires registration_token") && wrong_token.contains(agent_name),
+        "unexpected wrong-token error: {wrong_token}"
+    );
+
+    let retired = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "retire_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("retire_agent router call")
+    .expect("retire_agent should succeed");
+    assert_eq!(
+        retired,
+        serde_json::json!({
+            "status": "retired",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
+
+    let active = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "unretire_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("unretire_agent router call")
+    .expect("unretire_agent should succeed");
+    assert_eq!(
+        active,
+        serde_json::json!({
+            "status": "active",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
+
+    let deregistered = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "deregister_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("deregister_agent router call")
+    .expect("deregister_agent should succeed");
+    assert_eq!(
+        deregistered,
+        serde_json::json!({
+            "status": "deregistered",
+            "agent_name": agent_name,
+            "project_key": project_key
+        })
+    );
+
+    let repeated = execute_tool(
+        &env.router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "deregister_agent",
+        Some(serde_json::json!({
+            "project_key": project_key,
+            "agent_name": agent_name,
+            "registration_token": registration_token
+        })),
+    )
+    .expect("repeat deregister_agent router call")
+    .expect("repeat deregister_agent should be idempotent");
+    assert_eq!(repeated, deregistered);
+
+    assert_eq!(
+        mcp_agent_mail_storage::wbq_flush_status(),
+        mcp_agent_mail_storage::WbqFlushOutcome::Drained,
+        "lifecycle profile writes must drain before the fixture archive is removed"
+    );
+    mcp_agent_mail_storage::flush_async_commits();
 }
 
 #[test]

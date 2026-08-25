@@ -4,7 +4,7 @@
 
 use crate::DbConn;
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Error as SqlError, Value};
+use sqlmodel_core::{Connection, Error as SqlError, Row as SqlRow, Value};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -57,10 +57,20 @@ CREATE TABLE IF NOT EXISTS agents (
     contact_policy TEXT NOT NULL DEFAULT 'auto',
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
     registration_token TEXT,
+    retired_at INTEGER,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC);
+
+-- Durable deregistration ledger. The task-description tombstone remains a
+-- Python-compatible presentation artifact. Authorization and routing never
+-- derive lifecycle state from user-controlled profile text.
+CREATE TABLE IF NOT EXISTS agent_deregistrations (
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    deregistered_at INTEGER NOT NULL,
+    PRIMARY KEY(agent_id)
+);
 
 -- Messages table
 CREATE TABLE IF NOT EXISTS messages (
@@ -531,6 +541,53 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
              FROM messages AS m WHERE m.id = NEW.message_id; \
          END";
 
+/// Build the legacy TEXT-timestamp conversion shared by schema migrations.
+///
+/// Remove the fractional component before `strftime('%s', ...)` so SQLite
+/// cannot round the whole-second value and then add the original fraction a
+/// second time. Numeric microsecond strings bypass date parsing unchanged.
+fn legacy_text_timestamp_to_micros_sql(column: &str) -> String {
+    let value = format!("trim({column})");
+    let fraction_tail = format!("substr({value}, instr({value}, '.') + 1)");
+    let suffix_offset = format!(
+        "CASE \
+         WHEN instr({fraction_tail}, 'Z') > 0 THEN instr({fraction_tail}, 'Z') \
+         WHEN instr({fraction_tail}, '+') > 0 THEN instr({fraction_tail}, '+') \
+         WHEN instr({fraction_tail}, '-') > 0 THEN instr({fraction_tail}, '-') \
+         ELSE length({fraction_tail}) + 1 \
+         END"
+    );
+    let whole_second_value = format!(
+        "substr({value}, 1, instr({value}, '.') - 1) || \
+         substr({fraction_tail}, ({suffix_offset}))"
+    );
+    let fraction_digits = format!("substr({fraction_tail}, 1, ({suffix_offset}) - 1)");
+
+    format!(
+        "CASE \
+         WHEN {value} = '' THEN NULL \
+         WHEN {value} <> '' AND ( \
+              {value} NOT GLOB '*[^0-9]*' OR ( \
+                  length({value}) > 1 AND \
+                  substr({value}, 1, 1) IN ('+', '-') AND \
+                  substr({value}, 2) NOT GLOB '*[^0-9]*' \
+              ) \
+         ) \
+         THEN CAST({value} AS INTEGER) \
+         ELSE CAST(strftime('%s', \
+                  CASE WHEN instr({value}, '.') > 0 \
+                       THEN {whole_second_value} \
+                       ELSE {value} \
+                  END \
+              ) AS INTEGER) * 1000000 + \
+              CASE WHEN instr({value}, '.') > 0 \
+                   THEN CAST(substr(({fraction_digits}) || '000000', 1, 6) AS INTEGER) \
+                   ELSE 0 \
+              END \
+         END"
+    )
+}
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -581,20 +638,8 @@ pub fn schema_migrations() -> Vec<Migration> {
     // v3: Convert legacy Python TEXT timestamps to INTEGER (i64 microseconds).
     // The Python schema used SQLAlchemy DATETIME columns that store ISO-8601 strings
     // like "2026-02-04 22:13:11.079199", but the Rust port expects i64 microseconds.
-    // The conversion: strftime('%s', text) * 1000000 + fractional_micros
-    let ts_conversion = |col: &str| -> String {
-        format!(
-            "CASE \
-                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
-                 THEN CAST(trim({col}) AS INTEGER) \
-                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-                      CASE WHEN instr({col}, '.') > 0 \
-                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                           ELSE 0 \
-                      END \
-             END"
-        )
-    };
+    // Parse whole seconds first, then add an independently normalized fraction.
+    let ts_conversion = legacy_text_timestamp_to_micros_sql;
 
     // projects.created_at
     migrations.push(Migration::new(
@@ -2274,6 +2319,58 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v27: Agent retirement lifecycle parity ─────────────────────
+    //
+    // Python databases may already carry this column with DATETIME/TEXT
+    // values. The migration runner reconciles the duplicate ADD COLUMN, then
+    // the follow-up normalizes preserved retirement state to microseconds.
+    migrations.push(Migration::new(
+        "v27_agents_retired_at".to_string(),
+        "add nullable retired_at column for agent lifecycle state".to_string(),
+        "ALTER TABLE agents ADD COLUMN retired_at INTEGER DEFAULT NULL".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v27_fix_agents_retired_at_text_timestamp".to_string(),
+        "convert imported retired_at TEXT timestamps to integer microseconds".to_string(),
+        format!(
+            "UPDATE agents SET retired_at = ({}) WHERE typeof(retired_at) = 'text'",
+            ts_conversion("retired_at")
+        ),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v27_create_agent_deregistrations".to_string(),
+        "create explicit agent deregistration lifecycle ledger".to_string(),
+        "CREATE TABLE IF NOT EXISTS agent_deregistrations (\
+             agent_id INTEGER NOT NULL REFERENCES agents(id),\
+             deregistered_at INTEGER NOT NULL,\
+             PRIMARY KEY(agent_id)\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+    let legacy_deregistered_timestamp = "CASE \
+         WHEN task_description LIKE '[DEREGISTERED at %] %' THEN \
+              substr(task_description, length('[DEREGISTERED at ') + 1, \
+                     instr(task_description, ']') - length('[DEREGISTERED at ') - 1) \
+         ELSE substr(task_description, length('[DEREGISTERED ') + 1, \
+                     instr(task_description, ']') - length('[DEREGISTERED ') - 1) \
+         END";
+    let legacy_deregistered_micros = ts_conversion(legacy_deregistered_timestamp);
+    migrations.push(Migration::new(
+        "v27_backfill_agent_deregistrations".to_string(),
+        "backfill explicit deregistration state from legacy Python tombstones".to_string(),
+        format!(
+            "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+             SELECT id, COALESCE(({}), last_active_ts) FROM agents \
+             WHERE contact_policy = 'block_all' \
+               AND task_description LIKE '[DEREGISTERED %] %'",
+            legacy_deregistered_micros
+        ),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -3389,7 +3486,7 @@ async fn migration_preflight_already_satisfied<C: Connection>(
             Outcome::Ok(rows) => Outcome::Ok(
                 rows.into_iter()
                     .filter_map(|row| row.get_named::<String>("name").ok())
-                    .any(|name| name == column),
+                    .any(|name| name.eq_ignore_ascii_case(&column)),
             ),
             Outcome::Err(query_err) => Outcome::Err(query_err),
             Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
@@ -3484,6 +3581,304 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     }
 
     ensure_inbox_delivery_events_recipient_insert_trigger(cx, conn).await
+}
+
+const V27_CREATE_REBUILD_AGENTS_SQL: &str = "CREATE TABLE agents_v27_rebuild (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         project_id INTEGER NOT NULL REFERENCES projects(id),\
+         name TEXT NOT NULL,\
+         program TEXT NOT NULL,\
+         model TEXT NOT NULL,\
+         task_description TEXT NOT NULL DEFAULT '',\
+         inception_ts INTEGER NOT NULL,\
+         last_active_ts INTEGER NOT NULL,\
+         attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+         contact_policy TEXT NOT NULL DEFAULT 'auto',\
+         reaper_exempt INTEGER NOT NULL DEFAULT 0,\
+         registration_token TEXT,\
+         retired_at INTEGER,\
+         UNIQUE(project_id, name)\
+     )";
+
+const V27_INSERT_REBUILT_AGENT_SQL: &str = "INSERT INTO agents_v27_rebuild (\
+         id, project_id, name, program, model, task_description,\
+         inception_ts, last_active_ts, attachments_policy, contact_policy,\
+         reaper_exempt, registration_token, retired_at\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
+
+const V27_FINALIZE_REBUILT_AGENTS_SQL: [&str; 2] = [
+    "DROP TABLE agents",
+    "ALTER TABLE agents_v27_rebuild RENAME TO agents",
+];
+
+fn v27_schema_objects(rows: Vec<SqlRow>) -> std::result::Result<Vec<(String, String)>, SqlError> {
+    let mut objects = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = row.get_named::<String>("name")?;
+        if matches!(name.as_str(), "agents_ai" | "agents_ad" | "agents_au") {
+            continue;
+        }
+        objects.push((name, row.get_named::<String>("sql")?));
+    }
+    Ok(objects)
+}
+
+fn v27_agent_timestamp_value(row: &SqlRow, field: &str) -> std::result::Result<Value, SqlError> {
+    if let Ok(value) = row.get_named::<i64>(field) {
+        return Ok(Value::BigInt(value));
+    }
+    let raw = row.get_named::<String>(field)?;
+    if let Ok(value) = raw.trim().parse::<i64>() {
+        return Ok(Value::BigInt(value));
+    }
+    let normalized = raw.replacen(' ', "T", 1);
+    crate::iso_to_micros(normalized.trim())
+        .map(Value::BigInt)
+        .ok_or_else(|| {
+            SqlError::Custom(format!("v27 cannot parse agents.{field} timestamp {raw:?}"))
+        })
+}
+
+fn v27_agent_values(rows: Vec<SqlRow>) -> std::result::Result<Vec<Vec<Value>>, SqlError> {
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let registration_token = row.get_named::<Option<String>>("registration_token")?;
+        values.push(vec![
+            Value::BigInt(row.get_named::<i64>("id")?),
+            Value::BigInt(row.get_named::<i64>("project_id")?),
+            Value::Text(row.get_named::<String>("name")?),
+            Value::Text(row.get_named::<String>("program")?),
+            Value::Text(row.get_named::<String>("model")?),
+            Value::Text(row.get_named::<String>("task_description")?),
+            v27_agent_timestamp_value(&row, "inception_ts")?,
+            v27_agent_timestamp_value(&row, "last_active_ts")?,
+            Value::Text(row.get_named::<String>("attachments_policy")?),
+            Value::Text(row.get_named::<String>("contact_policy")?),
+            Value::BigInt(row.get_named::<i64>("reaper_exempt")?),
+            registration_token.map_or(Value::Null, Value::Text),
+            // Both specialized executors prove `retired_at` is absent before
+            // rebuilding, so source rows cannot contain retirement state here.
+            Value::Null,
+        ]);
+    }
+    Ok(values)
+}
+
+/// Add `agents.retired_at` without asking FrankenSQLite to reparse a legacy
+/// Python `CREATE TABLE agents` statement in place.
+///
+/// Some imported tables use DATETIME/TEXT spellings that FrankenSQLite can
+/// read but cannot yet rewrite through `ALTER TABLE ... ADD COLUMN`. Rebuild
+/// the table with the canonical schema instead, preserving every explicit
+/// index and trigger that survived the earlier migration steps.
+///
+/// Every supported migration entrypoint disables SQLite foreign-key
+/// enforcement before starting (`PRAGMA_DB_INIT_SQL`,
+/// `PRAGMA_DB_INIT_BASE_SQL`, or the normal `DbConn` connection bundle). That
+/// schema-wide invariant is required here: declared `REFERENCES agents(id)`
+/// clauses are documentary, while the v23 delete triggers provide the live
+/// cascade behavior. The populated-mailbox regression below pins this contract
+/// with an FK-declared child row that must survive the rebuild.
+async fn execute_v27_add_retired_at_to_agents<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    // Keep this specialized executor safe when called directly or after an
+    // interrupted migration record write: an imported Python schema may
+    // already contain live retirement values even when v27 is not recorded.
+    let columns = match conn.query(cx, "PRAGMA table_info(agents)", &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if columns
+        .iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name.eq_ignore_ascii_case("retired_at"))
+    {
+        return Outcome::Ok(());
+    }
+
+    let schema_objects = match conn
+        .query(
+            cx,
+            "SELECT name, sql FROM sqlite_master \
+             WHERE tbl_name = 'agents' \
+               AND type IN ('index', 'trigger') \
+               AND sql IS NOT NULL \
+             ORDER BY type, name",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => match v27_schema_objects(rows) {
+            Ok(objects) => objects,
+            Err(error) => return Outcome::Err(error),
+        },
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let agent_rows = match conn
+        .query(
+            cx,
+            "SELECT id, project_id, name, program, model, task_description, \
+                    inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                    reaper_exempt, registration_token \
+             FROM agents ORDER BY id",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => match v27_agent_values(rows) {
+            Ok(values) => values,
+            Err(error) => return Outcome::Err(error),
+        },
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    match conn.execute(cx, V27_CREATE_REBUILD_AGENTS_SQL, &[]).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(error) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "v27 create rebuilt agents table: {error}"
+            )));
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    for params in agent_rows {
+        let agent_id = params.first().and_then(|value| match value {
+            Value::BigInt(value) => Some(*value),
+            _ => None,
+        });
+        match conn
+            .execute(cx, V27_INSERT_REBUILT_AGENT_SQL, &params)
+            .await
+        {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "v27 copy agent {agent_id:?} into rebuilt table: {error}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    for sql in V27_FINALIZE_REBUILT_AGENTS_SQL {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => {
+                return Outcome::Err(SqlError::Custom(format!("v27 execute `{sql}`: {error}")));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    for (name, sql) in schema_objects {
+        match conn.execute(cx, &sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "v27 recreate agents schema object `{name}`: {error}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
+/// Apply one base migration through the canonical synchronous SQLite lane.
+///
+/// The CLI's one-shot bootstrap cannot use the async migration runner. Keep
+/// its v27 behavior aligned with [`execute_v27_add_retired_at_to_agents`] so
+/// imported Python schemas never fall back to fragile in-place `ALTER TABLE`
+/// reparsing.
+pub fn apply_base_migration_canonical_sync(
+    conn: &crate::CanonicalDbConn,
+    migration: &Migration,
+) -> std::result::Result<(), SqlError> {
+    if migration.id != "v27_agents_retired_at" {
+        return conn.execute_raw(&migration.up);
+    }
+
+    let columns = conn.query_sync("PRAGMA table_info(agents)", &[])?;
+    if columns
+        .iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name.eq_ignore_ascii_case("retired_at"))
+    {
+        return Ok(());
+    }
+
+    conn.execute_raw("BEGIN IMMEDIATE")?;
+    let rebuild = (|| {
+        let schema_objects = v27_schema_objects(conn.query_sync(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE tbl_name = 'agents' \
+               AND type IN ('index', 'trigger') \
+               AND sql IS NOT NULL \
+             ORDER BY type, name",
+            &[],
+        )?)?;
+        let agent_rows = v27_agent_values(conn.query_sync(
+            "SELECT id, project_id, name, program, model, task_description, \
+                    inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                    reaper_exempt, registration_token \
+             FROM agents ORDER BY id",
+            &[],
+        )?)?;
+
+        conn.execute_raw(V27_CREATE_REBUILD_AGENTS_SQL)
+            .map_err(|error| {
+                SqlError::Custom(format!("v27 create rebuilt agents table: {error}"))
+            })?;
+        for params in agent_rows {
+            let agent_id = params.first().and_then(|value| match value {
+                Value::BigInt(value) => Some(*value),
+                _ => None,
+            });
+            conn.execute_sync(V27_INSERT_REBUILT_AGENT_SQL, &params)
+                .map_err(|error| {
+                    SqlError::Custom(format!(
+                        "v27 copy agent {agent_id:?} into rebuilt table: {error}"
+                    ))
+                })?;
+        }
+        for sql in V27_FINALIZE_REBUILT_AGENTS_SQL {
+            conn.execute_raw(sql)
+                .map_err(|error| SqlError::Custom(format!("v27 execute `{sql}`: {error}")))?;
+        }
+        for (name, sql) in schema_objects {
+            conn.execute_raw(&sql).map_err(|error| {
+                SqlError::Custom(format!(
+                    "v27 recreate agents schema object `{name}`: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = rebuild {
+        let _ = conn.execute_raw("ROLLBACK");
+        return Err(error);
+    }
+    if let Err(error) = conn.execute_raw("COMMIT") {
+        let _ = conn.execute_raw("ROLLBACK");
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn ensure_inbox_delivery_events_recipient_insert_trigger<C: Connection>(
@@ -3851,6 +4246,8 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                     execute_v10a_dedup_agents_case_insensitive(cx, conn).await
                 } else if migration.id == "v15_add_recipients_json_to_messages" {
                     execute_v15_add_recipients_json_to_messages(cx, conn).await
+                } else if migration.id == "v27_agents_retired_at" {
+                    execute_v27_add_retired_at_to_agents(cx, conn).await
                 } else {
                     match conn.execute(cx, &migration.up, &[]).await {
                         Outcome::Ok(_) => Outcome::Ok(()),
@@ -6244,6 +6641,290 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
     fn derive_migration_id_unknown_returns_none() {
         assert_eq!(derive_migration_id_and_description("SELECT 1"), None);
         assert_eq!(derive_migration_id_and_description(""), None);
+    }
+
+    #[test]
+    fn v27_migration_rebuilds_legacy_agents_without_losing_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v27_legacy_agents.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                slug TEXT NOT NULL UNIQUE,\
+                human_key TEXT NOT NULL,\
+                created_at DATETIME NOT NULL\
+            )",
+        )
+        .expect("create projects table");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                program TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                task_description TEXT NOT NULL,\
+                inception_ts DATETIME NOT NULL,\
+                last_active_ts DATETIME NOT NULL,\
+                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                reaper_exempt INTEGER NOT NULL DEFAULT 0,\
+                registration_token TEXT,\
+                UNIQUE(project_id, name)\
+            )",
+        )
+        .expect("create legacy agents table");
+        conn.execute_raw(
+            "CREATE INDEX idx_agents_registration_token ON agents(registration_token)",
+        )
+        .expect("create legacy agent index");
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (\
+                 id INTEGER PRIMARY KEY,\
+                 agent_id INTEGER NOT NULL REFERENCES agents(id)\
+             )",
+        )
+        .expect("create trigger target");
+        conn.execute_raw(
+            "CREATE TRIGGER trg_agents_cascade_file_reservations \
+             AFTER DELETE ON agents \
+             BEGIN DELETE FROM file_reservations WHERE agent_id = OLD.id; END",
+        )
+        .expect("create legacy agent trigger");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'legacy', '/tmp/legacy', '2026-02-24 15:30:00')",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents (\
+                 id, project_id, name, program, model, task_description,\
+                 inception_ts, last_active_ts, attachments_policy, contact_policy,\
+                 reaper_exempt, registration_token\
+             ) VALUES (\
+                 7, 1, 'BlueLake', 'python', 'legacy', 'preserve me',\
+                 '2026-02-24 15:30:01.000001', '2026-02-24 15:30:02.000002', 'inline', 'open',\
+                 1, 'fixture-token'\
+             )",
+        )
+        .expect("insert legacy agent");
+        conn.execute_raw(
+            "INSERT INTO agents (\
+                 id, project_id, name, program, model, task_description,\
+                 inception_ts, last_active_ts, attachments_policy, contact_policy,\
+                 reaper_exempt, registration_token\
+             ) VALUES (\
+                 8, 1, 'RedStone', 'python', 'legacy',\
+                 '[DEREGISTERED 1970-01-01T00:00:01.234567Z] legacy session',\
+                 '1970-01-01 00:00:01.000000', '1970-01-01 00:00:09.000000',\
+                 'auto', 'block_all', 0, 'legacy-token'\
+             )",
+        )
+        .expect("insert legacy deregistered agent");
+        conn.execute_raw("INSERT INTO file_reservations (id, agent_id) VALUES (1, 7)")
+            .expect("insert trigger target row");
+
+        let foreign_keys = conn
+            .query_sync("PRAGMA foreign_keys", &[])
+            .expect("query foreign-key enforcement");
+        assert_eq!(
+            foreign_keys[0]
+                .get_named::<i64>("foreign_keys")
+                .expect("foreign_keys pragma value"),
+            0,
+            "Agent Mail migrations require documentary FK clauses with enforcement disabled"
+        );
+
+        let migrations: Vec<_> = schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v27_"))
+            .collect();
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_specific_migrations(&cx, conn, migrations)
+                    .await
+                    .into_result()
+                    .expect("run v27 migrations");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT id, name, task_description, attachments_policy, contact_policy, \
+                        reaper_exempt, registration_token, retired_at, inception_ts, last_active_ts \
+                 FROM agents WHERE id = 7",
+                &[],
+            )
+            .expect("query rebuilt agent");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get_named::<i64>("id").unwrap(), 7);
+        assert_eq!(row.get_named::<String>("name").unwrap(), "BlueLake");
+        assert_eq!(
+            row.get_named::<String>("task_description").unwrap(),
+            "preserve me"
+        );
+        assert_eq!(
+            row.get_named::<String>("attachments_policy").unwrap(),
+            "inline"
+        );
+        assert_eq!(row.get_named::<String>("contact_policy").unwrap(), "open");
+        assert_eq!(row.get_named::<i64>("reaper_exempt").unwrap(), 1);
+        assert_eq!(
+            row.get_named::<String>("registration_token").unwrap(),
+            "fixture-token"
+        );
+        assert_eq!(row.get_named::<Option<i64>>("retired_at").unwrap(), None);
+        assert_eq!(
+            row.get_named::<i64>("inception_ts").unwrap(),
+            crate::iso_to_micros("2026-02-24T15:30:01.000001").unwrap()
+        );
+        assert_eq!(
+            row.get_named::<i64>("last_active_ts").unwrap(),
+            crate::iso_to_micros("2026-02-24T15:30:02.000002").unwrap()
+        );
+        let deregistration = conn
+            .query_sync(
+                "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = 8",
+                &[],
+            )
+            .expect("query backfilled deregistration");
+        assert_eq!(deregistration.len(), 1);
+        assert_eq!(
+            deregistration[0]
+                .get_named::<i64>("deregistered_at")
+                .unwrap(),
+            1_234_567
+        );
+
+        let schema_objects = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE name IN (\
+                     'idx_agents_registration_token',\
+                     'trg_agents_cascade_file_reservations'\
+                 ) \
+                 ORDER BY name",
+                &[],
+            )
+            .expect("query preserved schema objects");
+        assert_eq!(schema_objects.len(), 2);
+
+        let reservation_rows = conn
+            .query_sync("SELECT agent_id FROM file_reservations", &[])
+            .expect("query trigger target before delete");
+        assert_eq!(
+            reservation_rows.len(),
+            1,
+            "FK-declared child state must survive the agents table rebuild"
+        );
+
+        conn.execute_raw("DELETE FROM agents WHERE id = 7")
+            .expect("exercise preserved trigger");
+        let reservation_rows = conn
+            .query_sync("SELECT agent_id FROM file_reservations", &[])
+            .expect("query trigger target");
+        assert!(reservation_rows.is_empty());
+    }
+
+    #[test]
+    fn v27_migration_preserves_imported_retired_at_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v27_retired_at.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                last_active_ts INTEGER NOT NULL DEFAULT 0,\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                retired_at DATETIME\
+            )",
+        )
+        .expect("create imported agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (retired_at) VALUES (?), (?), (?)",
+            &[
+                Value::Text("1970-01-01 00:00:01.999999".to_string()),
+                Value::Null,
+                Value::Text("   ".to_string()),
+            ],
+        )
+        .expect("insert imported retirement state");
+
+        let migrations: Vec<_> = schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v27_"))
+            .collect();
+        assert_eq!(
+            migrations.len(),
+            4,
+            "expected add, convert, deregistration ledger, and backfill v27 migrations"
+        );
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_specific_migrations(&cx, conn, migrations)
+                    .await
+                    .into_result()
+                    .expect("run v27 migrations");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT retired_at, typeof(retired_at) AS retired_at_type \
+                 FROM agents ORDER BY id",
+                &[],
+            )
+            .expect("query migrated retirement state");
+        assert_eq!(rows[0].get_named::<i64>("retired_at").unwrap(), 1_999_999);
+        assert_eq!(
+            rows[0].get_named::<String>("retired_at_type").unwrap(),
+            "integer"
+        );
+        assert_eq!(
+            rows[1].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            rows[2].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn base_agents_schema_declares_nullable_retired_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("base_retired_at.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(&init_schema_sql_base())
+            .expect("create base schema");
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("inspect agents schema");
+        let retired_at = columns
+            .iter()
+            .find(|row| row.get_named::<String>("name").ok().as_deref() == Some("retired_at"))
+            .expect("agents.retired_at column");
+
+        assert_eq!(retired_at.get_named::<String>("type").unwrap(), "INTEGER");
+        assert_eq!(retired_at.get_named::<i64>("notnull").unwrap(), 0);
     }
 
     // ── br-3h13.17.3 addendum: additional edge case (RubyPrairie) ──────

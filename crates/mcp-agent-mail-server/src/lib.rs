@@ -163,22 +163,22 @@ use mcp_agent_mail_db::{
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
-    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
-    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
+    CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
+    FetchInboxEvents, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
+    ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource,
+    InboxResource, InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
     MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
     MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
     ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
     ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
     RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
-    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
+    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
     ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
     ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
     ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
     ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -645,6 +645,27 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "create_agent_identity",
         clusters::IDENTITY,
         CreateAgentIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "deregister_agent",
+        clusters::IDENTITY,
+        DeregisterAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "retire_agent",
+        clusters::IDENTITY,
+        RetireAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "unretire_agent",
+        clusters::IDENTITY,
+        UnretireAgent,
     );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
     let server = add_tool(
@@ -16406,6 +16427,9 @@ fn accepts_pane_id_header(tool_name: &str) -> bool {
         tool_name,
         "register_agent"
             | "create_agent_identity"
+            | "deregister_agent"
+            | "retire_agent"
+            | "unretire_agent"
             | "macro_start_session"
             | "resolve_pane_identity"
     )
@@ -22385,6 +22409,75 @@ first body
                 .is_some(),
             "expected tools list result on /api alias"
         );
+    }
+
+    #[test]
+    fn tools_list_includes_agent_lifecycle_tools() {
+        let state = build_state(mcp_agent_mail_core::Config::default());
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 91_i64))
+            .expect("serialize tools/list request");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("tools/list response JSON");
+        let tools = body
+            .pointer("/result/tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools/list result");
+
+        for expected in ["retire_agent", "unretire_agent", "deregister_agent"] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == expected),
+                "tools/list omitted {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_tool_names_reach_tool_dispatch() {
+        let config = mcp_agent_mail_core::Config {
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        for (id, name) in [
+            (92_i64, "retire_agent"),
+            (93_i64, "unretire_agent"),
+            (94_i64, "deregister_agent"),
+        ] {
+            let mut req = make_request(Http1Method::Post, "/api", &[]);
+            req.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": {} })),
+                id,
+            ))
+            .expect("serialize tools/call request");
+
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200, "{name} dispatch HTTP status");
+            let body: serde_json::Value =
+                serde_json::from_slice(&resp.body).expect("tools/call response JSON");
+            assert_eq!(body["id"], id);
+            assert_ne!(
+                body.pointer("/error/code")
+                    .and_then(serde_json::Value::as_i64),
+                Some(-32601),
+                "{name} was not registered with the dispatcher: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_tools_accept_pane_id_header() {
+        for name in ["retire_agent", "unretire_agent", "deregister_agent"] {
+            assert!(
+                accepts_pane_id_header(name),
+                "{name} must accept pane binding"
+            );
+        }
     }
 
     #[test]

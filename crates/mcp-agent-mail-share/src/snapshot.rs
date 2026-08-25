@@ -84,7 +84,14 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "contact_policy",
             "reaper_exempt",
             "registration_token",
+            "retired_at",
         ],
+    },
+    KnownTable {
+        name: "agent_deregistrations",
+        page_by_column: Some("agent_id"),
+        primary_key_columns: &["agent_id"],
+        columns: &["agent_id", "deregistered_at"],
     },
     KnownTable {
         name: "messages",
@@ -1174,14 +1181,27 @@ mod tests {
                 project_id INTEGER NOT NULL, \
                 name TEXT NOT NULL, \
                 reaper_exempt INTEGER NOT NULL DEFAULT 0, \
-                registration_token TEXT\
+                registration_token TEXT, \
+                retired_at INTEGER\
             )",
         )
         .unwrap();
         conn.execute_raw(
             "INSERT INTO agents \
-             (id, project_id, name, reaper_exempt, registration_token) \
-             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret')",
+             (id, project_id, name, reaper_exempt, registration_token, retired_at) \
+             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret', 424242)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agent_deregistrations (\
+                agent_id INTEGER NOT NULL PRIMARY KEY, \
+                deregistered_at INTEGER NOT NULL\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) \
+             VALUES (7, 434343)",
         )
         .unwrap();
         drop(conn);
@@ -1191,7 +1211,8 @@ mod tests {
         let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
             .query_sync(
-                "SELECT reaper_exempt, registration_token FROM agents WHERE id = 7",
+                "SELECT reaper_exempt, registration_token, retired_at \
+                 FROM agents WHERE id = 7",
                 &[],
             )
             .unwrap();
@@ -1203,6 +1224,25 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("registration-secret")
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<Option<String>>("retired_at")
+                .unwrap()
+                .as_deref(),
+            Some("424242")
+        );
+
+        let rows = copy_conn
+            .query_sync(
+                "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = 7",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("deregistered_at").unwrap(),
+            "434343"
         );
     }
 

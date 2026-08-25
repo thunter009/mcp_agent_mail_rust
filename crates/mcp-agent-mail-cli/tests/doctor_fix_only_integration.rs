@@ -907,6 +907,12 @@ fn dispatch_only_handles_every_registered_id() {
                  registry entry exists but dispatch_only arm is missing",
                 spec.id
             ),
+            Err(fixers::DispatchError::Mutate(
+                mcp_agent_mail_cli::doctor::mutate::MutateError::OutOfScope(_),
+            )) if spec.id == fixers::codex_startup_timeout::FM_ID => {
+                // This FM discovers the ambient Codex config. Reaching the
+                // scope guard proves dispatch without mutating live state.
+            }
             Err(other) => panic!(
                 "unexpected dispatch_only error for registered FM `{}`: {other:?}",
                 spec.id

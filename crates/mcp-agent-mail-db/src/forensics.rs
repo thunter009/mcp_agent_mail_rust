@@ -4235,9 +4235,9 @@ mod tests {
         prepare_recovery_receipt, read_sqlite_header_fields, redact_database_url,
         verify_recovery_receipt_state, verify_recovery_receipt_state_for_promotion,
     };
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::ffi::OsString;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::os::unix::ffi::OsStringExt;
 
     /// br-r6awv: reduced multiplicity of a SURVIVING identity is

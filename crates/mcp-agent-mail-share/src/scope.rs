@@ -265,7 +265,23 @@ pub fn apply_project_scope(
             }
         }
 
-        // 8. Delete agents
+        // 8. Delete lifecycle ledger rows for filtered-out agents before the
+        // parent agents. Legacy snapshots predate the explicit ledger.
+        if table_exists(&conn, "agent_deregistrations")? {
+            exec(
+                &conn,
+                &format!(
+                    "DELETE FROM agent_deregistrations \
+                     WHERE agent_id IN (\
+                         SELECT id FROM agents WHERE project_id NOT IN ({p})\
+                     )",
+                    p = placeholders
+                ),
+                &id_values,
+            )?;
+        }
+
+        // 9. Delete agents
         exec(
             &conn,
             &format!(
@@ -275,7 +291,7 @@ pub fn apply_project_scope(
             &id_values,
         )?;
 
-        // 9. Delete recipient links that now point at filtered-out agents, then
+        // 10. Delete recipient links that now point at filtered-out agents, then
         // repair the denormalized recipients envelope for kept messages.
         exec(
             &conn,
@@ -287,14 +303,14 @@ pub fn apply_project_scope(
             sync_scope_recipients_json(&conn)?;
         }
 
-        // 10. Rebuild agent-scoped aggregates that are not protected by FK
+        // 11. Rebuild agent-scoped aggregates that are not protected by FK
         // constraints. Kept agents can otherwise retain stale counts from
         // messages trimmed out of scope.
         if table_exists(&conn, "inbox_stats")? {
             rebuild_scope_inbox_stats(&conn)?;
         }
 
-        // 11. Delete projects
+        // 12. Delete projects
         exec(
             &conn,
             &format!(
@@ -700,6 +716,13 @@ mod tests {
         )
         .unwrap();
         conn.execute_raw(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER NOT NULL PRIMARY KEY,
+                deregistered_at INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -795,6 +818,11 @@ mod tests {
         conn.execute_raw("INSERT INTO agents (project_id, name) VALUES (2, 'PurpleBear')")
             .unwrap();
         conn.execute_raw(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) \
+             VALUES (1, 111), (2, 222)",
+        )
+        .unwrap();
+        conn.execute_raw(
             "INSERT INTO messages (project_id, sender_id, subject) VALUES (1, 1, 'Msg A')",
         )
         .unwrap();
@@ -870,6 +898,26 @@ mod tests {
         assert_eq!(result.remaining.inbox_stats, 1);
         assert_eq!(result.remaining.agent_links, 0);
         assert_eq!(result.remaining.project_sibling_suggestions, 0);
+    }
+
+    #[test]
+    fn scope_preserves_only_kept_agent_deregistrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, deregistered_at FROM agent_deregistrations \
+                 ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("deregistered_at").unwrap(), 111);
     }
 
     #[test]

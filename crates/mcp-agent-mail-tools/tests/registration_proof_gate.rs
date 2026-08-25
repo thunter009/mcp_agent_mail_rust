@@ -18,8 +18,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    create_agent_identity, ensure_project, macro_prepare_thread, macro_start_session,
-    register_agent, request_contact, send_message, whois,
+    create_agent_identity, deregister_agent, ensure_project, list_agents, macro_prepare_thread,
+    macro_start_session, register_agent, reply_message, request_contact, retire_agent,
+    send_message, set_contact_policy, unretire_agent, whois,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -97,6 +98,86 @@ fn error_type(err: &fastmcp::McpError) -> String {
         .and_then(Value::as_str)
         .unwrap_or("<no type>")
         .to_string()
+}
+
+async fn setup_reply_lifecycle_fixture(
+    ctx: &McpContext,
+    label: &str,
+) -> (String, i64, String, String) {
+    let project_key = format!("/tmp/{label}-{}", unique_suffix());
+    ensure_project(ctx, project_key.clone(), None)
+        .await
+        .expect("ensure_project");
+
+    let sender = create_agent_identity(
+        ctx,
+        project_key.clone(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some("BlueLake".to_string()),
+        Some("reply sender".to_string()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create reply sender");
+    let sender: Value = serde_json::from_str(&sender).expect("sender identity JSON");
+    let sender_token = sender["registration_token"]
+        .as_str()
+        .expect("sender registration token")
+        .to_string();
+
+    let recipient = create_agent_identity(
+        ctx,
+        project_key.clone(),
+        "claude-code".to_string(),
+        "opus-4.1".to_string(),
+        Some("GreenCastle".to_string()),
+        Some("original message sender".to_string()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create original sender");
+    let recipient: Value = serde_json::from_str(&recipient).expect("recipient identity JSON");
+    let recipient_token = recipient["registration_token"]
+        .as_str()
+        .expect("recipient registration token")
+        .to_string();
+
+    let original = send_message(
+        ctx,
+        project_key.clone(),
+        "GreenCastle".to_string(),
+        vec!["BlueLake".to_string()],
+        "reply lifecycle".to_string(),
+        "original message".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        Some(recipient_token.clone()),
+        None,
+    )
+    .await
+    .expect("send original message");
+    let original: Value = serde_json::from_str(&original).expect("original message JSON");
+    let message_id = original
+        .pointer("/deliveries/0/payload/id")
+        .and_then(Value::as_i64)
+        .expect("original message id");
+
+    (project_key, message_id, sender_token, recipient_token)
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -238,6 +319,535 @@ fn disabled_gate_registers_without_proof() {
         )
         .await
         .expect("macro_start_session should succeed with gate disabled");
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn lifecycle_tools_require_auth_and_return_python_status_contracts() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/lifecycle-{}", unique_suffix());
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure_project");
+        let created = create_agent_identity(
+            &ctx,
+            project_key.clone(),
+            "codex-cli".to_string(),
+            "gpt-5".to_string(),
+            Some("GreenCastle".to_string()),
+            Some("lifecycle contract".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create_agent_identity");
+        let created: Value = serde_json::from_str(&created).expect("created identity JSON");
+        let token = created["registration_token"]
+            .as_str()
+            .expect("registration token")
+            .to_string();
+
+        let missing = retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            None,
+            Some("%unbound-lifecycle-test".to_string()),
+        )
+        .await
+        .expect_err("retire_agent must reject an unbound caller without a token");
+        assert_eq!(error_type(&missing), "AUTHENTICATION_REQUIRED");
+
+        let wrong = retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some("wrong-token".to_string()),
+            None,
+        )
+        .await
+        .expect_err("retire_agent must reject a wrong token");
+        assert_eq!(error_type(&wrong), "AUTHENTICATION_REQUIRED");
+
+        let retired = retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .expect("retire_agent");
+        let retired: Value = serde_json::from_str(&retired).expect("retire response JSON");
+        assert_eq!(retired["status"], "retired");
+        assert_eq!(retired["agent_name"], "GreenCastle");
+        assert_eq!(retired["project_key"], project_key);
+
+        let roster = list_agents(&ctx, project_key.clone(), None, None)
+            .await
+            .expect("list agents after retirement");
+        let roster: Value = serde_json::from_str(&roster).expect("retired roster JSON");
+        assert_eq!(roster, serde_json::json!([]));
+
+        let profile = whois(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(false),
+            None,
+        )
+        .await
+        .expect("whois retired agent");
+        let profile: Value = serde_json::from_str(&profile).expect("whois response JSON");
+        assert!(profile["retired_at"].as_str().is_some());
+
+        let wrong = unretire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some("wrong-token".to_string()),
+            None,
+        )
+        .await
+        .expect_err("unretire_agent must reject a wrong token");
+        assert_eq!(error_type(&wrong), "AUTHENTICATION_REQUIRED");
+
+        let active = unretire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .expect("unretire_agent");
+        let active: Value = serde_json::from_str(&active).expect("unretire response JSON");
+        assert_eq!(active["status"], "active");
+        assert_eq!(active["agent_name"], "GreenCastle");
+        assert_eq!(active["project_key"], project_key);
+
+        let roster = list_agents(&ctx, project_key.clone(), None, None)
+            .await
+            .expect("list agents after unretirement");
+        let roster: Value = serde_json::from_str(&roster).expect("active roster JSON");
+        assert_eq!(roster.as_array().map(Vec::len), Some(1));
+        assert_eq!(roster[0]["name"], "GreenCastle");
+
+        let missing = deregister_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            None,
+            Some("%unbound-lifecycle-test".to_string()),
+        )
+        .await
+        .expect_err("deregister_agent must reject an unbound caller without a token");
+        assert_eq!(error_type(&missing), "AUTHENTICATION_REQUIRED");
+
+        let deregistered = deregister_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .expect("deregister_agent");
+        let deregistered: Value =
+            serde_json::from_str(&deregistered).expect("deregister response JSON");
+        assert_eq!(deregistered["status"], "deregistered");
+        assert_eq!(deregistered["agent_name"], "GreenCastle");
+        assert_eq!(deregistered["project_key"], project_key);
+
+        let roster = list_agents(&ctx, project_key.clone(), None, None)
+            .await
+            .expect("list agents after deregistration");
+        let roster: Value = serde_json::from_str(&roster).expect("deregistered roster JSON");
+        assert_eq!(roster, serde_json::json!([]));
+
+        let reopened = set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            "open".to_string(),
+        )
+        .await
+        .expect_err("set_contact_policy must not reopen a deregistered identity");
+        assert_eq!(error_type(&reopened), "INVALID_ARGUMENT");
+
+        let retire_again = retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .expect_err("retire_agent must reject a deregistered identity");
+        assert_eq!(error_type(&retire_again), "INVALID_ARGUMENT");
+
+        let unretire = unretire_agent(
+            &ctx,
+            project_key,
+            "GreenCastle".to_string(),
+            Some(token),
+            None,
+        )
+        .await
+        .expect_err("unretire_agent must reject a deregistered identity");
+        assert_eq!(error_type(&unretire), "INVALID_ARGUMENT");
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn retired_agents_cannot_send_or_receive_until_unretired() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let (project_key, _, sender_token, recipient_token) =
+            setup_reply_lifecycle_fixture(&ctx, "retired-routing").await;
+
+        retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token.clone()),
+            None,
+        )
+        .await
+        .expect("retire recipient");
+
+        let recipient_err = send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "routing while recipient retired".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect_err("retired recipient must reject new messages");
+        assert_eq!(error_type(&recipient_err), "AGENT_RETIRED");
+
+        unretire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token),
+            None,
+        )
+        .await
+        .expect("unretire recipient");
+        retire_agent(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect("retire sender");
+
+        let sender_err = send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "routing while sender retired".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect_err("retired sender must reject new messages");
+        assert_eq!(error_type(&sender_err), "AGENT_RETIRED");
+
+        unretire_agent(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect("unretire sender");
+        send_message(
+            &ctx,
+            project_key,
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "routing restored".to_string(),
+            "delivery resumes after unretire".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(sender_token),
+            None,
+        )
+        .await
+        .expect("unretired sender and recipient accept messages");
+    });
+}
+
+#[test]
+fn deregistered_agents_cannot_send_or_receive_messages() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let (sender_project, _, sender_token, _) =
+            setup_reply_lifecycle_fixture(&ctx, "deregistered-sender-routing").await;
+        deregister_agent(
+            &ctx,
+            sender_project.clone(),
+            "BlueLake".to_string(),
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect("deregister sender");
+
+        let sender_err = send_message(
+            &ctx,
+            sender_project,
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "deregistered sender routing".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(sender_token),
+            None,
+        )
+        .await
+        .expect_err("deregistered sender must reject new messages");
+        assert_eq!(error_type(&sender_err), "AGENT_DEREGISTERED");
+
+        let (recipient_project, _, sender_token, recipient_token) =
+            setup_reply_lifecycle_fixture(&ctx, "deregistered-recipient-routing").await;
+        deregister_agent(
+            &ctx,
+            recipient_project.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token),
+            None,
+        )
+        .await
+        .expect("deregister recipient");
+
+        let recipient_err = send_message(
+            &ctx,
+            recipient_project,
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "deregistered recipient routing".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(sender_token),
+            None,
+        )
+        .await
+        .expect_err("deregistered recipient must reject new messages");
+        assert_eq!(error_type(&recipient_err), "AGENT_DEREGISTERED");
+    });
+}
+
+#[test]
+fn retired_and_deregistered_senders_cannot_reply() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let (retired_project, retired_message, retired_token, _) =
+            setup_reply_lifecycle_fixture(&ctx, "retired-reply-sender").await;
+        retire_agent(
+            &ctx,
+            retired_project.clone(),
+            "BlueLake".to_string(),
+            Some(retired_token.clone()),
+            None,
+        )
+        .await
+        .expect("retire reply sender");
+
+        let retired_err = reply_message(
+            &ctx,
+            retired_project,
+            retired_message,
+            "BlueLake".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(retired_token),
+            None,
+        )
+        .await
+        .expect_err("retired sender must not reply");
+        assert_eq!(error_type(&retired_err), "AGENT_RETIRED");
+
+        let (deregistered_project, deregistered_message, deregistered_token, _) =
+            setup_reply_lifecycle_fixture(&ctx, "deregistered-reply-sender").await;
+        deregister_agent(
+            &ctx,
+            deregistered_project.clone(),
+            "BlueLake".to_string(),
+            Some(deregistered_token.clone()),
+            None,
+        )
+        .await
+        .expect("deregister reply sender");
+
+        let deregistered_err = reply_message(
+            &ctx,
+            deregistered_project,
+            deregistered_message,
+            "BlueLake".to_string(),
+            "must not be delivered".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(deregistered_token),
+            None,
+        )
+        .await
+        .expect_err("deregistered sender must not reply");
+        assert_eq!(error_type(&deregistered_err), "AGENT_DEREGISTERED");
+    });
+}
+
+#[test]
+fn retired_and_deregistered_recipients_cannot_receive_replies() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let (project_key, message_id, sender_token, recipient_token) =
+            setup_reply_lifecycle_fixture(&ctx, "inactive-reply-recipient").await;
+
+        retire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token.clone()),
+            None,
+        )
+        .await
+        .expect("retire reply recipient");
+        let retired_err = reply_message(
+            &ctx,
+            project_key.clone(),
+            message_id,
+            "BlueLake".to_string(),
+            "must not reach retired recipient".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(sender_token.clone()),
+            None,
+        )
+        .await
+        .expect_err("retired recipient must reject replies");
+        assert_eq!(error_type(&retired_err), "AGENT_RETIRED");
+
+        unretire_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token.clone()),
+            None,
+        )
+        .await
+        .expect("unretire reply recipient");
+        deregister_agent(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(recipient_token),
+            None,
+        )
+        .await
+        .expect("deregister reply recipient");
+
+        let deregistered_err = reply_message(
+            &ctx,
+            project_key,
+            message_id,
+            "BlueLake".to_string(),
+            "must not reach deregistered recipient".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(sender_token),
+            None,
+        )
+        .await
+        .expect_err("deregistered recipient must reject replies");
+        assert_eq!(error_type(&deregistered_err), "AGENT_DEREGISTERED");
     });
 }
 

@@ -2762,6 +2762,13 @@ mod tests {
                 Err(DispatchError::UnknownFm(id)) => {
                     panic!("registry id {id} is missing a dispatch_only branch")
                 }
+                Err(DispatchError::Mutate(crate::doctor::mutate::MutateError::OutOfScope(_)))
+                    if spec.id == codex_startup_timeout::FM_ID =>
+                {
+                    // This FM intentionally discovers the ambient Codex config.
+                    // Reaching the scope guard proves its dispatch arm exists
+                    // without letting a registry test modify live user state.
+                }
                 Err(DispatchError::Mutate(err)) => {
                     panic!(
                         "dispatch_only for {} unexpectedly reached mutate: {err}",

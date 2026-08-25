@@ -2040,11 +2040,20 @@ fn discover_agents(
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
+        let retired_at = parse_ts_from_json(&profile, "retired_at");
+        let legacy_deregistered_at = (contact_policy.eq_ignore_ascii_case("block_all")
+            && crate::models::task_description_uses_reserved_deregistered_prefix(task_description))
+        .then(|| {
+            crate::models::deregistered_task_timestamp_micros(task_description)
+                .unwrap_or(last_active_ts)
+        });
+        let deregistered_at =
+            parse_ts_from_json(&profile, "deregistered_at").or(legacy_deregistered_at);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
@@ -2055,6 +2064,7 @@ fn discover_agents(
                 Value::BigInt(last_active_ts),
                 Value::Text(attachments_policy),
                 Value::Text(contact_policy),
+                retired_at.map_or(Value::Null, Value::BigInt),
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
@@ -2067,6 +2077,18 @@ fn discover_agents(
             "name",
             &agent_name,
         )?;
+        if let Some(deregistered_at) = deregistered_at {
+            conn.execute_sync(
+                "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+                 VALUES (?, ?)",
+                &[Value::BigInt(aid), Value::BigInt(deregistered_at)],
+            )
+            .map_err(|e| {
+                DbError::Sqlite(format!(
+                    "reconstruct: insert agent deregistration {agent_name}: {e}"
+                ))
+            })?;
+        }
         agent_ids.insert((project_id, agent_name), aid);
         stats.agents += 1;
     }
@@ -6313,10 +6335,13 @@ mod tests {
             "name": "TestAgent",
             "program": "claude-code",
             "model": "opus-4.6",
-            "task_description": "testing",
+            "task_description": "[DEREGISTERED 2026-02-22T12:02:00Z] testing",
             "inception_ts": "2026-02-22T12:00:00Z",
             "last_active_ts": "2026-02-22T12:00:00Z",
             "attachments_policy": "auto",
+            "contact_policy": "block_all",
+            "retired_at": "2026-02-22T12:01:00Z",
+            "deregistered_at": "2026-02-22T12:02:00Z",
         });
         std::fs::write(
             agent_dir.join("profile.json"),
@@ -6335,6 +6360,23 @@ mod tests {
             "reconstructed database should be healthy for canonical sqlite",
         );
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        let lifecycle = conn
+            .query_sync(
+                "SELECT a.retired_at, d.deregistered_at \
+                 FROM agents a JOIN agent_deregistrations d ON d.agent_id = a.id \
+                 WHERE a.name = 'TestAgent'",
+                &[],
+            )
+            .expect("query reconstructed lifecycle state");
+        assert_eq!(lifecycle.len(), 1);
+        assert_eq!(
+            lifecycle[0].get_named::<i64>("retired_at").unwrap(),
+            crate::iso_to_micros("2026-02-22T12:01:00Z").unwrap()
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<i64>("deregistered_at").unwrap(),
+            crate::iso_to_micros("2026-02-22T12:02:00Z").unwrap()
+        );
         // ATC telemetry now lives in the dedicated sidecar DB (atc.sqlite3),
         // which is independent of the Git archive and untouched by reconstruct
         // (br-bvq1x.11.7). The rebuilt primary mailbox DB must therefore contain

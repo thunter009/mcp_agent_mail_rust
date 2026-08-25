@@ -207,7 +207,12 @@ mod tests {
 
     fn init_repo(td: &TempDir) -> PathBuf {
         let repo = td.path().to_path_buf();
-        git2::Repository::init(&repo).unwrap();
+        let git_repo = git2::Repository::init(&repo).unwrap();
+        git_repo
+            .config()
+            .unwrap()
+            .set_str("core.hooksPath", ".git/hooks")
+            .unwrap();
         let hooks = repo.join(".git").join("hooks");
         fs::create_dir_all(&hooks).unwrap();
         repo

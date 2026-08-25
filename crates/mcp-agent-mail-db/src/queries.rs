@@ -972,7 +972,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 /// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
 /// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`, `reaper_exempt`,
-/// `registration_token`.
+/// `registration_token`, `retired_at`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx).and_then(value_as_i64).unwrap_or(0)
@@ -1014,6 +1014,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
         },
         reaper_exempt: get_opt_i64(row, 10).unwrap_or(0),
         registration_token: get_opt_string(row, 11),
+        retired_at: get_opt_i64(row, 12),
     }
 }
 
@@ -1793,7 +1794,7 @@ async fn verify_agent_visible_after_commit(
     // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -4656,6 +4657,14 @@ pub async fn register_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
+    if task_description
+        .is_some_and(crate::models::task_description_uses_reserved_deregistered_prefix)
+    {
+        return Outcome::Err(DbError::invalid(
+            "task_description",
+            "task description uses the reserved deregistration tombstone prefix",
+        ));
+    }
     let now = now_micros();
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -4680,7 +4689,7 @@ pub async fn register_agent(
                 );
                 let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                                  inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                                 registration_token \
+                                 registration_token, retired_at \
                                  FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC LIMIT 1";
@@ -4692,6 +4701,31 @@ pub async fn register_agent(
                 )
                 .first()
                 .map(decode_agent_row_indexed);
+
+                if let Some(existing_id) = existing.as_ref().and_then(|agent| agent.id) {
+                    let deregistration_rows = try_in_tx!(
+                        cx,
+                        &tracked,
+                        map_sql_outcome(
+                            traw_query(
+                                cx,
+                                &tracked,
+                                "SELECT 1 FROM agent_deregistrations WHERE agent_id = ? LIMIT 1",
+                                &[Value::BigInt(existing_id)],
+                            )
+                            .await
+                        )
+                    );
+                    if !deregistration_rows.is_empty() {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::invalid(
+                            "name",
+                            format!(
+                                "Agent '{name}' was deregistered and cannot be re-registered; create a new identity"
+                            ),
+                        ));
+                    }
+                }
 
                 // Retain the canonical stored spelling when an older database lacks
                 // the NOCASE unique index.  Otherwise a case-only re-registration
@@ -4855,6 +4889,14 @@ pub async fn create_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
+    if task_description
+        .is_some_and(crate::models::task_description_uses_reserved_deregistered_prefix)
+    {
+        return Outcome::Err(DbError::invalid(
+            "task_description",
+            "task description uses the reserved deregistration tombstone prefix",
+        ));
+    }
     let now = now_micros();
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -4875,7 +4917,7 @@ pub async fn create_agent(
             // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                             registration_token \
+                             registration_token, retired_at \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                              ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5057,7 +5099,7 @@ pub async fn get_agent(
     // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5097,7 +5139,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5136,7 +5178,7 @@ pub async fn get_agent_by_id_fresh(
 
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
+               registration_token, retired_at \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -5242,6 +5284,28 @@ pub async fn list_agents_bounded(
     min_last_active_ts: Option<i64>,
     limit: Option<usize>,
 ) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded_inner(cx, pool, project_id, min_last_active_ts, limit, false).await
+}
+
+/// List only active agents, applying the cap after lifecycle filtering.
+pub async fn list_active_agents_bounded(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded_inner(cx, pool, project_id, min_last_active_ts, limit, true).await
+}
+
+async fn list_agents_bounded_inner(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+    active_only: bool,
+) -> Outcome<Vec<AgentRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -5255,12 +5319,22 @@ pub async fn list_agents_bounded(
     // Keep this as a simple ordered scan: startup/TUI paths call this often,
     // and case-insensitive de-duplication is cheap in Rust while avoiding a
     // FrankenSQLite window-function dependency during mailbox recovery.
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
-               FROM agents \
-               WHERE project_id = ? \
-               ORDER BY last_active_ts DESC, id DESC";
+    let sql = if active_only {
+        "SELECT id, project_id, name, program, model, task_description, \
+         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+         registration_token, retired_at \
+         FROM agents \
+         WHERE project_id = ? AND retired_at IS NULL \
+           AND id NOT IN (SELECT agent_id FROM agent_deregistrations) \
+         ORDER BY last_active_ts DESC, id DESC"
+    } else {
+        "SELECT id, project_id, name, program, model, task_description, \
+         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+         registration_token, retired_at \
+         FROM agents \
+         WHERE project_id = ? \
+         ORDER BY last_active_ts DESC, id DESC"
+    };
     let params = [Value::BigInt(project_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -5337,7 +5411,7 @@ pub async fn get_agents_by_ids(
         let sql = format!(
             "SELECT id, project_id, name, program, model, task_description, \
              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-             registration_token \
+             registration_token, retired_at \
              FROM agents WHERE id IN ({placeholders})"
         );
 
@@ -5626,6 +5700,42 @@ pub async fn set_agent_contact_policy(
     let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
+        let current_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let deregistered_at = try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        );
+        if deregistered_at.is_some() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "policy",
+                format!(
+                    "Agent '{}' was deregistered and its contact policy cannot be changed",
+                    current_agent.name
+                ),
+            ));
+        }
+
         let now = now_micros();
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
         let params = [
@@ -5643,7 +5753,7 @@ pub async fn set_agent_contact_policy(
         // Fetch updated agent using raw SQL with explicit column order.
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(agent_id)];
         let rows = try_in_tx!(
@@ -5666,6 +5776,294 @@ pub async fn set_agent_contact_policy(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+    Outcome::Ok(agent)
+}
+
+async fn get_agent_deregistered_at_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = ? LIMIT 1",
+            &[Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(row_first_i64)),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Return the explicit deregistration timestamp for an agent, if present.
+pub async fn get_agent_deregistered_at(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = ? LIMIT 1",
+            &[Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(row_first_i64)),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List deregistered agent ids for one project.
+pub async fn list_deregistered_agent_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<HashSet<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT d.agent_id FROM agent_deregistrations d \
+             JOIN agents a ON a.id = d.agent_id WHERE a.project_id = ?",
+            &[Value::BigInt(project_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.iter().filter_map(row_first_i64).collect()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Set or clear an agent's retirement timestamp.
+pub async fn set_agent_retired_at(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    retired_at: Option<i64>,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let deregistered_at = try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        );
+        if deregistered_at.is_some() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "agent_id",
+                "deregistered agents cannot change retirement state",
+            ));
+        }
+
+        let retired_at = retired_at.map_or(Value::Null, Value::BigInt);
+        let params = [retired_at, Value::BigInt(agent_id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET retired_at = ? WHERE id = ?",
+                    &params,
+                )
+                .await
+            )
+        );
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+    Outcome::Ok(agent)
+}
+
+/// Remove an agent from active contact while preserving its row and history.
+pub async fn deregister_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    deregistered_at: i64,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let current_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let deregistration_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT deregistered_at FROM agent_deregistrations \
+                     WHERE agent_id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        if !deregistration_rows.is_empty() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(current_agent);
+        }
+
+        let insert_params = [Value::BigInt(agent_id), Value::BigInt(deregistered_at)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) \
+                     VALUES (?, ?)",
+                    &insert_params,
+                )
+                .await
+            )
+        );
+
+        let prefix = format!("[DEREGISTERED {}] ", crate::micros_to_iso(deregistered_at));
+        let params = [Value::Text(prefix), Value::BigInt(agent_id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET contact_policy = 'block_all', task_description = ? || task_description WHERE id = ?",
+                    &params,
+                )
+                .await
+            )
+        );
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
@@ -5704,7 +6102,7 @@ pub async fn set_agent_contact_policy_by_name(
         // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                           registration_token \
+                           registration_token, retired_at \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                            ORDER BY id ASC LIMIT 1";
         let current_params = [
@@ -5729,6 +6127,21 @@ pub async fn set_agent_contact_policy_by_name(
                 "policy update lookup returned agent without id for {project_id}:{normalized_name}"
             )));
         };
+        let deregistered_at = try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, current_id).await
+        );
+        if deregistered_at.is_some() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "policy",
+                format!(
+                    "Agent '{}' was deregistered and its contact policy cannot be changed",
+                    current_agent.name
+                ),
+            ));
+        }
 
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
         let params = [
@@ -5745,7 +6158,7 @@ pub async fn set_agent_contact_policy_by_name(
 
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token \
+                         registration_token, retired_at \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(current_id)];
         let rows = try_in_tx!(
@@ -6544,6 +6957,77 @@ async fn create_message_with_recipients_impl(
     Outcome::Ok(IdempotentOutcome::Fresh(row))
 }
 
+/// Revalidate sender and recipients inside the message transaction.
+///
+/// Lifecycle mutations update the same rows/ledger under `BEGIN CONCURRENT`,
+/// so a concurrent retire/deregister either wins before this read or conflicts
+/// with this transaction and forces the outer MVCC retry to observe new state.
+async fn ensure_message_participants_active_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    sender_id: i64,
+    recipients: &[(i64, &str)],
+) -> Outcome<(), DbError> {
+    let mut participant_ids = Vec::with_capacity(recipients.len().saturating_add(1));
+    participant_ids.push(sender_id);
+    for &(agent_id, _) in recipients {
+        if !participant_ids.contains(&agent_id) {
+            participant_ids.push(agent_id);
+        }
+    }
+
+    let mut states: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
+    for chunk in participant_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        let rows = try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(traw_query(cx, tracked, &sql, &params).await)
+        );
+        for row in &rows {
+            let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
+                continue;
+            };
+            states.insert(
+                agent_id,
+                (
+                    row.get(1)
+                        .and_then(|value| match value {
+                            Value::Text(name) => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    row.get(2).and_then(value_as_i64),
+                    row.get(3).and_then(value_as_i64),
+                ),
+            );
+        }
+    }
+
+    for agent_id in participant_ids {
+        let Some((name, retired_at, deregistered_at)) = states.remove(&agent_id) else {
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        if let Some(deregistered_at) = deregistered_at {
+            return Outcome::Err(DbError::AgentDeregistered {
+                name,
+                deregistered_at,
+            });
+        }
+        if let Some(retired_at) = retired_at {
+            return Outcome::Err(DbError::AgentRetired { name, retired_at });
+        }
+    }
+
+    Outcome::Ok(())
+}
+
 /// Inner transaction body for [`create_message_with_recipients`].
 ///
 /// Runs BEGIN CONCURRENT → INSERT message → INSERT recipients → COMMIT.
@@ -6606,6 +7090,12 @@ async fn create_message_with_recipients_tx(
             }
         }
     }
+
+    try_in_tx!(
+        cx,
+        tracked,
+        ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
+    );
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -13683,7 +14173,7 @@ pub async fn insert_system_agent(
 
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                          registration_token \
+                          registration_token, retired_at \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];

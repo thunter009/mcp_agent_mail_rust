@@ -439,6 +439,365 @@ fn get_agent_nonexistent_returns_not_found() {
     );
 }
 
+#[test]
+fn get_agent_exposes_active_retirement_state() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    let agent = block_on(|cx| async move {
+        queries::get_agent(&cx, &pool2, project_id, "GreenCastle")
+            .await
+            .into_result()
+            .expect("get agent")
+    });
+
+    assert_eq!(agent.retired_at, None);
+}
+
+#[test]
+fn agent_retirement_state_round_trips() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let agent_id = setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    let retired = block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, agent_id, Some(1_234_567))
+            .await
+            .into_result()
+            .expect("retire agent")
+    });
+    assert_eq!(retired.retired_at, Some(1_234_567));
+
+    let pool2 = pool.clone();
+    let persisted = block_on(|cx| async move {
+        queries::get_agent(&cx, &pool2, project_id, "GreenCastle")
+            .await
+            .into_result()
+            .expect("get retired agent")
+    });
+    assert_eq!(persisted.retired_at, Some(1_234_567));
+
+    let pool2 = pool.clone();
+    let restored = block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, agent_id, None)
+            .await
+            .into_result()
+            .expect("unretire agent")
+    });
+    assert_eq!(restored.retired_at, None);
+}
+
+#[test]
+fn get_agent_by_id_fresh_preserves_retirement_state() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let agent_id = setup_agent(&pool, project_id, "GreenCastle");
+    let retired_at = 1_234_567_i64;
+
+    let pool2 = pool.clone();
+    let agent = block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, agent_id, Some(retired_at))
+            .await
+            .into_result()
+            .expect("retire agent");
+        queries::get_agent_by_id_fresh(&cx, &pool2, agent_id)
+            .await
+            .into_result()
+            .expect("fresh agent lookup")
+    });
+
+    assert_eq!(agent.retired_at, Some(retired_at));
+}
+
+#[test]
+fn deregister_agent_blocks_contact_and_marks_task_description() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let agent_id = setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    let deregistered = block_on(|cx| async move {
+        queries::deregister_agent(&cx, &pool2, agent_id, 1_234_567)
+            .await
+            .into_result()
+            .expect("deregister agent")
+    });
+
+    assert_eq!(deregistered.contact_policy, "block_all");
+    assert_eq!(
+        deregistered.task_description,
+        "[DEREGISTERED 1970-01-01T00:00:01.234567Z] integration test"
+    );
+
+    let pool2 = pool.clone();
+    let repeated = block_on(|cx| async move {
+        queries::deregister_agent(&cx, &pool2, agent_id, 1_893_456_000_000_000)
+            .await
+            .into_result()
+            .expect("repeat deregister agent")
+    });
+    assert_eq!(repeated.task_description, deregistered.task_description);
+    assert_eq!(repeated.contact_policy, "block_all");
+    let pool2 = pool.clone();
+    let deregistered_at = block_on(|cx| async move {
+        queries::get_agent_deregistered_at(&cx, &pool2, agent_id)
+            .await
+            .into_result()
+            .expect("deregistration lookup")
+    });
+    assert_eq!(deregistered_at, Some(1_234_567));
+}
+
+#[test]
+fn agent_creation_rejects_reserved_deregistered_task_prefix() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+
+    let pool2 = pool.clone();
+    let registered = block_on(|cx| async move {
+        queries::register_agent(
+            &cx,
+            &pool2,
+            project_id,
+            "BlueLake",
+            "test",
+            "test-model",
+            Some("[DEREGISTERED at 2026-08-24T00:00:00Z] forged"),
+            None,
+            None,
+        )
+        .await
+    });
+    assert!(matches!(
+        registered,
+        Outcome::Err(DbError::InvalidArgument {
+            field: "task_description",
+            ..
+        })
+    ));
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        queries::create_agent(
+            &cx,
+            &pool2,
+            project_id,
+            "RedStone",
+            "test",
+            "test-model",
+            Some("[DEREGISTERED at 2026-08-24T00:00:00Z] forged"),
+            None,
+        )
+        .await
+    });
+    assert!(matches!(
+        created,
+        Outcome::Err(DbError::InvalidArgument {
+            field: "task_description",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn deregistered_agent_cannot_be_reregistered() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let agent_id = setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        queries::deregister_agent(&cx, &pool2, agent_id, 1_777_158_400_000_000)
+            .await
+            .into_result()
+            .expect("deregister agent");
+    });
+
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        queries::register_agent(
+            &cx,
+            &pool2,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test-model",
+            Some("new session"),
+            None,
+            None,
+        )
+        .await
+    });
+    match result {
+        Outcome::Err(DbError::InvalidArgument { field, message }) => {
+            assert_eq!(field, "name");
+            assert!(message.contains("deregistered"));
+        }
+        other => panic!("expected deregistered identity rejection, got: {other:?}"),
+    }
+}
+
+#[test]
+fn deregistered_agent_contact_policy_cannot_be_changed() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let agent_id = setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        queries::deregister_agent(&cx, &pool2, agent_id, 1_777_158_400_000_000)
+            .await
+            .into_result()
+            .expect("deregister agent");
+    });
+
+    let pool2 = pool.clone();
+    let by_id = block_on(|cx| async move {
+        queries::set_agent_contact_policy(&cx, &pool2, agent_id, "open").await
+    });
+    assert!(matches!(
+        by_id,
+        Outcome::Err(DbError::InvalidArgument {
+            field: "policy",
+            ..
+        })
+    ));
+
+    let pool2 = pool.clone();
+    let by_name = block_on(|cx| async move {
+        queries::set_agent_contact_policy_by_name(&cx, &pool2, project_id, "GreenCastle", "open")
+            .await
+    });
+    assert!(matches!(
+        by_name,
+        Outcome::Err(DbError::InvalidArgument {
+            field: "policy",
+            ..
+        })
+    ));
+
+    let pool2 = pool.clone();
+    let persisted = block_on(|cx| async move {
+        queries::get_agent(&cx, &pool2, project_id, "GreenCastle")
+            .await
+            .into_result()
+            .expect("get deregistered agent")
+    });
+    assert_eq!(persisted.contact_policy, "block_all");
+    let pool2 = pool.clone();
+    let deregistered_at = block_on(|cx| async move {
+        queries::get_agent_deregistered_at(&cx, &pool2, agent_id)
+            .await
+            .into_result()
+            .expect("get deregistration state")
+    });
+    assert!(deregistered_at.is_some());
+}
+
+#[test]
+fn active_agent_list_filters_lifecycle_state_before_limit() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    setup_agent(&pool, project_id, "BlueLake");
+    let retired_id = setup_agent(&pool, project_id, "RedStone");
+    let deregistered_id = setup_agent(&pool, project_id, "GreenCastle");
+
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, retired_id, Some(1_234_567))
+            .await
+            .into_result()
+            .expect("retire agent");
+        queries::deregister_agent(&cx, &pool2, deregistered_id, 1_777_158_400_000_000)
+            .await
+            .into_result()
+            .expect("deregister agent");
+    });
+
+    let pool2 = pool.clone();
+    let active = block_on(|cx| async move {
+        queries::list_active_agents_bounded(&cx, &pool2, project_id, None, Some(1))
+            .await
+            .into_result()
+            .expect("list active agents")
+    });
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].name, "BlueLake");
+}
+
+#[test]
+fn message_transaction_revalidates_participant_lifecycle_state() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let sender_id = setup_agent(&pool, project_id, "BlueLake");
+    let recipient_id = setup_agent(&pool, project_id, "RedStone");
+
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, recipient_id, Some(1_234_567))
+            .await
+            .into_result()
+            .expect("retire recipient");
+    });
+    let pool2 = pool.clone();
+    let retired = block_on(|cx| async move {
+        queries::create_message_with_recipients(
+            &cx,
+            &pool2,
+            project_id,
+            sender_id,
+            "retired recipient",
+            "body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await
+    });
+    assert!(matches!(
+        retired,
+        Outcome::Err(DbError::AgentRetired { ref name, .. }) if name == "RedStone"
+    ));
+
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        queries::set_agent_retired_at(&cx, &pool2, recipient_id, None)
+            .await
+            .into_result()
+            .expect("unretire recipient");
+        queries::deregister_agent(&cx, &pool2, sender_id, 2_345_678)
+            .await
+            .into_result()
+            .expect("deregister sender");
+    });
+    let pool2 = pool.clone();
+    let deregistered = block_on(|cx| async move {
+        queries::create_message_with_recipients(
+            &cx,
+            &pool2,
+            project_id,
+            sender_id,
+            "deregistered sender",
+            "body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await
+    });
+    assert!(matches!(
+        deregistered,
+        Outcome::Err(DbError::AgentDeregistered { ref name, .. }) if name == "BlueLake"
+    ));
+}
+
 // =============================================================================
 // Messaging error path tests (br-3h13.4.2)
 // =============================================================================

@@ -47,6 +47,9 @@
         "summarize_thread",
         "summarize_thread_product",
         "uninstall_precommit_guard",
+        "deregister_agent",
+        "retire_agent",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -93,6 +96,9 @@
         "reply_message",
         "resolve_pane_identity",
         "send_message",
+        "deregister_agent",
+        "retire_agent",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -122,6 +128,9 @@
         "search_messages",
         "send_message",
         "set_contact_policy",
+        "deregister_agent",
+        "retire_agent",
+        "unretire_agent",
         "whois"
       ]
     },
@@ -185,6 +194,9 @@
         "summarize_thread",
         "summarize_thread_product",
         "uninstall_precommit_guard",
+        "deregister_agent",
+        "retire_agent",
+        "unretire_agent",
         "whois"
       ]
     }

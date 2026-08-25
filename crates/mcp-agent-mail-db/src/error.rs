@@ -62,6 +62,12 @@ pub enum DbError {
         field: &'static str,
         message: String,
     },
+    /// Message participant was retired before the message transaction committed.
+    #[error("Agent retired: {name}")]
+    AgentRetired { name: String, retired_at: i64 },
+    /// Message participant was deregistered before the message transaction committed.
+    #[error("Agent deregistered: {name}")]
+    AgentDeregistered { name: String, deregistered_at: i64 },
 
     /// Schema/migration error
     #[error("Schema error: {0}")]
@@ -638,6 +644,8 @@ impl DbError {
             Self::NotFound { .. }
             | Self::Duplicate { .. }
             | Self::InvalidArgument { .. }
+            | Self::AgentRetired { .. }
+            | Self::AgentDeregistered { .. }
             | Self::Serialization(_) => {
                 DbErrorClassification::for_class(DbErrorClass::ConnectionOrConfigError)
             }
@@ -663,6 +671,8 @@ impl DbError {
             Self::NotFound { .. } => "NOT_FOUND",
             Self::Duplicate { .. } => "DUPLICATE",
             Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
+            Self::AgentRetired { .. } => "AGENT_RETIRED",
+            Self::AgentDeregistered { .. } => "AGENT_DEREGISTERED",
             Self::IntegrityCorruption { .. } => "INTEGRITY_CORRUPTION",
             Self::RetryBudgetExhausted { inner, .. } => inner.error_code(),
             _ => "INTERNAL_ERROR",
@@ -676,7 +686,8 @@ impl DbError {
             Self::PoolExhausted { .. }
             | Self::ResourceBusy(_)
             | Self::CircuitBreakerOpen { .. }
-            | Self::Pool(_) => true,
+            | Self::Pool(_)
+            | Self::AgentRetired { .. } => true,
             Self::RetryBudgetExhausted { inner, .. } => inner.is_recoverable(),
             _ => false,
         }

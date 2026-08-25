@@ -9999,11 +9999,12 @@ fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     })
 }
 
-const SQLITE_BASE_INIT_TABLES: [&str; 11] = [
+const SQLITE_BASE_INIT_TABLES: [&str; 12] = [
     "projects",
     "products",
     "product_project_links",
     "agents",
+    "agent_deregistrations",
     "messages",
     "message_recipients",
     "file_reservations",
@@ -10013,13 +10014,14 @@ const SQLITE_BASE_INIT_TABLES: [&str; 11] = [
     "inbox_stats",
 ];
 
-const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 14] = [
+const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 15] = [
     ("products", "product_uid"),
     ("product_project_links", "created_at"),
     ("agents", "attachments_policy"),
     ("agents", "contact_policy"),
     ("agents", "reaper_exempt"),
     ("agents", "registration_token"),
+    ("agents", "retired_at"),
     ("messages", "attachments"),
     ("message_recipients", "kind"),
     ("message_recipients", "ack_ts"),
@@ -12494,8 +12496,11 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     }
 
     candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
+        // The undated sibling `.bak` is a legacy last resort. Copy-on-write
+        // filesystems can preserve source mtimes on newer timestamped copies,
+        // so mtime alone can make that stale sibling appear newest.
+        a.1.cmp(&b.1)
+            .then_with(|| b.0.cmp(&a.0))
             .then_with(|| a.2.cmp(&b.2))
             .then_with(|| b.3.cmp(&a.3))
     });
@@ -13053,7 +13058,41 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
 fn open_sqlite_read_only_with_fallback(
     path: &str,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    open_sqlite_with_fallback_internal(path, None, false)
+    let open_conn = |candidate: &str| -> Result<mcp_agent_mail_db::DbConn, String> {
+        let conn = if candidate == ":memory:" {
+            mcp_agent_mail_db::DbConn::open_memory().map_err(|e| e.to_string())?
+        } else {
+            mcp_agent_mail_db::DbConn::open_file_read_only(candidate).map_err(|e| e.to_string())?
+        };
+        // Read surfaces must not inherit the normal connection bundle: even
+        // nominally per-connection PRAGMAs can wait behind a reserved writer.
+        // The open flag is the hard filesystem guard; query_only also protects
+        // the in-memory compatibility path.
+        conn.execute_raw(
+            "PRAGMA foreign_keys = OFF;\
+             PRAGMA busy_timeout = 250;\
+             PRAGMA query_only = ON;",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn)
+    };
+
+    match open_conn(path) {
+        Ok(conn) => Ok((conn, path.to_string())),
+        Err(primary_err) => {
+            if let Some(fallback_path) = sqlite_absolute_fallback_path(path, &primary_err) {
+                let fallback_conn = open_conn(&fallback_path).map_err(|fallback_err| {
+                    CliError::Other(format!(
+                        "cannot open DB at {path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
+                    ))
+                })?;
+                return Ok((fallback_conn, fallback_path));
+            }
+            Err(CliError::Other(format!(
+                "cannot open DB at {path}: {primary_err}"
+            )))
+        }
+    }
 }
 
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
@@ -13286,7 +13325,9 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
 
         let migration_ts = mcp_agent_mail_db::timestamps::now_micros();
         for migration in mcp_agent_mail_db::schema::schema_migrations_base() {
-            if let Err(e) = conn.execute_raw(&migration.up) {
+            if let Err(e) =
+                mcp_agent_mail_db::schema::apply_base_migration_canonical_sync(&conn, &migration)
+            {
                 let err_text = e.to_string();
                 if !sqlite_migration_error_is_benign(&err_text) {
                     return Err(sqlite_retryable_error(
@@ -13428,14 +13469,19 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     }
     let read_only_open = open_sqlite_read_only_with_fallback(&path);
     if let Ok((conn, opened_path)) = read_only_open {
-        if opened_path == ":memory:" {
-            return Ok((conn, opened_path));
-        }
-
-        if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
+        if opened_path != ":memory:"
+            && !sqlite_conn_requires_canonical_init(&conn)?
+            && sqlite_conn_is_healthy(&conn)?
+        {
+            // The probe is deliberately opened with SQLITE_OPEN_READ_ONLY and
+            // query_only. Normal CLI openers still promise a writable handle,
+            // so never leak the probe connection to their callers.
+            drop(conn);
+            let (writable_conn, writable_path) =
+                open_sqlite_with_fallback_and_storage_root(&opened_path, storage_root_override)?;
             return maybe_reconcile_sync_opened_sqlite_archive_drift(
-                conn,
-                opened_path,
+                writable_conn,
+                writable_path,
                 database_url,
                 storage_root_override,
                 acquire_mutation_locks,
@@ -13830,8 +13876,6 @@ fn resolve_canonical_snapshot_source_path(
     storage_root_is_explicit: bool,
     context: &str,
 ) -> CliResult<CanonicalSnapshotSource> {
-    let archive = collect_doctor_archive_inventory(storage_root);
-    let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
     let candidate_display = source_candidate.display().to_string();
     let candidate_path = PathBuf::from(source_candidate);
     let archive_authoritative_for_path = doctor_archive_is_authoritative_for_sqlite_path(
@@ -13839,6 +13883,15 @@ fn resolve_canonical_snapshot_source_path(
         storage_root,
         storage_root_is_explicit,
     );
+    // An ambient default mailbox cannot supersede an unrelated explicit DB.
+    // Avoid walking that archive on the latency-sensitive read path unless it
+    // can actually be authoritative for this SQLite file.
+    let archive = if archive_authoritative_for_path {
+        collect_doctor_archive_inventory(storage_root)
+    } else {
+        DoctorArchiveInventory::default()
+    };
+    let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
 
     if candidate_display == ":memory:" || !source_candidate.exists() {
         if archive_has_state && archive_authoritative_for_path {
@@ -59487,6 +59540,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let (mut storage, _paths) =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -59873,6 +59927,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         // Initialize a fresh beads storage (creates the DB)
         let storage =
@@ -59904,6 +59959,7 @@ startup_timeout_sec = 42
         let beads_dir = dir.path().join(".beads");
         let nested = dir.path().join("crates/mcp-agent-mail-cli");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
         std::fs::create_dir_all(&nested).expect("create nested dir");
 
         let storage =
@@ -59933,6 +59989,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let (mut storage, _paths) =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -59981,6 +60038,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -65214,6 +65272,16 @@ startup_timeout_sec = 42
             .expect("query fallback connection");
         let one: i64 = rows.first().expect("row").get_named("one").unwrap_or(0);
         assert_eq!(one, 1, "fallback connection should execute queries");
+        conn.execute_sync("INSERT INTO seed DEFAULT VALUES", &[])
+            .expect("normal opener must return a writable fallback connection");
+        let seed_rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM seed", &[])
+            .expect("count inserted fallback row");
+        assert_eq!(
+            seed_rows[0].get_named::<i64>("count").unwrap_or(0),
+            1,
+            "fallback connection should preserve the normal writable contract"
+        );
 
         let relative_bytes = std::fs::read(&relative_path).expect("read relative bytes");
         assert_eq!(
@@ -66432,6 +66500,22 @@ startup_timeout_sec = 42
         assert!(
             !sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
             "fully initialized databases should skip canonical bootstrap"
+        );
+    }
+
+    #[test]
+    fn sqlite_base_init_requires_agent_retirement_state() {
+        assert!(
+            SQLITE_BASE_INIT_COLUMNS.contains(&("agents", "retired_at")),
+            "legacy mailboxes without agents.retired_at must run canonical migrations"
+        );
+    }
+
+    #[test]
+    fn sqlite_base_init_requires_agent_deregistration_ledger() {
+        assert!(
+            SQLITE_BASE_INIT_TABLES.contains(&"agent_deregistrations"),
+            "legacy mailboxes without the deregistration ledger must run canonical migrations"
         );
     }
 
@@ -72124,7 +72208,11 @@ fn archive_save_state_internal(
     } else {
         None
     };
-    let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
+    // This API receives the storage root as an explicit archive-save input.
+    // A non-default supplied root is authoritative even when it did not come
+    // from the process environment.
+    let storage_root_is_explicit =
+        mailbox_activity_storage_root_is_explicit(storage_root, Some(storage_root));
     let source = resolve_canonical_snapshot_source_path(
         &source_db,
         storage_root,
