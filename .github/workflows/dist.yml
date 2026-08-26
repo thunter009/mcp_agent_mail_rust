@@ -23,11 +23,10 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
+          # Keep the sibling checkout on the workspace dependency revision.
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git -C ../beads_rust fetch --depth 1 origin 258fd5fdf9f39acd07aad59a5ac2fa542bbfdddd
+          git -C ../beads_rust checkout --detach FETCH_HEAD
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -61,11 +60,16 @@ jobs:
           # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
           # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git -C ../beads_rust fetch --depth 1 origin 258fd5fdf9f39acd07aad59a5ac2fa542bbfdddd
+          git -C ../beads_rust checkout --detach FETCH_HEAD
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install pinned Beads CLI for integration tests
+        run: cargo install --locked --path ../beads_rust --bin br
 
       - name: Run tests
         run: cargo test --lib
@@ -120,6 +124,8 @@ jobs:
           # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
           # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git -C ../beads_rust fetch --depth 1 origin 258fd5fdf9f39acd07aad59a5ac2fa542bbfdddd
+          git -C ../beads_rust checkout --detach FETCH_HEAD
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly

@@ -2719,16 +2719,13 @@ mod tests {
 
     #[test]
     fn migrate_sqlite_db_runs_canonical_v15_and_preserves_message_extensions() {
-        use mcp_agent_mail_db::sqlmodel_core::Value;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("legacy-v15.sqlite3");
+        migrate_sqlite_db(&db_path).expect("seed fully migrated fixture DB");
         let conn = CanonicalDbConn::open_file(db_path.display().to_string())
             .expect("open canonical legacy fixture DB");
         conn.execute_raw("PRAGMA foreign_keys = OFF")
             .expect("disable fixture foreign keys");
-        conn.execute_raw(&schema::init_schema_sql_base())
-            .expect("create current base tables");
         conn.execute_raw("DROP TABLE messages")
             .expect("replace messages with Python legacy shape");
         conn.execute_raw(
@@ -2761,25 +2758,14 @@ mod tests {
         )
         .expect("insert Python legacy message");
         conn.execute_raw(
-            "CREATE TABLE mcp_agent_mail_migrations (\
-                id TEXT PRIMARY KEY,\
-                description TEXT NOT NULL,\
-                applied_at INTEGER NOT NULL\
-            )",
+            "DELETE FROM mcp_agent_mail_migrations \
+             WHERE id IN (\
+                 'v15_add_recipients_json_to_messages',\
+                 'v15b_backfill_recipients_json',\
+                 'v15c_trg_messages_default_recipients_json'\
+             )",
         )
-        .expect("create migration ledger");
-        for migration in schema::schema_migrations_base() {
-            conn.execute_sync(
-                "INSERT INTO mcp_agent_mail_migrations (id, description, applied_at) \
-                 VALUES (?, ?, ?)",
-                &[
-                    Value::Text(migration.id),
-                    Value::Text(migration.description),
-                    Value::BigInt(0),
-                ],
-            )
-            .expect("seed base migration ledger");
-        }
+        .expect("reopen canonical v15 migration family");
         drop(conn);
 
         let migrated_ids = migrate_sqlite_db(&db_path).expect("migrate legacy fixture");
@@ -2839,12 +2825,11 @@ mod tests {
     fn seed_v20_agents_fixture(path: &Path) {
         use mcp_agent_mail_db::sqlmodel_core::Value;
 
+        migrate_sqlite_db(path).expect("seed fully migrated v20 fixture DB");
         let conn = CanonicalDbConn::open_file(path.display().to_string())
             .expect("open canonical v20 fixture DB");
         conn.execute_raw("PRAGMA foreign_keys = OFF")
             .expect("disable fixture foreign keys");
-        conn.execute_raw(&schema::init_schema_sql_base())
-            .expect("create current base tables for v20 fixture");
         conn.execute_raw("DROP TABLE agents")
             .expect("replace agents with Python v20 shape");
         conn.execute_raw(
@@ -2895,30 +2880,10 @@ mod tests {
         )
         .expect("insert v20 agent");
         conn.execute_raw(
-            "CREATE TABLE mcp_agent_mail_migrations (\
-                id TEXT PRIMARY KEY,\
-                description TEXT NOT NULL,\
-                applied_at INTEGER NOT NULL\
-            )",
+            "DELETE FROM mcp_agent_mail_migrations \
+             WHERE id IN ('v20_agents_registration_token', 'v20_idx_agents_registration_token')",
         )
-        .expect("create migration ledger");
-        for migration in schema::schema_migrations_base() {
-            if matches!(
-                migration.id.as_str(),
-                "v20_agents_registration_token" | "v20_idx_agents_registration_token"
-            ) {
-                continue;
-            }
-            conn.execute_sync(
-                "INSERT INTO mcp_agent_mail_migrations (id, description, applied_at) VALUES (?, ?, ?)",
-                &[
-                    Value::Text(migration.id),
-                    Value::Text(migration.description),
-                    Value::BigInt(0),
-                ],
-            )
-            .expect("seed already-applied migration");
-        }
+        .expect("reopen v20 migration family");
     }
 
     #[test]
