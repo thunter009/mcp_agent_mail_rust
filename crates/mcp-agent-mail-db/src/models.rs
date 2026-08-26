@@ -255,6 +255,10 @@ pub struct MessageRow {
     #[sqlmodel(nullable)]
     pub thread_id: Option<String>,
 
+    /// Optional legacy-compatible topic tag used for lightweight grouping.
+    #[sqlmodel(nullable)]
+    pub topic: Option<String>,
+
     pub subject: String,
     pub body_md: String,
 
@@ -283,6 +287,7 @@ impl Default for MessageRow {
             project_id: 0,
             sender_id: 0,
             thread_id: None,
+            topic: None,
             subject: String::new(),
             body_md: String::new(),
             importance: "normal".to_string(),

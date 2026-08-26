@@ -1341,6 +1341,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 2,
                 thread_id: Some("br-1".into()),
+                topic: None,
                 subject: "Hello".into(),
                 importance: "high".into(),
                 ack_required: true,

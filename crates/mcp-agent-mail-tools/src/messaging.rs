@@ -905,6 +905,35 @@ fn normalized_topic_argument(topic: Option<&str>) -> Option<&str> {
     topic.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn normalize_send_topic_argument(topic: Option<String>) -> McpResult<Option<String>> {
+    let Some(topic) = normalized_topic_argument(topic.as_deref()) else {
+        return Ok(None);
+    };
+    let valid = topic.len() <= 64
+        && topic
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && topic
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !valid {
+        return Err(legacy_tool_error(
+            "INVALID_TOPIC",
+            format!(
+                "Topic must be 1-64 characters, start with a letter or digit, and \
+                 contain only alphanumerics, '.', '_', or '-'. Got: {topic:?}"
+            ),
+            true,
+            json!({
+                "argument": "topic",
+                "provided": topic,
+            }),
+        ));
+    }
+    Ok(Some(topic.to_string()))
+}
+
 fn reject_unsupported_topic_argument(topic: Option<&str>, tool_name: &str) -> McpResult<()> {
     let Some(topic_value) = normalized_topic_argument(topic) else {
         return Ok(());
@@ -1501,6 +1530,7 @@ pub struct MessagePayload {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -1665,6 +1695,7 @@ pub struct InboxMessage {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1713,6 +1744,7 @@ pub struct ReplyMessageResponse {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub topic: Option<String>,
     pub subject: String,
     pub importance: String,
     pub ack_required: bool,
@@ -1745,7 +1777,7 @@ pub struct ReplyMessageResponse {
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
 /// - `thread_id`: Associate with existing thread (optional; bare numerics must already exist)
-/// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
+/// - `topic`: Optional 1-64 character topic tag, persisted and inherited by replies
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 /// - `sender_token`: Registration token for sender identity verification (optional by default; mandatory in the fail-closed profile)
 ///
@@ -1757,7 +1789,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional topic tag (max 64 chars). Must start with a letter or digit and may otherwise\n    contain alphanumerics, '.', '_', or '-'. Persisted on the message and inherited by replies.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -1784,6 +1816,7 @@ pub async fn send_message(
     let to = normalize_agent_names_or_original(to);
     let cc = normalize_optional_agent_names(cc);
     let bcc = normalize_optional_agent_names(bcc);
+    let topic = normalize_send_topic_argument(topic)?;
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
     // Fingerprint the normalized request payload (only when a key was supplied)
@@ -1810,6 +1843,7 @@ pub async fn send_message(
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
                 ("thread_id", thread_id.clone().unwrap_or_default()),
+                ("topic", topic.clone().unwrap_or_default()),
                 ("attachments", atts.join("\u{1f}")),
                 (
                     "convert_images",
@@ -1856,7 +1890,6 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    reject_unsupported_topic_argument(topic.as_deref(), "send_message")?;
 
     let config = &Config::get();
 
@@ -2480,7 +2513,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_with_topic_idempotent(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2491,6 +2524,7 @@ effective_free_bytes={free}"
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
+                topic.as_deref(),
                 &recipient_refs,
                 claim,
             )
@@ -2504,7 +2538,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_with_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -2515,6 +2549,7 @@ effective_free_bytes={free}"
                 &importance_val,
                 ack_required.unwrap_or(false),
                 &attachments_json,
+                topic.as_deref(),
                 &recipient_refs,
             )
             .await,
@@ -2620,6 +2655,7 @@ effective_free_bytes={free}"
                 "subject": &message.subject,
                 "created": micros_to_iso(message.created_ts),
                 "thread_id": &message.thread_id,
+                "topic": &message.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &message.importance,
@@ -2664,6 +2700,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: message.thread_id,
+            topic: message.topic,
             subject: message.subject,
             body_md: message.body_md,
             importance: message.importance,
@@ -3459,7 +3496,7 @@ effective_free_bytes={free}"
             fingerprint,
         };
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+            mcp_agent_mail_db::queries::create_message_with_recipients_with_topic_idempotent(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3470,6 +3507,7 @@ effective_free_bytes={free}"
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
+                original.topic.as_deref(),
                 &recipient_refs,
                 claim,
             )
@@ -3483,7 +3521,7 @@ effective_free_bytes={free}"
         }
     } else {
         let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients(
+            mcp_agent_mail_db::queries::create_message_with_recipients_with_topic(
                 ctx.cx(),
                 &pool,
                 project_id,
@@ -3494,6 +3532,7 @@ effective_free_bytes={free}"
                 &importance_val,
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
+                original.topic.as_deref(),
                 &recipient_refs,
             )
             .await,
@@ -3596,6 +3635,7 @@ effective_free_bytes={free}"
                 "subject": &reply.subject,
                 "created": micros_to_iso(reply.created_ts),
                 "thread_id": &thread_id,
+                "topic": &reply.topic,
                 "project": &project.human_key,
                 "project_slug": &project.slug,
                 "importance": &reply.importance,
@@ -3641,6 +3681,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id.clone()),
+            topic: reply.topic.clone(),
             subject: reply.subject.clone(),
             body_md: reply.body_md.clone(),
             importance: reply.importance.clone(),
@@ -3658,6 +3699,7 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             thread_id: Some(thread_id),
+            topic: reply.topic,
             subject: reply.subject,
             importance: reply.importance,
             ack_required: reply.ack_required != 0,
@@ -3909,6 +3951,7 @@ pub async fn fetch_inbox(
                 project_id: row.message.project_id,
                 sender_id: row.message.sender_id,
                 thread_id: row.message.thread_id,
+                topic: row.message.topic,
                 subject: row.message.subject,
                 importance: row.message.importance,
                 ack_required: row.message.ack_required != 0,
@@ -5832,6 +5875,32 @@ mod tests {
     }
 
     #[test]
+    fn normalize_send_topic_argument_accepts_and_trims_legacy_topic() {
+        assert_eq!(
+            normalize_send_topic_argument(Some(" br-q49el.1 ".to_string())).expect("valid topic"),
+            Some("br-q49el.1".to_string())
+        );
+        assert_eq!(
+            normalize_send_topic_argument(Some("   ".to_string())).expect("blank topic"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_send_topic_argument_rejects_invalid_topic() {
+        for topic in [".hidden", "bad/topic", "ümlaut"] {
+            let err = normalize_send_topic_argument(Some(topic.to_string()))
+                .expect_err("invalid topic must be rejected");
+            let data = err.data.expect("error payload");
+            assert_eq!(data["error"]["type"], "INVALID_TOPIC");
+            assert_eq!(data["error"]["data"]["argument"], "topic");
+        }
+        let too_long = "a".repeat(65);
+        normalize_send_topic_argument(Some(too_long))
+            .expect_err("topic longer than 64 bytes must be rejected");
+    }
+
+    #[test]
     fn reject_unsupported_topic_argument_allows_blank_topic() {
         reject_unsupported_topic_argument(Some("   "), "send_message")
             .expect("blank topic should behave like an omitted topic");
@@ -6384,6 +6453,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6409,6 +6479,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: Some("br-topic.1".into()),
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: true,
@@ -6460,6 +6531,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: Some("thread-1".into()),
+            topic: None,
             subject: "test".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6491,6 +6563,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "new".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6510,6 +6583,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "already-read".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6529,6 +6603,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "not-updated".into(),
                 importance: "normal".into(),
                 ack_required: false,
@@ -6590,6 +6665,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-topic.1".into()),
             subject: "Hello".into(),
             body_md: "# Content".into(),
             importance: "high".into(),
@@ -6604,6 +6680,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["from"], "BlueLake");
+        assert_eq!(json["topic"], "br-topic.1");
         assert_eq!(json["to"][0], "RedFox");
         assert_eq!(json["cc"][0], "GoldHawk");
         assert_eq!(
@@ -6621,6 +6698,7 @@ mod tests {
             project_id: 1,
             sender_id: 2,
             thread_id: Some("t-1".into()),
+            topic: Some("br-topic.1".into()),
             subject: "Re: Hello".into(),
             importance: "normal".into(),
             ack_required: false,
@@ -6641,6 +6719,7 @@ mod tests {
         assert_eq!(deserialized.id, 5);
         assert_eq!(deserialized.reply_to, 3);
         assert_eq!(deserialized.subject, "Re: Hello");
+        assert_eq!(deserialized.topic.as_deref(), Some("br-topic.1"));
     }
 
     // -----------------------------------------------------------------------
@@ -7496,6 +7575,7 @@ mod tests {
                 project_id: 1,
                 sender_id: 1,
                 thread_id: None,
+                topic: None,
                 subject: "test".into(),
                 body_md: "body".into(),
                 importance: "normal".into(),
@@ -7521,6 +7601,7 @@ mod tests {
             project_id: 1,
             sender_id: 1,
             thread_id: None,
+            topic: None,
             subject: "s".into(),
             body_md: "b".into(),
             importance: "low".into(),

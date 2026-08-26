@@ -5,6 +5,7 @@
 use fastmcp::{Cx, ListToolsParams, McpContext, Tool};
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
@@ -122,10 +123,25 @@ fn diff_position(expected: &str, actual: &str) -> Option<(usize, String)> {
     None
 }
 
+// GH#259: the maintained fork implements topic persistence before the pinned
+// Python-description fixture is regenerated. Keep this override exact so any
+// unrelated description drift still fails parity.
+const PYTHON_FIXTURE_TOPIC_DESCRIPTION: &str = "    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.";
+const FORK_TOPIC_DESCRIPTION: &str = "    Optional topic tag (max 64 chars). Must start with a letter or digit and may otherwise\n    contain alphanumerics, '.', '_', or '-'. Persisted on the message and inherited by replies.";
+
+fn expected_description_with_fork_overrides(expected: &str) -> Cow<'_, str> {
+    if expected.contains(PYTHON_FIXTURE_TOPIC_DESCRIPTION) {
+        Cow::Owned(expected.replacen(PYTHON_FIXTURE_TOPIC_DESCRIPTION, FORK_TOPIC_DESCRIPTION, 1))
+    } else {
+        Cow::Borrowed(expected)
+    }
+}
+
 fn description_matches_fixture(expected: &str, actual: &str) -> bool {
-    actual == expected
+    let expected = expected_description_with_fork_overrides(expected);
+    actual == expected.as_ref()
         || actual
-            .strip_prefix(expected)
+            .strip_prefix(expected.as_ref())
             .is_some_and(|suffix| suffix.starts_with("\n\n"))
 }
 
@@ -451,6 +467,18 @@ fn description_matching_rejects_same_prefix_with_midstream_drift() {
     assert!(!description_matches_fixture(
         fixture,
         "alpha beta gamma Rust-only extension"
+    ));
+}
+
+#[test]
+fn description_matching_allows_only_the_topic_persistence_fork_override() {
+    let expected = format!("before\n{PYTHON_FIXTURE_TOPIC_DESCRIPTION}\nafter");
+    let actual = format!("before\n{FORK_TOPIC_DESCRIPTION}\nafter");
+
+    assert!(description_matches_fixture(&expected, &actual));
+    assert!(!description_matches_fixture(
+        &expected,
+        &format!("{actual}\nunrelated drift")
     ));
 }
 

@@ -401,7 +401,7 @@ fn fetch_inbox_rows_from_conn_impl(
     };
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
@@ -452,6 +452,9 @@ fn fetch_inbox_rows_from_conn_impl(
         let thread_id: Option<String> = row
             .get_named("thread_id")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let topic: Option<String> = row
+            .get_named("topic")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let subject: String = row
             .get_named("subject")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -492,6 +495,7 @@ fn fetch_inbox_rows_from_conn_impl(
                 project_id,
                 sender_id,
                 thread_id,
+                topic,
                 subject,
                 body_md,
                 importance,

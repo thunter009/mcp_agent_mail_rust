@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS messages (
     project_id INTEGER NOT NULL REFERENCES projects(id),
     sender_id INTEGER NOT NULL REFERENCES agents(id),
     thread_id TEXT,
+    topic VARCHAR(64),
     subject TEXT NOT NULL,
     body_md TEXT NOT NULL,
     importance TEXT NOT NULL DEFAULT 'normal',
@@ -89,6 +90,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
@@ -2368,6 +2370,25 @@ pub fn schema_migrations() -> Vec<Migration> {
                AND task_description LIKE '[DEREGISTERED %] %'",
             legacy_deregistered_micros
         ),
+        String::new(),
+    ));
+
+    // ── v28: legacy topic-tag persistence parity (GH#259) ─────────────
+    //
+    // Python-imported databases already carry this column. The migration
+    // runner's structural preflight records this step without re-running the
+    // ALTER in that case; existing Rust-native databases receive the column.
+    migrations.push(Migration::new(
+        "v28_messages_topic".to_string(),
+        "GH#259: add optional legacy-compatible message topic tag".to_string(),
+        "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v28_idx_messages_project_topic".to_string(),
+        "GH#259: index project-scoped message topic tags".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic)"
+            .to_string(),
         String::new(),
     ));
 

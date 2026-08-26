@@ -6481,6 +6481,7 @@ pub async fn create_message(
             project_id,
             sender_id,
             thread_id: thread_id.map(String::from),
+            topic: None,
             subject: subject.to_string(),
             body_md: body_md.to_string(),
             importance: importance.to_string(),
@@ -6619,6 +6620,40 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
+    create_message_with_recipients_with_topic(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        None,
+        recipients,
+    )
+    .await
+}
+
+/// Create a message and recipients atomically while preserving an optional
+/// legacy topic tag.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_with_topic(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    topic: Option<&str>,
+    recipients: &[(i64, &str)], // (agent_id, kind)
+) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
         cx,
         pool,
@@ -6630,6 +6665,7 @@ pub async fn create_message_with_recipients(
         importance,
         ack_required,
         attachments,
+        topic,
         recipients,
         None,
     )
@@ -6675,6 +6711,42 @@ pub async fn create_message_with_recipients_idempotent(
     recipients: &[(i64, &str)],
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    create_message_with_recipients_with_topic_idempotent(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        None,
+        recipients,
+        claim,
+    )
+    .await
+}
+
+/// Idempotent topic-preserving variant of
+/// [`create_message_with_recipients_with_topic`].
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_with_topic_idempotent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    topic: Option<&str>,
+    recipients: &[(i64, &str)],
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
         cx,
         pool,
@@ -6686,6 +6758,7 @@ pub async fn create_message_with_recipients_idempotent(
         importance,
         ack_required,
         attachments,
+        topic,
         recipients,
         Some(claim),
     )
@@ -6704,6 +6777,7 @@ async fn create_message_with_recipients_impl(
     importance: &str,
     ack_required: bool,
     attachments: &str,
+    topic: Option<&str>,
     recipients: &[(i64, &str)], // (agent_id, kind)
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
@@ -6800,6 +6874,7 @@ async fn create_message_with_recipients_impl(
                     importance,
                     ack_required,
                     attachments,
+                    topic,
                     recipients,
                     now,
                     message_id,
@@ -7044,6 +7119,7 @@ async fn create_message_with_recipients_tx(
     importance: &str,
     ack_required: bool,
     attachments: &str,
+    topic: Option<&str>,
     recipients: &[(i64, &str)],
     now: i64,
     message_id: i64,
@@ -7147,13 +7223,14 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
         thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
+        topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string())),
         Value::Text(subject.to_string()),
         Value::Text(body_md.to_string()),
         Value::Text(importance.to_string()),
@@ -7174,6 +7251,7 @@ async fn create_message_with_recipients_tx(
         project_id,
         sender_id,
         thread_id: thread_id.map(String::from),
+        topic: topic.map(String::from),
         subject: subject.to_string(),
         body_md: body_md.to_string(),
         importance: importance.to_string(),
@@ -8036,7 +8114,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, project_id, sender_id, thread_id, subject, body_md, importance, \
+    let sql = "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
                        ack_required, created_ts, recipients_json, attachments \
                 FROM messages \
                 WHERE id = ? \
@@ -8062,6 +8140,10 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
             let thread_id: Option<String> = match row.get_named("thread_id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let topic: Option<String> = match row.get_named("topic") {
                 Ok(v) => v,
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
@@ -8099,6 +8181,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 project_id,
                 sender_id,
                 thread_id,
+                topic,
                 subject,
                 body_md,
                 importance,
@@ -8609,17 +8692,18 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
     let project_id: i64 = row.get_as(1).map_err(|e| map_sql_error(&e))?;
     let sender_id: i64 = row.get_as(2).map_err(|e| map_sql_error(&e))?;
     let thread_id: Option<String> = row.get_as(3).map_err(|e| map_sql_error(&e))?;
-    let subject: String = row.get_as(4).map_err(|e| map_sql_error(&e))?;
-    let body_md: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
-    let importance: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
-    let ack_required: i64 = row.get_as(7).map_err(|e| map_sql_error(&e))?;
-    let created_ts: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
-    let recipients_json: String = row.get_as(9).map_err(|e| map_sql_error(&e))?;
-    let attachments: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
-    let kind: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
-    let sender_name: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
-    let read_ts: Option<i64> = row.get_as(13).map_err(|e| map_sql_error(&e))?;
-    let ack_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+    let topic: Option<String> = row.get_as(4).map_err(|e| map_sql_error(&e))?;
+    let subject: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
+    let body_md: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
+    let importance: String = row.get_as(7).map_err(|e| map_sql_error(&e))?;
+    let ack_required: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
+    let created_ts: i64 = row.get_as(9).map_err(|e| map_sql_error(&e))?;
+    let recipients_json: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
+    let attachments: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
+    let kind: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
+    let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
+    let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+    let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
         message: MessageRow {
@@ -8627,6 +8711,7 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
             project_id,
             sender_id,
             thread_id,
+            topic,
             subject,
             body_md,
             importance,
@@ -8722,7 +8807,7 @@ async fn fetch_inbox_for_product_agent_impl(
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
          FROM product_project_links ppl \
@@ -9392,7 +9477,7 @@ pub async fn fetch_inbox_global(
     let tracked = tracked(&*conn);
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                 m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, \
@@ -9429,17 +9514,18 @@ pub async fn fetch_inbox_global(
                 let project_id: i64 = row.get_as(1).unwrap_or(0);
                 let sender_id: i64 = row.get_as(2).unwrap_or(0);
                 let thread_id: Option<String> = row.get_as(3).unwrap_or(None);
-                let subject: String = row.get_as(4).unwrap_or_default();
-                let body_md: String = row.get_as(5).unwrap_or_default();
-                let importance: String = row.get_as(6).unwrap_or_default();
-                let ack_required: i64 = row.get_as(7).unwrap_or(0);
-                let created_ts: i64 = row.get_as(8).unwrap_or(0);
-                let recipients_json: String = row.get_as(9).unwrap_or_default();
-                let attachments: String = row.get_as(10).unwrap_or_default();
-                let kind: String = row.get_as(11).unwrap_or_default();
-                let sender_name: String = row.get_as(12).unwrap_or_default();
-                let ack_ts: Option<i64> = row.get_as(13).unwrap_or(None);
-                let project_slug: String = row.get_as(14).unwrap_or_default();
+                let topic: Option<String> = row.get_as(4).unwrap_or(None);
+                let subject: String = row.get_as(5).unwrap_or_default();
+                let body_md: String = row.get_as(6).unwrap_or_default();
+                let importance: String = row.get_as(7).unwrap_or_default();
+                let ack_required: i64 = row.get_as(8).unwrap_or(0);
+                let created_ts: i64 = row.get_as(9).unwrap_or(0);
+                let recipients_json: String = row.get_as(10).unwrap_or_default();
+                let attachments: String = row.get_as(11).unwrap_or_default();
+                let kind: String = row.get_as(12).unwrap_or_default();
+                let sender_name: String = row.get_as(13).unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_as(14).unwrap_or(None);
+                let project_slug: String = row.get_as(15).unwrap_or_default();
 
                 out.push(GlobalInboxRow {
                     message: MessageRow {
@@ -9447,6 +9533,7 @@ pub async fn fetch_inbox_global(
                         project_id,
                         sender_id,
                         thread_id,
+                        topic,
                         subject,
                         body_md,
                         importance,
@@ -14017,7 +14104,7 @@ pub async fn fetch_unacked_for_agent(
     };
 
     let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
                   r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
@@ -14056,43 +14143,47 @@ pub async fn fetch_unacked_for_agent(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(4) {
+                let topic: Option<String> = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(5) {
+                let subject: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(6) {
+                let body_md: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(7) {
+                let importance: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(8) {
+                let ack_required: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients_json: String = match row.get_as(9) {
+                let created_ts: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(10) {
+                let recipients_json: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(11) {
+                let attachments: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(12) {
+                let kind: String = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(13) {
+                let sender_name: String = match row.get_as(13) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let read_ts: Option<i64> = match row.get_as(14) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -14103,6 +14194,7 @@ pub async fn fetch_unacked_for_agent(
                         project_id: proj_id,
                         sender_id,
                         thread_id,
+                        topic,
                         subject,
                         body_md,
                         importance,
@@ -20343,6 +20435,95 @@ mod tests {
     }
 
     #[test]
+    fn create_message_with_recipients_persists_topic() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message_topic_persistence.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-topic-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let message = create_message_with_recipients_with_topic(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "topic persistence",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                Some("build-updates"),
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message with topic");
+
+            assert_eq!(message.topic.as_deref(), Some("build-updates"));
+
+            let message_id = message.id.expect("message id");
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let rows = conn
+                .query_sync(
+                    "SELECT topic FROM messages WHERE id = ?",
+                    &[Value::BigInt(message_id)],
+                )
+                .expect("query stored topic");
+            let stored_topic: Option<String> = rows[0].get_as(0).expect("decode topic");
+            assert_eq!(stored_topic.as_deref(), Some("build-updates"));
+            drop(conn);
+
+            let reloaded = get_message(&cx, &pool, message_id)
+                .await
+                .into_result()
+                .expect("reload message with topic");
+            assert_eq!(reloaded.topic.as_deref(), Some("build-updates"));
+        });
+    }
+
+    #[test]
     fn list_thread_messages_limit_returns_latest_window_in_order() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -26324,6 +26505,7 @@ mod tests {
                 project_id: 10,
                 sender_id: 100,
                 thread_id: Some("t1".to_string()),
+                topic: None,
                 subject: "Test".to_string(),
                 body_md: "Body".to_string(),
                 importance: "normal".to_string(),
