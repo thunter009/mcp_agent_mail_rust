@@ -610,6 +610,13 @@ pub fn schema_migrations() -> Vec<Migration> {
             continue;
         };
 
+        // The static schema includes latest-state indexes for fresh databases,
+        // but legacy databases need the versioned column migration first.
+        // v28 owns this index so it cannot run as a generated v1 migration.
+        if id == "v1_create_index_idx_messages_project_topic" {
+            continue;
+        }
+
         migrations.push(Migration::new(id, desc, stmt.to_string(), String::new()));
     }
 
@@ -4969,6 +4976,70 @@ mod tests {
             )
             .expect("query migration row");
         assert_eq!(rows.len(), 1, "expected migration row to be recorded");
+    }
+
+    #[test]
+    fn topic_migrations_upgrade_legacy_messages_before_index_creation() {
+        let migrations: Vec<_> = schema_migrations()
+            .into_iter()
+            .filter(|migration| {
+                migration.id == "v1_create_index_idx_messages_project_topic"
+                    || migration.id == "v28_messages_topic"
+                    || migration.id == "v28_idx_messages_project_topic"
+            })
+            .collect();
+        let ids: Vec<_> = migrations
+            .iter()
+            .map(|migration| migration.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["v28_messages_topic", "v28_idx_messages_project_topic"],
+            "the versioned column migration must precede its dependent index"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("migrations_legacy_messages_topic.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL\
+            )",
+        )
+        .expect("create legacy messages table without topic");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_specific_migrations(&cx, conn, migrations)
+                    .await
+                    .into_result()
+                    .expect("apply ordered topic migrations");
+            }
+        });
+
+        let columns = conn
+            .query_sync("PRAGMA table_info(messages)", &[])
+            .expect("inspect migrated messages columns");
+        assert!(
+            columns
+                .iter()
+                .any(|row| { row.get_named::<String>("name").ok().as_deref() == Some("topic") })
+        );
+
+        let indexes = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+                &[Value::Text("idx_messages_project_topic".to_string())],
+            )
+            .expect("inspect migrated topic index");
+        assert_eq!(indexes.len(), 1);
     }
 
     #[test]
