@@ -14,10 +14,11 @@ This crate keeps the live Rust router honest against the legacy Python reference
 - Focused regression checks for tool filtering, error envelopes, and outage behavior
 - Automation entrypoints in `../../scripts/regen_python_parity_fixtures.sh` and `.github/workflows/conformance-fixture-regen.yml`
 
-## Current coverage (as of 2026-04-18)
+## Current coverage (as of 2026-08-27)
 
-- The live Rust router exposes 43 tools.
+- The live Rust router exposes 48 tools.
 - 37 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
+- 5 additional Python-compatible tools have description/schema parity plus focused DB/tool tests: `list_window_identities`, `sweep_stale_agents`, `fetch_topic`, `summarize_recent`, `fetch_summary`.
 - 6 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, and `get_message_delivery_receipt`.
 - All 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.

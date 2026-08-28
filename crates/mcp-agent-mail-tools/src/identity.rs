@@ -1612,7 +1612,7 @@ pub struct AgentResponse {
     pub registration_token: Option<String>,
 }
 
-fn authenticate_lifecycle_agent(
+pub(crate) fn authenticate_lifecycle_agent(
     project: &mcp_agent_mail_db::ProjectRow,
     agent: &mcp_agent_mail_db::AgentRow,
     registration_token: Option<&str>,
@@ -2660,6 +2660,125 @@ Choose a different name (or omit the name to auto-generate one)."
         serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
     }
+}
+
+/// List active Python-compatible persistent window identities.
+#[tool(
+    description = "List active window identities for a project.\n\nReturns all non-expired window identities with their display names,\nlast activity timestamps, and age.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\n\nReturns\n-------\ndict\n    { identities: [{ id, window_uuid, display_name, created_ts, last_active_ts, expires_ts }] }"
+)]
+pub async fn list_window_identities(
+    ctx: &McpContext,
+    project_key: String,
+    format: Option<String>,
+) -> McpResult<String> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+    let _ = format;
+
+    let pool = get_read_db_pool(ctx.cx()).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let now = mcp_agent_mail_db::now_micros();
+    let identities = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_active_window_identities(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            now,
+        )
+        .await,
+    )?;
+    let items: Vec<serde_json::Value> = identities
+        .into_iter()
+        .map(|identity| {
+            json!({
+                "id": identity.id,
+                "window_uuid": identity.window_uuid,
+                "display_name": identity.display_name,
+                "created_ts": micros_to_iso(identity.created_ts),
+                "last_active_ts": micros_to_iso(identity.last_active_ts),
+                "expires_ts": identity.expires_ts.map(micros_to_iso),
+                "age_days": now.saturating_sub(identity.created_ts) / MICROS_PER_DAY,
+            })
+        })
+        .collect();
+    Ok(json!({ "identities": items, "count": items.len() }).to_string())
+}
+
+/// Retire abandoned agents without requiring each target's token.
+#[tool(
+    description = "Retire abandoned agents in the caller's project using the server's conservative inactivity heuristic. The caller is never retired, the threshold has a 60-second floor, and active file reservations block retirement by default."
+)]
+pub async fn sweep_stale_agents(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    threshold_seconds: Option<i64>,
+    require_no_active_reservations: Option<bool>,
+    registration_token: Option<String>,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let actor = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &agent_name,
+        )
+        .await,
+    )?;
+    authenticate_lifecycle_agent(
+        &project,
+        &actor,
+        registration_token.as_deref(),
+        pane_id.as_deref(),
+        "sweep_stale_agents",
+    )?;
+    reject_deregistered_lifecycle_transition(ctx, &pool, &actor, "swept").await?;
+
+    let actor_id = actor
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let effective_threshold = threshold_seconds.unwrap_or(86_400).max(60);
+    let now = mcp_agent_mail_db::now_micros();
+    let cutoff = now.saturating_sub(effective_threshold.saturating_mul(1_000_000));
+    let protect_reservations = require_no_active_reservations.unwrap_or(true);
+    let retired = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::sweep_stale_agents(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            actor_id,
+            cutoff,
+            now,
+            protect_reservations,
+        )
+        .await,
+    )?;
+    let retired_names: Vec<String> = retired.iter().map(|agent| agent.name.clone()).collect();
+    let retired_agents: Vec<serde_json::Value> = retired
+        .into_iter()
+        .map(|agent| {
+            json!({
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "project_id": project.id,
+                "project_key": project.human_key,
+                "last_active_ts": micros_to_iso(agent.last_active_ts),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "project_key": project.human_key,
+        "requested_by": actor.name,
+        "threshold_seconds": effective_threshold,
+        "require_no_active_reservations": protect_reservations,
+        "retired": retired_names,
+        "retired_agents": retired_agents,
+        "count": retired_names.len(),
+    })
+    .to_string())
 }
 
 /// Soft-delete an agent while preserving its message history.

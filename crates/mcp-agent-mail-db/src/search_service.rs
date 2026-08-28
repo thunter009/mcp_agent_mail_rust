@@ -6283,6 +6283,8 @@ mod tests {
             project_id,
             sender_id: 1,
             thread_id: thread_id.map(std::borrow::ToOwned::to_owned),
+            reply_to: None,
+            topic: None,
             subject: "subject".to_string(),
             body_md: "body".to_string(),
             importance: importance.to_string(),

@@ -164,16 +164,17 @@ use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
     CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
-    FetchInboxEvents, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
-    ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource,
-    InboxResource, InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
-    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
-    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
-    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
-    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
-    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
-    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    FetchInboxEvents, FetchInboxProduct, FetchSummary, FetchTopic, FileReservationPaths,
+    FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
+    IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
+    ListWindowIdentities, MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread,
+    MacroStartSession, MailboxResource, MailboxWithCommitsResource, MarkMessageRead,
+    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
+    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeRecent, SummarizeThread,
+    SummarizeThreadProduct, SweepStaleAgents, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
     ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
     ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
@@ -667,6 +668,20 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         clusters::IDENTITY,
         UnretireAgent,
     );
+    let server = add_tool(
+        server,
+        config,
+        "sweep_stale_agents",
+        clusters::IDENTITY,
+        SweepStaleAgents,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "list_window_identities",
+        clusters::IDENTITY,
+        ListWindowIdentities,
+    );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
     let server = add_tool(
         server,
@@ -709,6 +724,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "fetch_inbox",
         clusters::MESSAGING,
         FetchInbox,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_topic",
+        clusters::MESSAGING,
+        FetchTopic,
     );
     let server = add_tool(
         server,
@@ -828,6 +850,20 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "summarize_thread",
         clusters::SEARCH,
         SummarizeThread,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "summarize_recent",
+        clusters::SEARCH,
+        SummarizeRecent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_summary",
+        clusters::SEARCH,
+        FetchSummary,
     );
     let server = add_tool(
         server,

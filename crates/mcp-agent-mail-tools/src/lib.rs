@@ -2855,6 +2855,8 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("deregister_agent", clusters::IDENTITY),
     ("retire_agent", clusters::IDENTITY),
     ("unretire_agent", clusters::IDENTITY),
+    ("sweep_stale_agents", clusters::IDENTITY),
+    ("list_window_identities", clusters::IDENTITY),
     ("whois", clusters::IDENTITY),
     ("resolve_pane_identity", clusters::IDENTITY),
     ("cleanup_pane_identities", clusters::IDENTITY),
@@ -2863,6 +2865,7 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),
     ("fetch_inbox", clusters::MESSAGING),
+    ("fetch_topic", clusters::MESSAGING),
     ("fetch_inbox_events", clusters::MESSAGING),
     ("mark_message_read", clusters::MESSAGING),
     ("acknowledge_message", clusters::MESSAGING),
@@ -2887,6 +2890,8 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Search
     ("search_messages", clusters::SEARCH),
     ("summarize_thread", clusters::SEARCH),
+    ("summarize_recent", clusters::SEARCH),
+    ("fetch_summary", clusters::SEARCH),
     // Workflow macros
     ("macro_start_session", clusters::WORKFLOW_MACROS),
     ("macro_prepare_thread", clusters::WORKFLOW_MACROS),

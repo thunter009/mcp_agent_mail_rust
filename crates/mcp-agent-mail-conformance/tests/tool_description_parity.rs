@@ -32,14 +32,7 @@ struct ToolDescriptionsFixture {
 
 /// Python-only tools that exist in the Python server but not in Rust.
 /// These are window-management tools not yet ported.
-const PYTHON_ONLY_TOOLS: &[&str] = &[
-    "expire_window",
-    "fetch_summary",
-    "fetch_topic",
-    "list_window_identities",
-    "rename_window",
-    "summarize_recent",
-];
+const PYTHON_ONLY_TOOLS: &[&str] = &["expire_window", "rename_window"];
 
 /// Rust-native tools that do not have Python reference descriptions.
 const RUST_NATIVE_TOOLS: &[&str] = &[
@@ -537,11 +530,17 @@ fn cluster_infrastructure_descriptions() {
     ]);
 }
 
-/// Identity cluster: register_agent, create_agent_identity, whois
+/// Identity cluster descriptions.
 #[test]
 fn cluster_identity_descriptions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    check_cluster_descriptions(&["register_agent", "create_agent_identity", "whois"]);
+    check_cluster_descriptions(&[
+        "register_agent",
+        "create_agent_identity",
+        "list_window_identities",
+        "sweep_stale_agents",
+        "whois",
+    ]);
 }
 
 /// Messaging cluster: send_message, reply_message, fetch_inbox, fetch_inbox_events,
@@ -553,6 +552,7 @@ fn cluster_messaging_descriptions() {
         "send_message",
         "reply_message",
         "fetch_inbox",
+        "fetch_topic",
         "fetch_inbox_events",
         "get_message_delivery_receipt",
         "mark_message_read",
@@ -584,11 +584,16 @@ fn cluster_file_reservations_descriptions() {
     ]);
 }
 
-/// Search cluster: search_messages, summarize_thread
+/// Search cluster descriptions.
 #[test]
 fn cluster_search_descriptions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    check_cluster_descriptions(&["search_messages", "summarize_thread"]);
+    check_cluster_descriptions(&[
+        "search_messages",
+        "summarize_thread",
+        "summarize_recent",
+        "fetch_summary",
+    ]);
 }
 
 /// Macros cluster: macro_start_session, macro_prepare_thread, macro_file_reservation_cycle, macro_contact_handshake

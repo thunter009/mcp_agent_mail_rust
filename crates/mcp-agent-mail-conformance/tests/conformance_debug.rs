@@ -9,6 +9,14 @@ const README_RELATIVE: &str = "README.md";
 const PYTHON_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/python_reference.json";
 const TOOL_FILTER_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/tool_filter/cases.json";
 const RUST_NATIVE_FIXTURE_DIR_RELATIVE: &str = "tests/conformance/fixtures/rust_native";
+const TOOL_DESCRIPTION_FIXTURE: &str = "tests/conformance/fixtures/tool_descriptions.json";
+const DESCRIPTION_PARITY_PYTHON_TOOLS: &[&str] = &[
+    "fetch_summary",
+    "fetch_topic",
+    "list_window_identities",
+    "summarize_recent",
+    "sweep_stale_agents",
+];
 
 #[derive(Debug, Deserialize)]
 struct ToolFilterFixtures {
@@ -260,7 +268,7 @@ fn audit_doc_matches_live_inventory() {
         .collect();
     assert_eq!(
         runtime_tools.len(),
-        43,
+        48,
         "tool count drifted from audit baseline"
     );
 
@@ -272,6 +280,13 @@ fn audit_doc_matches_live_inventory() {
                 has_fixture: "yes".to_string(),
                 classification: "python-parity".to_string(),
                 fixture_file: "crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json".to_string(),
+            }
+        } else if DESCRIPTION_PARITY_PYTHON_TOOLS.contains(&tool.as_str()) {
+            AuditRow {
+                name: tool.clone(),
+                has_fixture: "yes".to_string(),
+                classification: "python-parity".to_string(),
+                fixture_file: TOOL_DESCRIPTION_FIXTURE.to_string(),
             }
         } else if rust_native_tools.contains(tool) {
             AuditRow {
@@ -411,9 +426,13 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     let readme = read_file(crate_root().join(README_RELATIVE));
     for needle in [
         "# mcp-agent-mail-conformance",
-        "## Current coverage (as of 2026-04-18)",
-        "43 tools",
+        "## Current coverage (as of 2026-08-27)",
+        "48 tools",
         "37 tools have Python behavior fixtures",
+        "5 additional Python-compatible tools",
+        "fetch_topic",
+        "summarize_recent",
+        "fetch_summary",
         "resolve_pane_identity",
         "cleanup_pane_identities",
         "list_agents",

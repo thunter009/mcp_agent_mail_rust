@@ -15,7 +15,7 @@ use crate::idempotency::{
 };
 use crate::models::{
     AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
-    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
+    MessageRecipientRow, MessageRow, MessageSummaryRow, ProductRow, ProjectRow, WindowIdentityRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -5369,6 +5369,43 @@ async fn list_agents_bounded_inner(
     }
 }
 
+/// List non-expired persistent terminal-window identities for a project.
+pub async fn list_active_window_identities(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    now: i64,
+) -> Outcome<Vec<WindowIdentityRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT id, project_id, window_uuid, display_name, created_ts, \
+               last_active_ts, expires_ts FROM window_identities \
+               WHERE project_id = ? AND (expires_ts IS NULL OR expires_ts > ?) \
+               ORDER BY id ASC";
+    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut identities = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match WindowIdentityRow::from_row(row) {
+                    Ok(identity) => identities.push(identity),
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                }
+            }
+            Outcome::Ok(identities)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Get agents by ids (cache-first).
 pub async fn get_agents_by_ids(
     cx: &Cx,
@@ -5943,6 +5980,103 @@ pub async fn set_agent_retired_at(
     Outcome::Ok(agent)
 }
 
+/// Atomically retire stale active agents in one project.
+///
+/// The authenticated caller is always excluded. When requested, any active,
+/// unexpired file reservation protects its owner from retirement.
+pub async fn sweep_stale_agents(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    exclude_agent_id: i64,
+    cutoff_ts: i64,
+    retired_at: i64,
+    require_no_active_reservations: bool,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    let swept = match run_with_mvcc_retry(cx, "sweep_stale_agents", || async {
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        let mut sql = String::from(
+            "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+             a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+             a.reaper_exempt, a.registration_token, a.retired_at \
+             FROM agents a \
+             WHERE a.project_id = ? AND a.id <> ? AND a.retired_at IS NULL \
+             AND a.last_active_ts < ? \
+             AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations)",
+        );
+        let mut params = vec![
+            Value::BigInt(project_id),
+            Value::BigInt(exclude_agent_id),
+            Value::BigInt(cutoff_ts),
+        ];
+        if require_no_active_reservations {
+            let active_predicate = active_reservation_predicate_for("fr");
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM file_reservations fr \
+                  WHERE fr.agent_id = a.id AND ({active_predicate}) \
+                  AND fr.expires_ts > ?)"
+            ));
+            params.push(Value::BigInt(retired_at));
+        }
+        sql.push_str(" ORDER BY a.id ASC");
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await)
+        );
+        let mut agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+        for agent in &mut agents {
+            let Some(agent_id) = agent.id else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "stale agent candidate missing id".to_string(),
+                ));
+            };
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_execute(
+                        cx,
+                        &tracked,
+                        "UPDATE agents SET retired_at = ? WHERE id = ? AND retired_at IS NULL",
+                        &[Value::BigInt(retired_at), Value::BigInt(agent_id)],
+                    )
+                    .await
+                )
+            );
+            agent.retired_at = Some(retired_at);
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agents)
+    })
+    .await
+    {
+        Outcome::Ok(agents) => agents,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let cache = crate::cache::read_cache();
+    let scope = cache_scope_for_pool(pool);
+    for agent in &swept {
+        cache.put_agent_scoped(&scope, agent);
+    }
+    Outcome::Ok(swept)
+}
+
 /// Remove an agent from active contact while preserving its row and history.
 pub async fn deregister_agent(
     cx: &Cx,
@@ -6197,6 +6331,8 @@ pub struct ThreadMessageRow {
     pub project_id: i64,
     pub sender_id: i64,
     pub thread_id: Option<String>,
+    pub reply_to: Option<i64>,
+    pub topic: Option<String>,
     pub subject: String,
     pub body_md: String,
     pub importance: String,
@@ -6205,6 +6341,378 @@ pub struct ThreadMessageRow {
     pub recipients: String,
     pub attachments: String,
     pub from: String,
+}
+
+/// Project-topic message projection used by `fetch_topic`.
+#[derive(Debug, Clone)]
+pub struct TopicMessageRow {
+    pub id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub reply_to: Option<i64>,
+    pub topic: Option<String>,
+    pub subject: String,
+    pub body_md: String,
+    pub importance: String,
+    pub ack_required: i64,
+    pub created_ts: i64,
+    pub attachments: String,
+    pub from: String,
+    pub sender_project_id: Option<i64>,
+    pub sender_project_human_key: Option<String>,
+    pub sender_project_slug: Option<String>,
+}
+
+fn decode_thread_message_projection(
+    row: &SqlRow,
+) -> std::result::Result<ThreadMessageRow, DbError> {
+    Ok(ThreadMessageRow {
+        id: row.get_as(0).map_err(|e| map_sql_error(&e))?,
+        project_id: row.get_as(1).map_err(|e| map_sql_error(&e))?,
+        sender_id: row.get_as(2).map_err(|e| map_sql_error(&e))?,
+        thread_id: row.get_as(3).map_err(|e| map_sql_error(&e))?,
+        reply_to: row.get_as(4).map_err(|e| map_sql_error(&e))?,
+        topic: row.get_as(5).map_err(|e| map_sql_error(&e))?,
+        subject: row.get_as(6).map_err(|e| map_sql_error(&e))?,
+        body_md: row.get_as(7).map_err(|e| map_sql_error(&e))?,
+        importance: row.get_as(8).map_err(|e| map_sql_error(&e))?,
+        ack_required: row.get_as(9).map_err(|e| map_sql_error(&e))?,
+        created_ts: row.get_as(10).map_err(|e| map_sql_error(&e))?,
+        recipients: row
+            .get_as::<Option<String>>(11)
+            .map_err(|e| map_sql_error(&e))?
+            .unwrap_or_else(|| "{}".to_string()),
+        attachments: row
+            .get_as::<Option<String>>(12)
+            .map_err(|e| map_sql_error(&e))?
+            .unwrap_or_else(|| "[]".to_string()),
+        from: row
+            .get_as::<Option<String>>(13)
+            .map_err(|e| map_sql_error(&e))?
+            .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
+    })
+}
+
+fn decode_topic_message_projection(row: &SqlRow) -> std::result::Result<TopicMessageRow, DbError> {
+    Ok(TopicMessageRow {
+        id: row.get_as(0).map_err(|e| map_sql_error(&e))?,
+        project_id: row.get_as(1).map_err(|e| map_sql_error(&e))?,
+        sender_id: row.get_as(2).map_err(|e| map_sql_error(&e))?,
+        thread_id: row.get_as(3).map_err(|e| map_sql_error(&e))?,
+        reply_to: row.get_as(4).map_err(|e| map_sql_error(&e))?,
+        topic: row.get_as(5).map_err(|e| map_sql_error(&e))?,
+        subject: row.get_as(6).map_err(|e| map_sql_error(&e))?,
+        body_md: row.get_as(7).map_err(|e| map_sql_error(&e))?,
+        importance: row.get_as(8).map_err(|e| map_sql_error(&e))?,
+        ack_required: row.get_as(9).map_err(|e| map_sql_error(&e))?,
+        created_ts: row.get_as(10).map_err(|e| map_sql_error(&e))?,
+        attachments: row
+            .get_as::<Option<String>>(11)
+            .map_err(|e| map_sql_error(&e))?
+            .unwrap_or_else(|| "[]".to_string()),
+        from: row
+            .get_as::<Option<String>>(12)
+            .map_err(|e| map_sql_error(&e))?
+            .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
+        sender_project_id: row.get_as(13).map_err(|e| map_sql_error(&e))?,
+        sender_project_human_key: row.get_as(14).map_err(|e| map_sql_error(&e))?,
+        sender_project_slug: row.get_as(15).map_err(|e| map_sql_error(&e))?,
+    })
+}
+
+/// List the latest project messages in a time window, returned oldest first.
+pub async fn list_recent_project_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    since_ts: i64,
+    limit: usize,
+) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    let limit = match i64::try_from(limit) {
+        Ok(value) => value,
+        Err(_) => return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX")),
+    };
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.reply_to, m.topic, m.subject, m.body_md, \
+         m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+         COALESCE(CASE WHEN sp.id <> m.project_id THEN a.name || '@' || sp.slug \
+                       ELSE a.name END, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
+         FROM messages m \
+         LEFT JOIN agents a ON a.id = m.sender_id \
+         LEFT JOIN projects sp ON sp.id = a.project_id \
+         WHERE m.project_id = ? AND m.created_ts >= ? \
+         ORDER BY m.created_ts DESC, m.id DESC LIMIT ?"
+    );
+    let params = [
+        Value::BigInt(project_id),
+        Value::BigInt(since_ts),
+        Value::BigInt(limit),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut messages = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match decode_thread_message_projection(row) {
+                    Ok(message) => messages.push(message),
+                    Err(error) => return Outcome::Err(error),
+                }
+            }
+            messages.reverse();
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List case-insensitive project-topic messages without changing read state.
+pub async fn list_topic_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    topic_name: &str,
+    since_ts: Option<i64>,
+    viewer_agent_id: Option<i64>,
+    unread_only: bool,
+    limit: usize,
+) -> Outcome<Vec<TopicMessageRow>, DbError> {
+    if unread_only && viewer_agent_id.is_none() {
+        return Outcome::Err(DbError::invalid(
+            "agent_name",
+            "unread_only requires an authenticated agent",
+        ));
+    }
+    let limit = match i64::try_from(limit) {
+        Ok(value) => value,
+        Err(_) => return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX")),
+    };
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let mut sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.reply_to, m.topic, \
+         m.subject, m.body_md, m.importance, m.ack_required, m.created_ts, m.attachments, \
+         COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
+         sp.id, sp.human_key, sp.slug \
+         FROM messages m \
+         LEFT JOIN agents a ON a.id = m.sender_id \
+         LEFT JOIN projects sp ON sp.id = a.project_id \
+         WHERE m.project_id = ? AND LOWER(m.topic) = LOWER(?)"
+    );
+    let mut params = vec![
+        Value::BigInt(project_id),
+        Value::Text(topic_name.to_string()),
+    ];
+    if let Some(since_ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(since_ts));
+    }
+    if unread_only {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM message_recipients mr \
+              WHERE mr.message_id = m.id AND mr.agent_id = ? AND mr.read_ts IS NULL)",
+        );
+        params.push(Value::BigInt(viewer_agent_id.unwrap_or_default()));
+    }
+    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+    params.push(Value::BigInt(limit));
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut messages = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match decode_topic_message_projection(row) {
+                    Ok(message) => messages.push(message),
+                    Err(error) => return Outcome::Err(error),
+                }
+            }
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+fn decode_message_summary_row(row: &SqlRow) -> std::result::Result<MessageSummaryRow, DbError> {
+    MessageSummaryRow::from_row(row).map_err(|error| map_sql_error(&error))
+}
+
+/// Find a cached summary whose requested window matches within a tolerance.
+pub async fn find_cached_message_summary(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    start_min: i64,
+    start_max: i64,
+    end_min: i64,
+    end_max: i64,
+) -> Outcome<Option<MessageSummaryRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT id, project_id, summary_text, start_ts, end_ts, \
+               source_message_count, source_thread_ids, llm_model, cost_usd, created_ts \
+               FROM message_summaries WHERE project_id = ? \
+               AND start_ts >= ? AND start_ts <= ? AND end_ts >= ? AND end_ts <= ? \
+               ORDER BY created_ts DESC, id DESC LIMIT 1";
+    let params = [
+        Value::BigInt(project_id),
+        Value::BigInt(start_min),
+        Value::BigInt(start_max),
+        Value::BigInt(end_min),
+        Value::BigInt(end_max),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => match rows.first() {
+            Some(row) => match decode_message_summary_row(row) {
+                Ok(summary) => Outcome::Ok(Some(summary)),
+                Err(error) => Outcome::Err(error),
+            },
+            None => Outcome::Ok(None),
+        },
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Persist one project-wide message summary.
+pub async fn create_message_summary(
+    cx: &Cx,
+    pool: &DbPool,
+    summary: &MessageSummaryRow,
+) -> Outcome<MessageSummaryRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    run_with_mvcc_retry(cx, "create_message_summary", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let params = [
+            Value::BigInt(summary.project_id),
+            Value::Text(summary.summary_text.clone()),
+            Value::BigInt(summary.start_ts),
+            Value::BigInt(summary.end_ts),
+            Value::BigInt(summary.source_message_count),
+            Value::Text(summary.source_thread_ids.clone()),
+            summary.llm_model.clone().map_or(Value::Null, Value::Text),
+            summary.cost_usd.map_or(Value::Null, Value::Double),
+            Value::BigInt(summary.created_ts),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT INTO message_summaries \
+                     (project_id, summary_text, start_ts, end_ts, source_message_count, \
+                      source_thread_ids, llm_model, cost_usd, created_ts) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &params,
+                )
+                .await
+            )
+        );
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, summary_text, start_ts, end_ts, \
+                     source_message_count, source_thread_ids, llm_model, cost_usd, created_ts \
+                     FROM message_summaries WHERE id = last_insert_rowid() LIMIT 1",
+                    &[],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "message summary insert succeeded but row was not visible".to_string(),
+            ));
+        };
+        let inserted = match decode_message_summary_row(row) {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(inserted)
+    })
+    .await
+}
+
+/// List stored summaries whose end timestamp is inside a recent window.
+pub async fn list_message_summaries(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_end_ts: i64,
+    limit: usize,
+) -> Outcome<Vec<MessageSummaryRow>, DbError> {
+    let limit = match i64::try_from(limit) {
+        Ok(value) => value,
+        Err(_) => return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX")),
+    };
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT id, project_id, summary_text, start_ts, end_ts, \
+               source_message_count, source_thread_ids, llm_model, cost_usd, created_ts \
+               FROM message_summaries WHERE project_id = ? AND end_ts >= ? \
+               ORDER BY created_ts DESC, id DESC LIMIT ?";
+    let params = [
+        Value::BigInt(project_id),
+        Value::BigInt(min_end_ts),
+        Value::BigInt(limit),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut summaries = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match decode_message_summary_row(row) {
+                    Ok(summary) => summaries.push(summary),
+                    Err(error) => return Outcome::Err(error),
+                }
+            }
+            Outcome::Ok(summaries)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Recipient details for a single message.
@@ -6482,6 +6990,7 @@ pub async fn create_message(
             sender_id,
             thread_id: thread_id.map(String::from),
             topic: None,
+            reply_to: None,
             subject: subject.to_string(),
             body_md: body_md.to_string(),
             importance: importance.to_string(),
@@ -6666,6 +7175,7 @@ pub async fn create_message_with_recipients_with_topic(
         ack_required,
         attachments,
         topic,
+        None,
         recipients,
         None,
     )
@@ -6677,6 +7187,55 @@ pub async fn create_message_with_recipients_with_topic(
         // Unreachable without a key: no claim means no prior record to conflict with.
         Outcome::Ok(IdempotentOutcome::Conflict(_)) => Outcome::Err(DbError::Internal(
             "create_message_with_recipients: unexpected idempotency conflict without a key"
+                .to_string(),
+        )),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Create a reply and recipients atomically while persisting the explicit
+/// parent message edge used by the Python contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_reply_with_recipients_with_topic(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    topic: Option<&str>,
+    reply_to: i64,
+    recipients: &[(i64, &str)],
+) -> Outcome<MessageRow, DbError> {
+    match create_message_with_recipients_impl(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        topic,
+        Some(reply_to),
+        recipients,
+        None,
+    )
+    .await
+    {
+        Outcome::Ok(IdempotentOutcome::Fresh(row) | IdempotentOutcome::Replayed(row)) => {
+            Outcome::Ok(row)
+        }
+        Outcome::Ok(IdempotentOutcome::Conflict(_)) => Outcome::Err(DbError::Internal(
+            "create_reply_with_recipients: unexpected idempotency conflict without a key"
                 .to_string(),
         )),
         Outcome::Err(e) => Outcome::Err(e),
@@ -6759,6 +7318,44 @@ pub async fn create_message_with_recipients_with_topic_idempotent(
         ack_required,
         attachments,
         topic,
+        None,
+        recipients,
+        Some(claim),
+    )
+    .await
+}
+
+/// Idempotent reply variant that persists the explicit parent message edge.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_reply_with_recipients_with_topic_idempotent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    topic: Option<&str>,
+    reply_to: i64,
+    recipients: &[(i64, &str)],
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    create_message_with_recipients_impl(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        topic,
+        Some(reply_to),
         recipients,
         Some(claim),
     )
@@ -6778,6 +7375,7 @@ async fn create_message_with_recipients_impl(
     ack_required: bool,
     attachments: &str,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     recipients: &[(i64, &str)], // (agent_id, kind)
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
@@ -6875,6 +7473,7 @@ async fn create_message_with_recipients_impl(
                     ack_required,
                     attachments,
                     topic,
+                    reply_to,
                     recipients,
                     now,
                     message_id,
@@ -7120,6 +7719,7 @@ async fn create_message_with_recipients_tx(
     ack_required: bool,
     attachments: &str,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     recipients: &[(i64, &str)],
     now: i64,
     message_id: i64,
@@ -7223,14 +7823,15 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-        (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        (id, project_id, sender_id, thread_id, topic, reply_to, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
         thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
         topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string())),
+        reply_to.map_or(Value::Null, Value::BigInt),
         Value::Text(subject.to_string()),
         Value::Text(body_md.to_string()),
         Value::Text(importance.to_string()),
@@ -7252,6 +7853,7 @@ async fn create_message_with_recipients_tx(
         sender_id,
         thread_id: thread_id.map(String::from),
         topic: topic.map(String::from),
+        reply_to,
         subject: subject.to_string(),
         body_md: body_md.to_string(),
         importance: importance.to_string(),
@@ -7528,7 +8130,7 @@ pub async fn get_messages_details_by_ids(
             ""
         };
         let sql = format!(
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.reply_to, m.topic, m.subject, m.body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                     m.attachments, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name \
              FROM messages m \
@@ -7573,35 +8175,43 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let subject: String = match row.get_as(4) {
+                    let reply_to: Option<i64> = match row.get_as(4) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let body_md: String = match row.get_as(5) {
+                    let topic: Option<String> = match row.get_as(5) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let importance: String = match row.get_as(6) {
+                    let subject: String = match row.get_as(6) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let ack_required: i64 = match get_i64(7) {
+                    let body_md: String = match row.get_as(7) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let importance: String = match row.get_as(8) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let ack_required: i64 = match get_i64(9) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(e),
                     };
-                    let created_ts: i64 = match get_i64(8) {
+                    let created_ts: i64 = match get_i64(10) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(e),
                     };
-                    let recipients: String = match row.get_as::<Option<String>>(9) {
+                    let recipients: String = match row.get_as::<Option<String>>(11) {
                         Ok(v) => v.unwrap_or_else(|| "{}".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let attachments: String = match row.get_as::<Option<String>>(10) {
+                    let attachments: String = match row.get_as::<Option<String>>(12) {
                         Ok(v) => v.unwrap_or_else(|| "[]".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_as::<Option<String>>(11) {
+                    let from: String = match row.get_as::<Option<String>>(13) {
                         Ok(v) => v.unwrap_or_default(),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
@@ -7610,6 +8220,8 @@ pub async fn get_messages_details_by_ids(
                         project_id,
                         sender_id,
                         thread_id,
+                        reply_to,
+                        topic,
                         subject,
                         body_md,
                         importance,
@@ -7671,7 +8283,8 @@ pub async fn list_thread_messages(
             (
                 format!(
                     "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.thread_id AS thread_id, m.reply_to AS reply_to, m.topic AS topic, \
+                            m.subject AS subject, m.body_md AS body_md, \
                             m.importance AS importance, m.ack_required AS ack_required, \
                             m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                             m.attachments AS attachments, \
@@ -7688,7 +8301,8 @@ pub async fn list_thread_messages(
         (true, None) => (
             format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.thread_id AS thread_id, m.reply_to AS reply_to, m.topic AS topic, \
+                        m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
@@ -7708,7 +8322,8 @@ pub async fn list_thread_messages(
             (
                 format!(
                     "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.thread_id AS thread_id, m.reply_to AS reply_to, m.topic AS topic, \
+                            m.subject AS subject, m.body_md AS body_md, \
                             m.importance AS importance, m.ack_required AS ack_required, \
                             m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                             m.attachments AS attachments, \
@@ -7725,7 +8340,8 @@ pub async fn list_thread_messages(
         (false, None) => (
             format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.thread_id AS thread_id, m.reply_to AS reply_to, m.topic AS topic, \
+                        m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
@@ -7760,35 +8376,43 @@ pub async fn list_thread_messages(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(4) {
+                let reply_to: Option<i64> = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(5) {
+                let topic: Option<String> = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(6) {
+                let subject: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(7) {
+                let body_md: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(8) {
+                let importance: String = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients: String = match row.get_as(9) {
+                let ack_required: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(10) {
+                let created_ts: i64 = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_as(11) {
+                let recipients: String = match row.get_as(11) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let attachments: String = match row.get_as(12) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let from: String = match row.get_as(13) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -7797,6 +8421,8 @@ pub async fn list_thread_messages(
                     project_id,
                     sender_id,
                     thread_id,
+                    reply_to,
+                    topic,
                     subject,
                     body_md,
                     importance,
@@ -8114,7 +8740,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+    let sql = "SELECT id, project_id, sender_id, thread_id, topic, reply_to, subject, body_md, importance, \
                        ack_required, created_ts, recipients_json, attachments \
                 FROM messages \
                 WHERE id = ? \
@@ -8144,6 +8770,10 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
             let topic: Option<String> = match row.get_named("topic") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let reply_to: Option<i64> = match row.get_named("reply_to") {
                 Ok(v) => v,
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
@@ -8182,6 +8812,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 sender_id,
                 thread_id,
                 topic,
+                reply_to,
                 subject,
                 body_md,
                 importance,
@@ -8693,17 +9324,18 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
     let sender_id: i64 = row.get_as(2).map_err(|e| map_sql_error(&e))?;
     let thread_id: Option<String> = row.get_as(3).map_err(|e| map_sql_error(&e))?;
     let topic: Option<String> = row.get_as(4).map_err(|e| map_sql_error(&e))?;
-    let subject: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
-    let body_md: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
-    let importance: String = row.get_as(7).map_err(|e| map_sql_error(&e))?;
-    let ack_required: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
-    let created_ts: i64 = row.get_as(9).map_err(|e| map_sql_error(&e))?;
-    let recipients_json: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
-    let attachments: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
-    let kind: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
-    let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
-    let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
-    let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
+    let reply_to: Option<i64> = row.get_as(5).map_err(|e| map_sql_error(&e))?;
+    let subject: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
+    let body_md: String = row.get_as(7).map_err(|e| map_sql_error(&e))?;
+    let importance: String = row.get_as(8).map_err(|e| map_sql_error(&e))?;
+    let ack_required: i64 = row.get_as(9).map_err(|e| map_sql_error(&e))?;
+    let created_ts: i64 = row.get_as(10).map_err(|e| map_sql_error(&e))?;
+    let recipients_json: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
+    let attachments: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
+    let kind: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
+    let sender_name: String = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+    let read_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
+    let ack_ts: Option<i64> = row.get_as(16).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
         message: MessageRow {
@@ -8712,6 +9344,7 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
             sender_id,
             thread_id,
             topic,
+            reply_to,
             subject,
             body_md,
             importance,
@@ -8807,7 +9440,7 @@ async fn fetch_inbox_for_product_agent_impl(
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.reply_to, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
          FROM product_project_links ppl \
@@ -9477,7 +10110,7 @@ pub async fn fetch_inbox_global(
     let tracked = tracked(&*conn);
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.reply_to, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                 m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, \
@@ -9515,17 +10148,18 @@ pub async fn fetch_inbox_global(
                 let sender_id: i64 = row.get_as(2).unwrap_or(0);
                 let thread_id: Option<String> = row.get_as(3).unwrap_or(None);
                 let topic: Option<String> = row.get_as(4).unwrap_or(None);
-                let subject: String = row.get_as(5).unwrap_or_default();
-                let body_md: String = row.get_as(6).unwrap_or_default();
-                let importance: String = row.get_as(7).unwrap_or_default();
-                let ack_required: i64 = row.get_as(8).unwrap_or(0);
-                let created_ts: i64 = row.get_as(9).unwrap_or(0);
-                let recipients_json: String = row.get_as(10).unwrap_or_default();
-                let attachments: String = row.get_as(11).unwrap_or_default();
-                let kind: String = row.get_as(12).unwrap_or_default();
-                let sender_name: String = row.get_as(13).unwrap_or_default();
-                let ack_ts: Option<i64> = row.get_as(14).unwrap_or(None);
-                let project_slug: String = row.get_as(15).unwrap_or_default();
+                let reply_to: Option<i64> = row.get_as(5).unwrap_or(None);
+                let subject: String = row.get_as(6).unwrap_or_default();
+                let body_md: String = row.get_as(7).unwrap_or_default();
+                let importance: String = row.get_as(8).unwrap_or_default();
+                let ack_required: i64 = row.get_as(9).unwrap_or(0);
+                let created_ts: i64 = row.get_as(10).unwrap_or(0);
+                let recipients_json: String = row.get_as(11).unwrap_or_default();
+                let attachments: String = row.get_as(12).unwrap_or_default();
+                let kind: String = row.get_as(13).unwrap_or_default();
+                let sender_name: String = row.get_as(14).unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_as(15).unwrap_or(None);
+                let project_slug: String = row.get_as(16).unwrap_or_default();
 
                 out.push(GlobalInboxRow {
                     message: MessageRow {
@@ -9534,6 +10168,7 @@ pub async fn fetch_inbox_global(
                         sender_id,
                         thread_id,
                         topic,
+                        reply_to,
                         subject,
                         body_md,
                         importance,
@@ -14104,7 +14739,7 @@ pub async fn fetch_unacked_for_agent(
     };
 
     let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.reply_to, m.subject, m.body_md, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
                   r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
@@ -14147,43 +14782,47 @@ pub async fn fetch_unacked_for_agent(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(5) {
+                let reply_to: Option<i64> = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(6) {
+                let subject: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(7) {
+                let body_md: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(8) {
+                let importance: String = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(9) {
+                let ack_required: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients_json: String = match row.get_as(10) {
+                let created_ts: i64 = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(11) {
+                let recipients_json: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(12) {
+                let attachments: String = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(13) {
+                let kind: String = match row.get_as(13) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(14) {
+                let sender_name: String = match row.get_as(14) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let read_ts: Option<i64> = match row.get_as(15) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -14195,6 +14834,7 @@ pub async fn fetch_unacked_for_agent(
                         sender_id,
                         thread_id,
                         topic,
+                        reply_to,
                         subject,
                         body_md,
                         importance,
@@ -20524,6 +21164,454 @@ mod tests {
     }
 
     #[test]
+    fn list_active_window_identities_excludes_expired_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("window_identity_activity.db");
+
+        rt.block_on(async {
+            let now = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-window-{now}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let insert_sql = "INSERT INTO window_identities \
+                (project_id, window_uuid, display_name, created_ts, last_active_ts, expires_ts) \
+                VALUES (?, ?, ?, ?, ?, ?)";
+            for (uuid, name, expires_ts) in [
+                ("window-active", "BlueLake", Value::Null),
+                (
+                    "window-future",
+                    "GreenStone",
+                    Value::BigInt(now.saturating_add(60_000_000)),
+                ),
+                (
+                    "window-expired",
+                    "RedHarbor",
+                    Value::BigInt(now.saturating_sub(1)),
+                ),
+            ] {
+                conn.execute_sync(
+                    insert_sql,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::Text(uuid.to_string()),
+                        Value::Text(name.to_string()),
+                        Value::BigInt(now.saturating_sub(86_400_000_000)),
+                        Value::BigInt(now),
+                        expires_ts,
+                    ],
+                )
+                .expect("insert window identity");
+            }
+            drop(conn);
+
+            let identities = list_active_window_identities(&cx, &pool, project_id, now)
+                .await
+                .into_result()
+                .expect("list active window identities");
+            let names: Vec<_> = identities
+                .iter()
+                .map(|identity| identity.display_name.as_str())
+                .collect();
+            assert_eq!(names, vec!["BlueLake", "GreenStone"]);
+        });
+    }
+
+    #[test]
+    fn sweep_stale_agents_excludes_caller_and_active_reservation_holder() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("sweep_stale_agents.db");
+
+        rt.block_on(async {
+            let now = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-sweep-{now}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let actor = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("actor"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register actor");
+            let protected = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("protected"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register protected agent");
+            let stale = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "codex-cli",
+                "gpt-5",
+                Some("stale"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register stale agent");
+            let actor_id = actor.id.expect("actor id");
+            let protected_id = protected.id.expect("protected id");
+            let stale_id = stale.id.expect("stale id");
+            let old = now.saturating_sub(7_200_000_000);
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_sync(
+                "UPDATE agents SET last_active_ts = ? WHERE id IN (?, ?, ?)",
+                &[
+                    Value::BigInt(old),
+                    Value::BigInt(actor_id),
+                    Value::BigInt(protected_id),
+                    Value::BigInt(stale_id),
+                ],
+            )
+            .expect("age agents");
+            drop(conn);
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                protected_id,
+                &["src/protected.rs"],
+                3_600,
+                true,
+                "protect active holder",
+            )
+            .await
+            .into_result()
+            .expect("create active reservation");
+
+            let released_reservations = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                stale_id,
+                &["src/released.rs"],
+                3_600,
+                true,
+                "released reservations must not protect stale holders",
+            )
+            .await
+            .into_result()
+            .expect("create reservation to release");
+            let released_id = released_reservations[0].id.expect("reservation id");
+            assert_eq!(
+                release_reservations_by_ids(&cx, &pool, &[released_id])
+                    .await
+                    .into_result()
+                    .expect("release reservation"),
+                1
+            );
+
+            let swept = sweep_stale_agents(
+                &cx,
+                &pool,
+                project_id,
+                actor_id,
+                now.saturating_sub(3_600_000_000),
+                now,
+                true,
+            )
+            .await
+            .into_result()
+            .expect("sweep stale agents");
+            assert_eq!(
+                swept
+                    .iter()
+                    .map(|agent| agent.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["RedHarbor"]
+            );
+
+            let actor = get_agent(&cx, &pool, project_id, "BlueLake")
+                .await
+                .into_result()
+                .expect("reload actor");
+            let protected = get_agent(&cx, &pool, project_id, "GreenStone")
+                .await
+                .into_result()
+                .expect("reload protected agent");
+            let stale = get_agent(&cx, &pool, project_id, "RedHarbor")
+                .await
+                .into_result()
+                .expect("reload stale agent");
+            assert_eq!(actor.retired_at, None);
+            assert_eq!(protected.retired_at, None);
+            assert_eq!(stale.retired_at, Some(now));
+        });
+    }
+
+    #[test]
+    fn list_topic_messages_is_case_insensitive_non_consuming_and_preserves_reply_metadata() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("topic_message_parity.db");
+
+        rt.block_on(async {
+            let now = now_micros();
+            let target_project = ensure_project(&cx, &pool, &format!("/tmp/am-topic-target-{now}"))
+                .await
+                .into_result()
+                .expect("ensure target project");
+            let sender_project = ensure_project(&cx, &pool, &format!("/tmp/am-topic-source-{now}"))
+                .await
+                .into_result()
+                .expect("ensure sender project");
+            let target_project_id = target_project.id.expect("target project id");
+            let sender_project_id = sender_project.id.expect("sender project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                sender_project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let viewer = register_agent(
+                &cx,
+                &pool,
+                target_project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("viewer"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register viewer");
+            let sender_id = sender.id.expect("sender id");
+            let viewer_id = viewer.id.expect("viewer id");
+
+            let parent = create_message_with_recipients_with_topic(
+                &cx,
+                &pool,
+                target_project_id,
+                sender_id,
+                "parent",
+                "parent body",
+                Some("topic-thread"),
+                "normal",
+                false,
+                "[]",
+                Some("Ops"),
+                &[(viewer_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create parent topic message");
+            let parent_id = parent.id.expect("parent id");
+            mark_message_read(&cx, &pool, viewer_id, parent_id)
+                .await
+                .into_result()
+                .expect("mark parent read");
+
+            let reply = create_reply_with_recipients_with_topic(
+                &cx,
+                &pool,
+                target_project_id,
+                sender_id,
+                "reply",
+                "reply body",
+                Some("topic-thread"),
+                "normal",
+                false,
+                "[]",
+                Some("ops"),
+                parent_id,
+                &[(viewer_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create topic reply");
+            let reply_id = reply.id.expect("reply id");
+
+            let inbox = fetch_inbox(&cx, &pool, target_project_id, viewer_id, false, None, 50)
+                .await
+                .into_result()
+                .expect("fetch recipient inbox");
+            let inbox_reply = inbox
+                .iter()
+                .find(|row| row.message.id == Some(reply_id))
+                .expect("reply should be present in recipient inbox");
+            assert_eq!(inbox_reply.message.reply_to, Some(parent_id));
+            assert_eq!(inbox_reply.message.topic.as_deref(), Some("ops"));
+
+            let all =
+                list_topic_messages(&cx, &pool, target_project_id, "oPs", None, None, false, 50)
+                    .await
+                    .into_result()
+                    .expect("list all topic messages");
+            assert_eq!(
+                all.iter().map(|message| message.id).collect::<Vec<_>>(),
+                vec![reply_id, parent_id]
+            );
+            assert_eq!(all[0].reply_to, Some(parent_id));
+            assert_eq!(all[0].from, "BlueLake");
+            assert_eq!(all[0].sender_project_id, Some(sender_project_id));
+            assert_eq!(
+                all[0].sender_project_human_key.as_deref(),
+                Some(sender_project.human_key.as_str())
+            );
+            assert_eq!(
+                all[0].sender_project_slug.as_deref(),
+                Some(sender_project.slug.as_str())
+            );
+
+            for _ in 0..2 {
+                let unread = list_topic_messages(
+                    &cx,
+                    &pool,
+                    target_project_id,
+                    "OPS",
+                    None,
+                    Some(viewer_id),
+                    true,
+                    50,
+                )
+                .await
+                .into_result()
+                .expect("list unread topic messages");
+                assert_eq!(
+                    unread.iter().map(|message| message.id).collect::<Vec<_>>(),
+                    vec![reply_id]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn message_summary_queries_roundtrip_cache_and_newest_first_ordering() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message_summary_queries.db");
+
+        rt.block_on(async {
+            let now = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-summary-{now}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let first = MessageSummaryRow {
+                id: None,
+                project_id,
+                summary_text: "first summary".to_string(),
+                start_ts: now.saturating_sub(7_200_000_000),
+                end_ts: now.saturating_sub(3_600_000_000),
+                source_message_count: 2,
+                source_thread_ids: "[\"thread-a\"]".to_string(),
+                llm_model: None,
+                cost_usd: None,
+                created_ts: now.saturating_sub(2_000_000),
+            };
+            let second = MessageSummaryRow {
+                id: None,
+                project_id,
+                summary_text: "second summary".to_string(),
+                start_ts: now.saturating_sub(3_600_000_000),
+                end_ts: now,
+                source_message_count: 4,
+                source_thread_ids: "[\"thread-b\",\"thread-c\"]".to_string(),
+                llm_model: Some("test-model".to_string()),
+                cost_usd: Some(0.25),
+                created_ts: now.saturating_sub(1_000_000),
+            };
+
+            let first = create_message_summary(&cx, &pool, &first)
+                .await
+                .into_result()
+                .expect("create first summary");
+            let second = create_message_summary(&cx, &pool, &second)
+                .await
+                .into_result()
+                .expect("create second summary");
+            assert!(first.id.is_some());
+            assert!(second.id.is_some());
+            assert_eq!(second.cost_usd, Some(0.25));
+
+            let cached = find_cached_message_summary(
+                &cx,
+                &pool,
+                project_id,
+                first.start_ts.saturating_sub(1),
+                first.start_ts.saturating_add(1),
+                first.end_ts.saturating_sub(1),
+                first.end_ts.saturating_add(1),
+            )
+            .await
+            .into_result()
+            .expect("find cached summary")
+            .expect("cached summary exists");
+            assert_eq!(cached.id, first.id);
+
+            let summaries = list_message_summaries(&cx, &pool, project_id, 0, 10)
+                .await
+                .into_result()
+                .expect("list summaries");
+            assert_eq!(
+                summaries
+                    .iter()
+                    .map(|summary| summary.summary_text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["second summary", "first summary"]
+            );
+        });
+    }
+
+    #[test]
     fn list_thread_messages_limit_returns_latest_window_in_order() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -20598,6 +21686,83 @@ mod tests {
                 .expect("list thread messages");
 
             assert_eq!(rows.len(), 2, "should return the requested window size");
+            assert_eq!(rows[0].subject, "msg-3");
+            assert_eq!(rows[1].subject, "msg-4");
+        });
+    }
+
+    #[test]
+    fn list_recent_project_messages_limit_returns_latest_window_in_order() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_limit_latest_window.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-limit-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let sender_id = sender.id.expect("sender id");
+            let recipient_id = recipient.id.expect("recipient id");
+            let recipients = [(recipient_id, "to")];
+
+            for idx in 1..=4 {
+                create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &format!("msg-{idx}"),
+                    "body",
+                    Some("RECENT-LIMIT"),
+                    "normal",
+                    false,
+                    "[]",
+                    &recipients,
+                )
+                .await
+                .into_result()
+                .expect("create message");
+            }
+
+            let rows = list_recent_project_messages(&cx, &pool, project_id, 0, 2)
+                .await
+                .into_result()
+                .expect("list recent project messages");
+            assert_eq!(rows.len(), 2, "should return requested window size");
             assert_eq!(rows[0].subject, "msg-3");
             assert_eq!(rows[1].subject, "msg-4");
         });
@@ -26506,6 +27671,7 @@ mod tests {
                 sender_id: 100,
                 thread_id: Some("t1".to_string()),
                 topic: None,
+                reply_to: None,
                 subject: "Test".to_string(),
                 body_md: "Body".to_string(),
                 importance: "normal".to_string(),
