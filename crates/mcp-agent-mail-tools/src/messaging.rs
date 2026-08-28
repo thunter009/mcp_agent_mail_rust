@@ -3861,7 +3861,7 @@ pub async fn fetch_topic(
                 "ack_required": row.ack_required != 0,
                 "created_ts": micros_to_iso(row.created_ts),
                 "attachments": parse_attachment_metadata_json(&row.attachments),
-                "from": row.from.clone(),
+                "from": row.from,
             });
             if row.sender_project_id.is_some_and(|id| id != row.project_id) {
                 if let Some(human_key) = row.sender_project_human_key {
