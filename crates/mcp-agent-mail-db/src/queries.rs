@@ -6020,11 +6020,12 @@ pub async fn sweep_stale_agents(
         ];
         if require_no_active_reservations {
             let active_predicate = active_reservation_predicate_for("fr");
-            sql.push_str(&format!(
+            sql.push_str(
                 " AND NOT EXISTS (SELECT 1 FROM file_reservations fr \
-                  WHERE fr.agent_id = a.id AND ({active_predicate}) \
-                  AND fr.expires_ts > ?)"
-            ));
+                 WHERE fr.agent_id = a.id AND (",
+            );
+            sql.push_str(&active_predicate);
+            sql.push_str(") AND fr.expires_ts > ?)");
             params.push(Value::BigInt(retired_at));
         }
         sql.push_str(" ORDER BY a.id ASC");
