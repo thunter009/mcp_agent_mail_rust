@@ -8376,7 +8376,10 @@ fn stage_sqlite_family_for_health_probe_once(
     let staged_path = directory.path().join("health-probe.sqlite3");
     copy_file_without_overwrite(source, &staged_path)?;
 
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .into_iter()
+        .chain(std::iter::once(FSQLITE_MIGRATION_STATE_SUFFIX))
+    {
         let source_sidecar = sqlite_sidecar_path(source, suffix);
         match std::fs::symlink_metadata(&source_sidecar) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -8496,13 +8499,19 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_read_path_is_healthy_direct(path: &Path) -> Result<bool, SqlError> {
-    sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, true)
+    sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, true, true)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_primary_read_surface_is_healthy_direct(path: &Path) -> Result<bool, SqlError> {
+    sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, true, false)
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
     path: &Path,
     allow_family_cleanup: bool,
+    require_incremental_check: bool,
 ) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(false);
@@ -8584,22 +8593,24 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
         }
     }
 
-    match sqlite_primary_check_is_ok_with_canonical_fallback(
-        path,
-        &conn,
-        integrity::CheckKind::Incremental,
-    ) {
-        Ok(false) => return Ok(false),
-        Ok(true) => {}
-        Err(e) => {
-            let msg = e.to_string();
-            if is_corruption_error_message(&msg)
-                || is_sqlite_snapshot_conflict_error_message(&msg)
-                || is_sqlite_recovery_error_message(&msg)
-            {
-                return Ok(false);
+    if require_incremental_check {
+        match sqlite_primary_check_is_ok_with_canonical_fallback(
+            path,
+            &conn,
+            integrity::CheckKind::Incremental,
+        ) {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if is_corruption_error_message(&msg)
+                    || is_sqlite_snapshot_conflict_error_message(&msg)
+                    || is_sqlite_recovery_error_message(&msg)
+                {
+                    return Ok(false);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     }
 
@@ -8636,12 +8647,24 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     sqlite_primary_read_path_is_healthy_direct(&staged.path)
 }
 
+/// Prove the production FrankenSQLite read surface.
+///
+/// The probe omits the secondary incremental diagnostic while remaining
+/// source-byte neutral on a private copy of the complete SQLite family.
+#[allow(clippy::result_large_err)]
+pub fn sqlite_primary_read_surface_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    sqlite_primary_read_surface_is_healthy_direct(&staged.path)
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy_staged(
     path: &Path,
     allow_family_cleanup: bool,
 ) -> Result<bool, SqlError> {
-    if !sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, allow_family_cleanup)? {
+    if !sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, allow_family_cleanup, true)? {
         return Ok(false);
     }
     normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
@@ -10266,6 +10289,12 @@ fn quarantined_sidecar_path(
 // post-checkpoint quarantine, and promotion's corrupt-sidecar quarantine.
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 5] =
     ["-journal", "-wal", "-shm", "-wal-cert", "-wal-cert-head"];
+
+/// FrankenSQLite migration ledger paired with the primary database file.
+/// Health probes must stage it with the SQLite family; otherwise the private
+/// copy reruns compatibility repairs and no longer represents the live primary
+/// read path.
+const FSQLITE_MIGRATION_STATE_SUFFIX: &str = ".fsqlite-migration-state";
 // Legacy builds could leave FrankenSQLite namespace coordination files beside
 // a disposable candidate. They must block reuse of that pathname, but must
 // never be unlinked here: namespace records are persistent by design and only
@@ -21481,6 +21510,33 @@ mod tests {
         assert!(state.wal_exists);
         assert_eq!(state.wal_bytes, None);
         assert!(state.live_sidecars);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn staged_health_probe_copies_fsqlite_migration_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("migration_state.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let migration_state = sqlite_sidecar_path(&path, FSQLITE_MIGRATION_STATE_SUFFIX);
+        std::fs::write(&migration_state, b"migration-state-witness")
+            .expect("write migration state");
+
+        let staged = stage_sqlite_family_for_health_probe(&path)
+            .expect("stage health probe family")
+            .expect("source exists");
+        let staged_migration_state =
+            sqlite_sidecar_path(staged.path(), FSQLITE_MIGRATION_STATE_SUFFIX);
+
+        assert_eq!(
+            std::fs::read(staged_migration_state).expect("read staged migration state"),
+            b"migration-state-witness"
+        );
     }
 
     #[test]

@@ -315,6 +315,7 @@ pub use pool::{
     recovery_admission,
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
+    sqlite_primary_read_surface_is_healthy,
     sqlite_recovery_candidate_is_standalone,
     sqlite_recovery_candidate_passes_full_integrity_check,
 };

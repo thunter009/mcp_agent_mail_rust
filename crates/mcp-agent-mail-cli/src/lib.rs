@@ -12862,6 +12862,62 @@ fn sqlite_doctor_file_sanity_read_only(db_path: &str) -> CliResult<(bool, String
     sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy_read_only)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteDoctorFileSanityClassification {
+    status: &'static str,
+    failed: bool,
+    degraded: bool,
+    compatibility_only_failure: bool,
+}
+
+fn sqlite_doctor_primary_read_path_is_healthy(db_path: &str) -> bool {
+    let resolved_path = resolve_sqlite_runtime_path(db_path);
+    mcp_agent_mail_db::sqlite_primary_read_surface_is_healthy(Path::new(&resolved_path))
+        .unwrap_or(false)
+}
+
+fn classify_sqlite_doctor_file_sanity(
+    full_probe_healthy: bool,
+    primary_probe_healthy: bool,
+    used_absolute_fallback: bool,
+) -> SqliteDoctorFileSanityClassification {
+    if full_probe_healthy {
+        SqliteDoctorFileSanityClassification {
+            status: if used_absolute_fallback { "warn" } else { "ok" },
+            failed: false,
+            degraded: used_absolute_fallback,
+            compatibility_only_failure: false,
+        }
+    } else if primary_probe_healthy {
+        SqliteDoctorFileSanityClassification {
+            status: "warn",
+            failed: false,
+            degraded: true,
+            compatibility_only_failure: true,
+        }
+    } else {
+        SqliteDoctorFileSanityClassification {
+            status: "fail",
+            failed: true,
+            degraded: false,
+            compatibility_only_failure: false,
+        }
+    }
+}
+
+fn sqlite_doctor_file_sanity_detail(
+    detail: String,
+    classification: SqliteDoctorFileSanityClassification,
+) -> String {
+    if classification.compatibility_only_failure {
+        "Primary SQLite read path passed; staged compatibility reopen probe failed. \
+         Production reads remain healthy; treating the compatibility result as a diagnostic warning."
+            .to_string()
+    } else {
+        detail
+    }
+}
+
 fn os_string_with_suffix(value: &OsStr, suffix: &str) -> OsString {
     let mut suffixed = value.to_os_string();
     suffixed.push(suffix);
@@ -30705,6 +30761,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     };
 
     match file_sanity {
+        Ok((false, _, _, _)) if sqlite_doctor_primary_read_path_is_healthy(&resolved_path) => {}
         Ok((false, detail, _, _)) => {
             let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -31979,17 +32036,19 @@ fn handle_doctor_check_with_target(
                                 used_absolute_fallback,
                                 _fallback_due_to_missing_configured_path,
                             )) => {
-                                if !qc_ok {
-                                    db_file_sanity_failed = true;
-                                }
-                                let status = if qc_ok {
-                                    if used_absolute_fallback { "warn" } else { "ok" }
-                                } else {
-                                    "fail"
-                                };
+                                let primary_healthy =
+                                    qc_ok || sqlite_doctor_primary_read_path_is_healthy(&db_path);
+                                let classification = classify_sqlite_doctor_file_sanity(
+                                    qc_ok,
+                                    primary_healthy,
+                                    used_absolute_fallback,
+                                );
+                                db_file_sanity_failed = classification.failed;
+                                let detail =
+                                    sqlite_doctor_file_sanity_detail(detail, classification);
                                 checks.push(serde_json::json!({
                                     "check": "db_file_sanity",
-                                    "status": status,
+                                    "status": classification.status,
                                     "detail": detail,
                                 }));
                             }
@@ -69441,6 +69500,32 @@ startup_timeout_sec = 42
             !verdict,
             "canonical malformed probe must not be treated as healthy"
         );
+    }
+
+    #[test]
+    fn doctor_file_sanity_classifies_compatibility_only_failure_as_warning() {
+        let classification = classify_sqlite_doctor_file_sanity(false, true, false);
+        let detail = sqlite_doctor_file_sanity_detail(
+            "Health probes failed (possible corruption)".to_string(),
+            classification,
+        );
+
+        assert_eq!(classification.status, "warn");
+        assert!(!classification.failed);
+        assert!(classification.degraded);
+        assert!(classification.compatibility_only_failure);
+        assert!(detail.contains("Production reads remain healthy"));
+        assert!(!detail.contains("possible corruption"));
+    }
+
+    #[test]
+    fn doctor_file_sanity_keeps_primary_failure_fatal() {
+        let classification = classify_sqlite_doctor_file_sanity(false, false, false);
+
+        assert_eq!(classification.status, "fail");
+        assert!(classification.failed);
+        assert!(!classification.degraded);
+        assert!(!classification.compatibility_only_failure);
     }
 
     #[test]

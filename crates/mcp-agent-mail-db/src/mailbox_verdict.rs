@@ -33,7 +33,7 @@ use crate::pool::{
     MailboxSidecarState, inspect_mailbox_db_inventory, inspect_mailbox_ownership,
     inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
     sqlite_compatibility_read_path_is_healthy, sqlite_path_with_suffix,
-    sqlite_primary_read_path_is_healthy,
+    sqlite_primary_read_surface_is_healthy,
 };
 use crate::reconstruct::{archive_missing_project_identities, scan_archive_message_inventory};
 use serde::{Deserialize, Serialize};
@@ -699,7 +699,7 @@ pub fn verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
         .filter(|probe| !probe.passed)
         .all(|probe| probe.name == "db_sanity");
     !(only_db_sanity_failures
-        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false))
+        && crate::pool::sqlite_primary_read_surface_is_healthy(sqlite_path).unwrap_or(false))
 }
 
 /// Compute the state from probe results.
@@ -1013,7 +1013,7 @@ fn probe_db_file_sanity(db_path: &Path) -> ProbeResult {
     }
 
     let start = std::time::Instant::now();
-    match sqlite_primary_read_path_is_healthy(db_path) {
+    match sqlite_primary_read_surface_is_healthy(db_path) {
         Ok(true) => {}
         Ok(false) => {
             return ProbeResult::error("db_sanity", "Primary SQLite read-path health probe failed")
@@ -1029,21 +1029,28 @@ fn probe_db_file_sanity(db_path: &Path) -> ProbeResult {
     }
 
     match sqlite_compatibility_read_path_is_healthy(db_path) {
-        Ok(true) => ProbeResult::ok(
-            "db_sanity",
-            "Primary SQLite read path and compatibility reopen probe passed",
-        )
-        .with_duration(probe_duration_micros(start)),
-        Ok(false) => ProbeResult::error(
-            "db_sanity",
-            "Primary SQLite read path passed, but the compatibility reopen probe failed",
-        )
-        .with_duration(probe_duration_micros(start)),
+        Ok(compatibility_healthy) => classify_db_compatibility_probe(compatibility_healthy)
+            .with_duration(probe_duration_micros(start)),
         Err(e) => ProbeResult::error(
             "db_sanity",
             format!("Cannot run SQLite compatibility reopen probe: {e}"),
         )
         .with_duration(probe_duration_micros(start)),
+    }
+}
+
+fn classify_db_compatibility_probe(compatibility_healthy: bool) -> ProbeResult {
+    if compatibility_healthy {
+        ProbeResult::ok(
+            "db_sanity",
+            "Primary SQLite read path and compatibility reopen probe passed",
+        )
+    } else {
+        ProbeResult::warn_state(
+            "db_sanity",
+            "Primary SQLite read path passed, but the compatibility reopen probe failed",
+            MailboxState::Healthy,
+        )
     }
 }
 
@@ -2560,6 +2567,16 @@ mod tests {
         let probe = probe_db_file_sanity(Path::new(":memory:"));
         assert!(probe.passed);
         assert!(probe.detail.contains("In-memory"));
+    }
+
+    #[test]
+    fn compatibility_only_probe_failure_is_diagnostic_warning() {
+        let probe = classify_db_compatibility_probe(false);
+
+        assert!(!probe.passed);
+        assert_eq!(probe.severity, ProbeSeverity::Warning);
+        assert_eq!(probe.impact_state, MailboxState::Healthy);
+        assert!(probe.detail.contains("compatibility reopen probe failed"));
     }
 
     #[test]

@@ -7403,24 +7403,23 @@ fn summarize_db_file_sanity_probe(database_url: &str) -> HealthProbeAssessment {
 
     match crate::sqlite_doctor_file_sanity(&sqlite_path) {
         Ok((healthy, detail, used_absolute_fallback, _fallback_due_to_missing_configured_path)) => {
-            let (status, unhealthy, degraded) = if healthy {
-                if used_absolute_fallback {
-                    ("warn", false, true)
-                } else {
-                    ("ok", false, false)
-                }
-            } else {
-                ("fail", true, false)
-            };
+            let primary_healthy =
+                healthy || crate::sqlite_doctor_primary_read_path_is_healthy(&sqlite_path);
+            let classification = crate::classify_sqlite_doctor_file_sanity(
+                healthy,
+                primary_healthy,
+                used_absolute_fallback,
+            );
+            let detail = crate::sqlite_doctor_file_sanity_detail(detail, classification);
             HealthProbeAssessment {
                 probe: HealthProbe {
                     name: "db_file_sanity".into(),
-                    status: status.into(),
+                    status: classification.status.into(),
                     latency_ms: 0.0,
                     detail,
                 },
-                unhealthy,
-                degraded,
+                unhealthy: classification.failed,
+                degraded: classification.degraded,
             }
         }
         Err(error) => {
