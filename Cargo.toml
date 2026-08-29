@@ -131,11 +131,12 @@ winsafe = { version = "=0.0.28", features = ["kernel"] }
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.4.0", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-fusion" }
+# The maintained production fork pins the same immutable revision as dist.yml.
+frankensearch = { version = "0.4.0", git = "https://github.com/Dicklesworthstone/frankensearch.git", rev = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch.git", rev = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3" }
+frankensearch-embed = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch.git", rev = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3", default-features = false }
+frankensearch-index = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch.git", rev = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3" }
+frankensearch-fusion = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/frankensearch.git", rev = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -187,12 +188,12 @@ inherits = "release"     # Benchmarks use same optimizations as release
 #   cleanup trigger fired, so those eight patch lines are gone too.
 # - fastmcp family resolves from crates.io (0.7.1).
 #
-# beads_rust 0.5.4 stays path-patched to the ../beads_rust checkout because
-# that release is not published yet. Keep the requirement, lockfile, sibling
-# checkout, and dist workflow's exact source commit in lockstep; Cargo ignores
-# a patch whose package version does not satisfy the declared requirement.
+# beads_rust 0.5.4 is not published yet. The maintained production fork pins
+# the same immutable revision as dist.yml; keep that revision, this patch, and
+# the lockfile in lockstep. Cargo ignores a patch whose package version does
+# not satisfy the declared requirement.
 # Cleanup trigger: beads_rust 0.5.x published to crates.io.
-beads_rust = { path = "../beads_rust" }
+beads_rust = { git = "https://github.com/Dicklesworthstone/beads_rust.git", rev = "ba6ff75da25529c8cad8395352f5c5fc2162ee95" }
 # ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.
