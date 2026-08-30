@@ -2765,9 +2765,9 @@ fn create_unique_setup_file_at(
     suffix: &str,
     permissions: u32,
 ) -> Result<(String, std::fs::File), SetupError> {
-    use rustix::fs::{Mode, OFlags, fchmod, openat};
+    use rustix::fs::{Mode, OFlags, RawMode, fchmod, openat};
 
-    let permissions = u16::try_from(permissions).map_err(|_| {
+    let permissions = RawMode::try_from(permissions).map_err(|_| {
         SetupError::Other(format!(
             "setup file permissions {permissions:#o} exceed the platform mode range"
         ))
