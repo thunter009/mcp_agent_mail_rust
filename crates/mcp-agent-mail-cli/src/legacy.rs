@@ -595,7 +595,7 @@ fn handle_legacy_status(
     let fmt = output::CliOutputFormat::resolve(format, json);
     let root = resolve_search_root(search_root);
     let storage = match storage_root_override {
-        Some(path) => normalize_input_path(&path.to_string_lossy(), &root),
+        Some(path) => normalize_explicit_legacy_path("STORAGE_ROOT", &path, &root)?,
         None => resolve_storage_root(&root, None)?.path,
     };
     let report = collect_status_report(&storage)?;
@@ -766,13 +766,15 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     let mode = ImportMode::Copy;
     let target_db = opts
         .target_db
-        .clone()
-        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .as_deref()
+        .map(|path| normalize_explicit_legacy_path("target DB", path, &root))
+        .transpose()?
         .unwrap_or_else(|| default_copy_target_db(&source_db));
     let target_storage = opts
         .target_storage_root
-        .clone()
-        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .as_deref()
+        .map(|path| normalize_explicit_legacy_path("target storage root", path, &root))
+        .transpose()?
         .unwrap_or_else(|| default_copy_target_storage(&source_storage));
 
     if source_db == target_db {
@@ -943,17 +945,15 @@ fn execute_import_body(
     })
 }
 
-/// A target storage root is usable when it does not exist, or contains at most
-/// the `legacy_import_receipts` directory (left behind by a previous failed
-/// attempt whose partial artifacts were staged aside). Anything else is
-/// refused so an unrelated directory is never merged into.
+/// A target storage root may contain retained receipts and the mailbox activity
+/// lock acquired by this import. Other entries must be staged before retrying.
 fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()> {
     if !require_storage_directory(target_storage_root, "target storage root", true)? {
         return Ok(());
     }
     for entry in fs::read_dir(target_storage_root)? {
         let entry = entry?;
-        if entry.file_name() == "legacy_import_receipts" {
+        if legacy_import_control_entry(&entry)? {
             continue;
         }
         return Err(CliError::InvalidArgument(format!(
@@ -964,14 +964,32 @@ fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()
     Ok(())
 }
 
+fn legacy_import_control_entry(entry: &fs::DirEntry) -> CliResult<bool> {
+    if entry.file_name() == "legacy_import_receipts" {
+        require_storage_directory(&entry.path(), "legacy import receipts", false)?;
+        return Ok(true);
+    }
+    if entry.file_name() == ".mailbox.activity.lock" {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() || storage_metadata_is_link_like(&metadata) {
+            return Err(CliError::InvalidArgument(format!(
+                "mailbox activity lock must be a regular file: {}",
+                entry.path().display()
+            )));
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Failure path for `execute_import`: stage the partially created target DB
 /// (plus `-wal`/`-shm` sidecars) aside as `<target>.failed-<UTC ts>` siblings
 /// so the original target path is free for a retry, write a failure receipt so
 /// `am legacy status` can report the attempt, and return the original error
 /// annotated with the staged and receipt paths.
 ///
-/// Staging uses rename (never deletion), and only touches the target DB this
-/// same run just created — source paths are never moved or modified.
+/// Staging uses rename (never deletion) for partial target DB/archive entries.
+/// Source paths and the held target activity lock are never moved or modified.
 fn handle_failed_import(
     plan: &ImportPlan,
     original: &CliError,
@@ -981,6 +999,14 @@ fn handle_failed_import(
     let failure_reason = original.to_string();
     let mut warnings = Vec::new();
     let staged = stage_failed_target_db_aside(&plan.target_db, timestamp, &mut warnings);
+    match stage_failed_target_storage_aside(&plan.target_storage_root) {
+        Ok(Some(path)) => warnings.push(format!(
+            "partial target storage preserved at {} (rename, not deletion)",
+            path.display()
+        )),
+        Ok(None) => {}
+        Err(error) => warnings.push(format!("failed to stage partial target storage: {error}")),
+    }
 
     let staged_note = if staged.is_empty() {
         "no partial target DB was created".to_string()
@@ -1023,11 +1049,61 @@ fn handle_failed_import(
         Err(receipt_err) => format!("failure receipt could not be written: {receipt_err}"),
     };
 
+    let database_path_free = ["", "-wal", "-shm"].iter().all(|suffix| {
+        let mut path = plan.target_db.as_os_str().to_os_string();
+        path.push(suffix);
+        matches!(fs::symlink_metadata(Path::new(&path)), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+    });
+    let retry_note = if database_path_free
+        && ensure_target_storage_root_usable(&plan.target_storage_root).is_ok()
+    {
+        "the original target paths are free again, so the same command can be retried once the cause is fixed"
+    } else {
+        "partial target artifacts remain; inspect the failure receipt and choose fresh target paths before retrying"
+    };
     CliError::Other(format!(
         "legacy import failed: {failure_reason}; {staged_note}; {receipt_note}; \
-         the original target paths are free again, so the same command can be retried \
-         once the cause is fixed"
+         {retry_note}"
     ))
+}
+
+/// Preserve partial archive copies below the receipt directory, the only
+/// content accepted in a retry target. Each attempt gets a private, unique
+/// directory; existing receipts and earlier quarantines are never moved.
+fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf>> {
+    if !require_storage_directory(storage, "failed target storage", true)? {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(storage)? {
+        let entry = entry?;
+        if !legacy_import_control_entry(&entry)? {
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let receipts = storage.join("legacy_import_receipts");
+    if !require_storage_directory(&receipts, "legacy import receipts", true)? {
+        fs::create_dir(&receipts)?;
+    }
+    require_storage_directory(&receipts, "legacy import receipts", false)?;
+    let quarantine = tempfile::Builder::new()
+        .prefix("failed-storage-")
+        .tempdir_in(&receipts)?
+        .keep();
+    for entry in entries {
+        fs::rename(entry.path(), quarantine.join(entry.file_name())).map_err(|error| {
+            CliError::Other(format!(
+                "cannot move {} into {}; earlier moved entries remain preserved there: {error}",
+                entry.path().display(),
+                quarantine.display()
+            ))
+        })?;
+    }
+    Ok(Some(quarantine))
 }
 
 /// Rename the partially created target DB and its SQLite sidecars aside as
@@ -1739,9 +1815,7 @@ fn resolve_database_path_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let raw = path.to_string_lossy();
-        require_nonblank_legacy_authority("DATABASE_URL", &raw)?;
-        let normalized = normalize_input_path(&raw, search_root);
+        let normalized = normalize_explicit_legacy_path("DATABASE_URL", path, search_root)?;
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1795,9 +1869,7 @@ fn resolve_storage_root_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let raw = path.to_string_lossy();
-        require_nonblank_legacy_authority("STORAGE_ROOT", &raw)?;
-        let normalized = normalize_input_path(&raw, search_root);
+        let normalized = normalize_explicit_legacy_path("STORAGE_ROOT", path, search_root)?;
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -2108,6 +2180,23 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
     }
 }
 
+/// Explicit paths become string authorities for SQLite and import receipts.
+/// Reject unrepresentable bytes before normalization can redirect them to a
+/// different, replacement-character path (including bytes inherited from base).
+fn normalize_explicit_legacy_path(key: &str, path: &Path, base: &Path) -> CliResult<PathBuf> {
+    let raw = path.to_str().ok_or_else(|| {
+        CliError::InvalidArgument(format!("explicit {key} authority is not valid UTF-8"))
+    })?;
+    require_nonblank_legacy_authority(key, raw)?;
+    let normalized = normalize_input_path(raw, base);
+    if normalized.to_str().is_none() {
+        return Err(CliError::InvalidArgument(format!(
+            "resolved explicit {key} authority is not valid UTF-8"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
     normalize_lexical_path(&crate::canonicalize_existing_prefix(path))
 }
@@ -2175,6 +2264,7 @@ fn default_copy_target_storage(source_storage: &Path) -> PathBuf {
     source_storage.with_file_name(format!("{name}-rust-copy"))
 }
 
+#[cfg(test)]
 fn open_canonical_read_only(path: &Path) -> CliResult<CanonicalDbConn> {
     let path_text = path.to_string_lossy().into_owned();
     let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(path_text)
@@ -2317,11 +2407,29 @@ fn verify_canonical_quick_check(conn: &CanonicalDbConn, path: &Path, label: &str
     Ok(())
 }
 
-/// Verify a TARGET database (a fresh artifact this run created) is readable.
-/// Uses a plain read-only open; side effects on our own target are harmless
-/// and a non-immutable open sees any WAL content the migration left behind.
+/// Verify a TARGET database through a private physical copy. Migration has
+/// already admitted the target into the native engine's namespace; a direct
+/// canonical open must not disturb its retained WAL/SHM lifetime or locks.
 fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
-    let conn = open_canonical_read_only(path)?;
+    let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{label} canonical verification could not stage {}: {error}",
+                path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "{label} canonical verification needs a regular database at {}",
+                path.display()
+            ))
+        })?;
+    let conn =
+        CanonicalDbConn::open_file(staged.path().to_string_lossy().as_ref()).map_err(|error| {
+            CliError::Other(format!(
+                "{label} canonical verification could not open its private copy: {error}"
+            ))
+        })?;
     verify_canonical_quick_check(&conn, path, label)
 }
 
@@ -2511,6 +2619,73 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_DB_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_DB";
+    #[cfg(target_os = "linux")]
+    const LEGACY_IMPORT_PROBE_STORAGE_ENV: &str = "AM_TEST_LEGACY_IMPORT_PROBE_STORAGE_ROOT";
+
+    /// GH#268: a freshly imported target must pass the server's startup
+    /// integrity probe from a fresh process, the way `am serve-http` sees it
+    /// after `am legacy import` exits. The importer's own reopen checks run
+    /// in the importing process and cannot observe a namespace-sidecar
+    /// refusal that only a new process hits.
+    #[cfg(target_os = "linux")]
+    fn assert_target_passes_startup_probe_in_fresh_process(
+        target_db: &Path,
+        target_storage: &Path,
+    ) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("legacy::tests::legacy_import_target_cross_process_startup_probe_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LEGACY_IMPORT_PROBE_DB_ENV, target_db)
+        .env(LEGACY_IMPORT_PROBE_STORAGE_ENV, target_storage)
+        .output()
+        .expect("spawn fresh-process startup probe");
+        assert!(
+            output.status.success(),
+            "fresh-process startup integrity probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("fresh-process startup integrity probe passed"),
+            "fresh-process startup probe ran no causal probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fresh-process helper invoked by the legacy import regression"]
+    fn legacy_import_target_cross_process_startup_probe_helper() {
+        let target_db = std::env::var_os(LEGACY_IMPORT_PROBE_DB_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target DB path");
+        let target_storage = std::env::var_os(LEGACY_IMPORT_PROBE_STORAGE_ENV)
+            .map(PathBuf::from)
+            .expect("fresh-process probe helper requires the target storage root");
+        let config = Config {
+            database_url: format!("sqlite:///{}", target_db.display()),
+            storage_root: target_storage,
+            integrity_check_on_startup: true,
+            ..Config::default()
+        };
+        match mcp_agent_mail_server::startup_checks::probe_integrity(&config) {
+            mcp_agent_mail_server::startup_checks::ProbeResult::Ok { .. } => {
+                println!("fresh-process startup integrity probe passed");
+            }
+            other => {
+                panic!("startup integrity probe must pass on a freshly imported target: {other:?}")
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3104,6 +3279,81 @@ mod tests {
     }
 
     #[test]
+    fn legacy_explicit_path_authorities_preserve_unicode_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Path::new("café-数据库.sqlite3");
+        let storage = Path::new("courrier-郵便");
+        fs::write(root.path().join(database), b"database sentinel").unwrap();
+        fs::create_dir(root.path().join(storage)).unwrap();
+        let resolved = resolve_legacy_authorities(root.path(), Some(database), Some(storage))
+            .expect("Unicode explicit authorities remain supported");
+        assert_eq!(resolved.database.path, root.path().join(database));
+        assert_eq!(resolved.storage.path, root.path().join(storage));
+        assert!(resolved.database.exists);
+        assert!(resolved.storage.exists);
+        assert_eq!(resolved.database.source, ResolvedSource::Explicit);
+        assert_eq!(resolved.storage.source, ResolvedSource::Explicit);
+        assert_eq!(resolved.database.raw_value.as_deref(), database.to_str());
+        assert_eq!(resolved.storage.raw_value.as_deref(), storage.to_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_explicit_path_authorities_reject_lossy_aliases() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"legacy-\xff".to_vec()));
+        let replacement = root.path().join("legacy-\u{fffd}");
+        fs::write(&replacement, b"unrelated replacement-path sentinel").unwrap();
+        let snapshot = LegacyEnvSnapshot::default();
+        let database = resolve_database_path_from_snapshot(
+            root.path(),
+            Some(&raw),
+            Some("fallback.sqlite3"),
+            &snapshot,
+        )
+        .expect_err("invalid explicit DB must not resolve to its lossy alias or fallback");
+        let storage = resolve_storage_root_from_snapshot(
+            root.path(),
+            Some(&raw),
+            Some("fallback-storage"),
+            &snapshot,
+        )
+        .expect_err("invalid explicit storage must not resolve to its lossy alias or fallback");
+        assert!(
+            database
+                .to_string()
+                .contains("DATABASE_URL authority is not valid UTF-8")
+        );
+        assert!(
+            storage
+                .to_string()
+                .contains("STORAGE_ROOT authority is not valid UTF-8")
+        );
+        for key in ["target DB", "target storage root"] {
+            let error = normalize_explicit_legacy_path(key, &raw, root.path())
+                .expect_err("invalid target authority must fail before any copy");
+            assert!(error.to_string().contains("not valid UTF-8"));
+        }
+        let non_unicode_base = root.path().join(&raw);
+        fs::create_dir(&non_unicode_base).unwrap();
+        let error = normalize_explicit_legacy_path(
+            "DATABASE_URL",
+            Path::new("relative.sqlite3"),
+            &non_unicode_base,
+        )
+        .expect_err("relative authority must not inherit an unrepresentable base");
+        assert!(error.to_string().contains("resolved explicit DATABASE_URL"));
+        assert_eq!(
+            fs::read(&replacement).unwrap(),
+            b"unrelated replacement-path sentinel"
+        );
+        assert!(!root.path().join("fallback.sqlite3").exists());
+        assert!(!root.path().join("fallback-storage").exists());
+    }
+
+    #[test]
     fn legacy_env_snapshot_prefers_first_user_authority_candidate() {
         let tmp = tempfile::tempdir().unwrap();
         let portable = tmp.path().join(".config/mcp-agent-mail");
@@ -3381,6 +3631,31 @@ mod tests {
 
     #[test]
     fn build_detect_report_marks_legacy_storage_only_env_signal() {
+        const CHILD_ENV: &str = "AM_TEST_LEGACY_STORAGE_ENV_SIGNAL";
+        const WITNESS: &str = "legacy-storage-only-env-marker-observed";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The scenario exercises project .env authority. An inherited
+            // STORAGE_ROOT legitimately wins over it, so remove that input
+            // only in a child instead of racing other tests' process env.
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("legacy::tests::build_detect_report_marks_legacy_storage_only_env_signal")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env_remove("STORAGE_ROOT")
+            .output()
+            .expect("run isolated legacy marker fixture");
+            assert!(
+                output.status.success(),
+                "legacy marker child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(WITNESS));
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join(".env"),
@@ -3390,13 +3665,16 @@ mod tests {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("MOCK_AM_BINARY", "")],
             || {
-                let report = build_detect_report(tmp.path(), None, None).unwrap();
+                let report =
+                    build_detect_report(tmp.path(), Some(&tmp.path().join("absent.db")), None)
+                        .unwrap();
                 assert!(
                     report
                         .markers
                         .iter()
                         .any(|marker| marker.id == "legacy_env_defaults")
                 );
+                println!("{WITNESS}");
             },
         );
     }
@@ -3712,6 +3990,8 @@ mod tests {
         drop(target_conn);
         #[cfg(target_os = "linux")]
         assert_target_reopens_in_fresh_process(&target_db);
+        #[cfg(target_os = "linux")]
+        assert_target_passes_startup_probe_in_fresh_process(&target_db, &target_storage);
         assert!(
             target_storage.join("legacy_import_receipts").exists(),
             "successful copy import must write its receipt under target storage"
@@ -3846,14 +4126,10 @@ mod tests {
         // target DB copy is created; the storage copy then fails on a broken
         // symlink (existing validation), which is the cleanest failure
         // injection AFTER the partial target DB exists.
-        let conn = CanonicalDbConn::open_file(source_db.display().to_string())
-            .expect("create source fixture DB");
-        conn.execute_raw("CREATE TABLE t (x INTEGER)")
-            .expect("create fixture table");
-        drop(conn);
-        fs::create_dir_all(&source_storage).expect("create source storage");
-        symlink("/does/not/exist", source_storage.join("broken-link"))
-            .expect("seed broken symlink");
+        seed_v20_agents_fixture(&source_db);
+        let messages = source_storage.join("messages");
+        fs::create_dir_all(&messages).expect("create source storage");
+        symlink("/does/not/exist", messages.join("broken-link")).expect("seed broken symlink");
 
         let opts = ImportOptions {
             auto: false,
@@ -3924,9 +4200,108 @@ mod tests {
         assert!(!latest.integrity_check_ok);
         assert!(latest.migrated_migration_ids.is_empty());
 
-        // Retryability: the same options build a plan again (target DB path is
-        // free; target storage root holds only the receipts directory).
-        build_import_plan(&opts).expect("retry plan must build after failed import");
+        let quarantines: Vec<_> = fs::read_dir(target_storage.join("legacy_import_receipts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert!(quarantines[0].join("messages").is_dir());
+        assert!(!target_storage.join("messages").exists());
+        assert!(message.contains("the original target paths are free again"));
+
+        // Correct the source failure without deleting its evidence, then run
+        // the SAME import options through copying, migration, and verification.
+        fs::rename(
+            messages.join("broken-link"),
+            tmp.path().join("broken-link-evidence"),
+        )
+        .unwrap();
+        fs::write(messages.join("message.md"), b"retry archive payload").unwrap();
+        let retry = build_import_plan(&opts).expect("retry plan must build after failed import");
+        let receipt = execute_import(retry, false).expect("corrected import must really succeed");
+        assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_SUCCEEDED);
+        assert!(receipt.integrity_check_ok);
+        assert_eq!(
+            fs::read(target_storage.join("messages/message.md")).unwrap(),
+            b"retry archive payload"
+        );
+        assert!(quarantines[0].join("messages").is_dir());
+        assert_eq!(
+            collect_status_report(&target_storage)
+                .unwrap()
+                .receipt_count,
+            2
+        );
+    }
+
+    #[test]
+    fn failed_storage_quarantine_preserves_prior_receipts_and_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        let receipts = storage.join("legacy_import_receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(receipts.join("prior.json"), b"prior receipt").unwrap();
+        let activity_lock = storage.join(".mailbox.activity.lock");
+        fs::write(&activity_lock, b"held activity lock").unwrap();
+        fs::write(storage.join("message.md"), b"first partial payload").unwrap();
+        let first = stage_failed_target_storage_aside(&storage)
+            .unwrap()
+            .unwrap();
+        ensure_target_storage_root_usable(&storage).unwrap();
+        fs::write(storage.join("message.md"), b"second partial payload").unwrap();
+        let second = stage_failed_target_storage_aside(&storage)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            fs::read(first.join("message.md")).unwrap(),
+            b"first partial payload"
+        );
+        assert_eq!(
+            fs::read(second.join("message.md")).unwrap(),
+            b"second partial payload"
+        );
+        assert_eq!(
+            fs::read(receipts.join("prior.json")).unwrap(),
+            b"prior receipt"
+        );
+        ensure_target_storage_root_usable(&storage).unwrap();
+        assert!(
+            stage_failed_target_storage_aside(&storage)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&activity_lock).unwrap(), b"held activity lock");
+    }
+
+    #[test]
+    fn failed_storage_quarantine_refuses_invalid_receipt_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let receipts = root.path().join("legacy_import_receipts");
+        fs::write(&receipts, b"occupied receipt path").unwrap();
+        fs::write(root.path().join("message.md"), b"partial payload").unwrap();
+        assert!(stage_failed_target_storage_aside(root.path()).is_err());
+        assert!(ensure_target_storage_root_usable(root.path()).is_err());
+        assert_eq!(fs::read(&receipts).unwrap(), b"occupied receipt path");
+        assert_eq!(
+            fs::read(root.path().join("message.md")).unwrap(),
+            b"partial payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_storage_quarantine_rejects_symlink_activity_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside sentinel").unwrap();
+        let storage = root.path().join("storage");
+        fs::create_dir(&storage).unwrap();
+        std::os::unix::fs::symlink(&outside, storage.join(".mailbox.activity.lock")).unwrap();
+        assert!(ensure_target_storage_root_usable(&storage).is_err());
+        assert!(stage_failed_target_storage_aside(&storage).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
     }
 
     #[test]
@@ -4013,10 +4388,27 @@ mod tests {
             wal_bytes_before,
             "source -wal bytes must be unchanged by detect+import"
         );
+        // The WAL-index is transient shared memory: SQLite's reader protocol
+        // records the snapshot a read-only connection uses in the
+        // checkpoint-info block (nBackfill + aReadMark[5], header bytes
+        // 96..116), and detect+import open the source read-only. That block
+        // may move; every other byte of the shm must be untouched (br-00gl8).
+        let shm_bytes_after = fs::read(&shm_path).expect("reread shm bytes");
         assert_eq!(
-            fs::read(&shm_path).expect("reread shm bytes"),
-            shm_bytes_before,
-            "source -shm bytes must be unchanged by detect+import"
+            shm_bytes_after.len(),
+            shm_bytes_before.len(),
+            "source -shm must keep its size across detect+import"
+        );
+        let shm_changed: Vec<usize> = shm_bytes_before
+            .iter()
+            .zip(shm_bytes_after.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert!(
+            shm_changed.iter().all(|offset| (96..116).contains(offset)),
+            "source -shm may only change inside the reader checkpoint-info block 96..116; changed offsets: {shm_changed:?}"
         );
         assert_eq!(
             fs::read(&source_db).expect("reread source db bytes"),
@@ -4408,13 +4800,18 @@ mod tests {
         const CHILD_WITNESS: &str = "legacy-source-snapshot-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(
-                PathBuf::from(path).to_string_lossy().into_owned(),
-            )
-            .flags(mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_write())
-            .busy_timeout(10);
-            let contender =
-                CanonicalDbConn::open(&config).expect("child opens competing canonical connection");
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let contender = DbConn::open_file(PathBuf::from(path).to_string_lossy().as_ref())
+                .expect("child opens competing runtime-engine connection");
+            let _ = contender.execute_raw("PRAGMA busy_timeout = 10;");
             let error = contender
                 .execute_raw("BEGIN IMMEDIATE")
                 .expect_err("child must not acquire the parent writer lock");

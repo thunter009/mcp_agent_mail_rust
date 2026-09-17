@@ -1036,6 +1036,66 @@ pub fn listener_port_holder_pids_with_hint(host: &str, port: u16) -> Vec<u32> {
     listener_port_holder_pids(host, port)
 }
 
+/// Discover the sole recorded listener currently owned by `pid`.
+///
+/// Hints are candidates, never authority: the operating system must confirm
+/// socket ownership. Callers must separately verify the PID's mailbox locks.
+/// Ambiguous listeners are deliberately not selected.
+#[must_use]
+pub fn verified_listener_for_pid(pid: u32) -> Option<(String, u16)> {
+    let directory = listener_pid_hint_path("127.0.0.1", 0)
+        .parent()?
+        .to_path_buf();
+    let mut found = None;
+    for (index, entry) in std::fs::read_dir(directory).ok()?.enumerate() {
+        if index >= 1024 {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some((encoded, port)) = name
+            .to_str()
+            .and_then(|s| s.strip_suffix(".pid"))
+            .and_then(|s| s.rsplit_once('-'))
+        else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if !encoded.is_ascii() || encoded.len() % 2 != 0 {
+            continue;
+        }
+        let bytes: Result<Vec<_>, _> = (0..encoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16))
+            .collect();
+        let Ok(bytes) = bytes else { continue };
+        let Ok(host) = String::from_utf8(bytes) else {
+            continue;
+        };
+        // Do not let a hint introduce DNS lookups or remote destinations.
+        let address = host.trim_matches(['[', ']']);
+        if address != "localhost" && address.parse::<std::net::IpAddr>().is_err() {
+            continue;
+        }
+        // A daemon can run longer than the generic hint TTL. This path has a
+        // known mailbox owner and verifies its live socket, so hint age alone
+        // must not disable discovery of a healthy long-running daemon.
+        if read_listener_pid_hint_inner(&host, port, false).is_none_or(|hint| hint.pid != pid) {
+            continue;
+        }
+        if listener_port_holder_pids(&host, port) != [pid] {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((host, port));
+    }
+    found
+}
+
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
@@ -1133,6 +1193,14 @@ fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
 }
 
 fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
+    read_listener_pid_hint_inner(host, port, true)
+}
+
+fn read_listener_pid_hint_inner(
+    host: &str,
+    port: u16,
+    enforce_age: bool,
+) -> Option<ListenerPidHint> {
     let path = listener_pid_hint_path(host, port);
     match path_existing_prefix_has_symlink(&path) {
         Ok(true) => {
@@ -1158,7 +1226,7 @@ fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
     let hint = parse_listener_pid_hint(&content)?;
     // Reject stale hints to prevent PID recycling attacks.
     // If no timestamp is present (old format), accept the hint but log a warning.
-    if let Some(created) = hint.created_epoch_secs {
+    if enforce_age && let Some(created) = hint.created_epoch_secs {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -2311,14 +2379,13 @@ fn probe_database(config: &Config) -> ProbeResult {
         if is_sqlite_memory_database_url(url) {
             return ProbeResult::Ok { name: "database" };
         }
-        let Ok(resolved_path) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(url) else {
+        let Some(path) = resolve_server_database_url_sqlite_path(url) else {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
                 problem: format!("Invalid SQLite database URL: {url}"),
                 fix: "Use a valid SQLite URL like 'sqlite:///./storage.sqlite3'".into(),
             });
         };
-        let path = PathBuf::from(resolved_path.configured_path);
         if let Err(problem) = validate_real_file_target_path(&path, "database path") {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
@@ -2342,16 +2409,17 @@ fn probe_database(config: &Config) -> ProbeResult {
 ///    `.bak.YYYYMMDD_HHMMSS[-NN]` file. Historical `.backup-*` generations
 ///    and `.recovery` WAL families are excluded until recovery can settle and
 ///    stage an unambiguous complete family.
-/// 2. If no healthy backup exists, attempt archive-aware reconstruction while
-///    preserving live coordination state that can be salvaged safely.
+/// 2. If no healthy backup exists, reinitialize an empty database.
 ///
-/// Opaque or otherwise unsafe durable database bytes are never replaced with a
-/// blank database. Startup fails closed and preserves them for operator-led
-/// repair. Successful recovery logs a warning and allows startup to continue.
+/// Startup only fails if recovery itself fails. Successful recovery
+/// logs a warning and allows startup to continue.
 ///
 /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
 #[allow(dead_code)]
-fn probe_integrity(config: &Config) -> ProbeResult {
+/// Run the startup integrity probe for `config`'s database. Public so the
+/// legacy-import regression can run it from a fresh process against a
+/// freshly imported target (GH#268).
+pub fn probe_integrity(config: &Config) -> ProbeResult {
     if !config.integrity_check_on_startup {
         return ProbeResult::Ok { name: "integrity" };
     }
@@ -2360,23 +2428,19 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         return ProbeResult::Ok { name: "integrity" };
     }
 
-    let resolved_db_path =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok();
-    if let Some(resolved) = resolved_db_path.as_ref() {
-        let configured_path = PathBuf::from(&resolved.configured_path);
-        if let Err(problem) = validate_real_file_target_path(&configured_path, "database path") {
+    let resolved_db_path = resolve_server_database_url_sqlite_path(&config.database_url);
+    if let Some(path) = resolved_db_path.as_ref() {
+        if let Err(problem) = validate_real_file_target_path(path, "database path") {
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem,
                 fix: format!(
                     "Use a real, non-symlinked database path for {}",
-                    configured_path.display()
+                    path.display()
                 ),
             });
         }
     }
-
-    let resolved_db_path = resolved_db_path.map(|resolved| PathBuf::from(resolved.canonical_path));
 
     let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
 
@@ -2519,6 +2583,9 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Err(e) => {
             let err_str = e.to_string();
 
+            if let Some(diagnosis) = diagnose_unopenable_namespace_sidecar(config, &err_str) {
+                return diagnosis;
+            }
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
@@ -2636,6 +2703,155 @@ fn classify_recovery_failure_root_cause(detail: &str) -> String {
     } else {
         format!("automatic recovery did not produce a safe validated mailbox candidate ({compact})")
     }
+}
+
+/// GH#268: FrankenSQLite reports a namespace sidecar it cannot open as
+/// `unable to open database file: '<db>-fsqlite-ns-gate'`, and the shared
+/// error classifier files that message under busy/retryable. A sidecar this
+/// process cannot open for a filesystem reason is not a busy mailbox: report
+/// the OS error, the directory ownership, and the process identity so the
+/// operator can fix the environment, and keep the probe out of both the
+/// "wait for the owner" advice and any recovery path.
+fn diagnose_unopenable_namespace_sidecar(config: &Config, detail: &str) -> Option<ProbeResult> {
+    if !detail
+        .to_ascii_lowercase()
+        .contains("unable to open database")
+    {
+        return None;
+    }
+    let sidecar =
+        quoted_path_in_message(detail).filter(|path| is_franken_namespace_sidecar_name(path))?;
+    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
+        || config.database_url.clone(),
+        |path| path.display().to_string(),
+    );
+    let context = namespace_sidecar_environment_summary(&sidecar);
+    let (problem, fix) = match namespace_sidecar_access_probe(&sidecar) {
+        Err(reason) => (
+            format!(
+                "FrankenSQLite cannot open its namespace sidecar {} for {db_target}: {reason}. \
+                 The mailbox is not busy; this is a filesystem access problem ({context}). \
+                 No recovery was attempted.",
+                sidecar.display()
+            ),
+            "Make the mailbox directory and its storage.sqlite3-fsqlite-ns-* sidecars readable and writable by the user running the server (chown/chmod, or the pod's runAsUser/fsGroup), keep the volume mounted read-write, then restart. Nothing needs repair.".to_string(),
+        ),
+        Ok(()) => (
+            format!(
+                "FrankenSQLite could not open its namespace sidecar {} for {db_target} although this process can open it ({context}). \
+                 The engine refused a sidecar it did not create, most likely one left by a different user or an aborted run. \
+                 No recovery was attempted.",
+                sidecar.display()
+            ),
+            "Confirm no Agent Mail process owns the mailbox (`am doctor locks`), then remove the stale storage.sqlite3-fsqlite-ns-gate and storage.sqlite3-fsqlite-ns-use pair (or chown them to the server user) and restart.".to_string(),
+        ),
+    };
+    Some(ProbeResult::Fail(ProbeFailure {
+        name: "integrity",
+        problem,
+        fix,
+    }))
+}
+
+fn quoted_path_in_message(message: &str) -> Option<PathBuf> {
+    let start = message.find('\'')? + 1;
+    let rest = &message[start..];
+    let end = rest.find('\'')?;
+    let quoted = rest[..end].trim();
+    (!quoted.is_empty()).then(|| PathBuf::from(quoted))
+}
+
+fn is_franken_namespace_sidecar_name(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
+}
+
+/// Try what the engine tries: open the sidecar read-write, or, when it does
+/// not exist yet, create a file in its directory. Returns the OS error text.
+fn namespace_sidecar_access_probe(sidecar: &std::path::Path) -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sidecar)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = sidecar.parent() else {
+                return Err("the sidecar path has no parent directory".to_string());
+            };
+            let probe = parent.join(format!(".am-access-probe-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "the sidecar does not exist and a new file cannot be created in {}: {error}",
+                    parent.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!("open read-write failed: {error}")),
+    }
+}
+
+/// Ownership and mode of the sidecar (if present) and its directory, plus the
+/// identity of this process, in one line for the operator.
+fn namespace_sidecar_environment_summary(sidecar: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let describe = |path: &std::path::Path| -> String {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => format!(
+                    "{} mode {:o} uid {} gid {}",
+                    path.display(),
+                    metadata.mode() & 0o7777,
+                    metadata.uid(),
+                    metadata.gid()
+                ),
+                Err(error) => format!("{} {error}", path.display()),
+            }
+        };
+        let mut parts = vec![describe(sidecar)];
+        if let Some(parent) = sidecar.parent() {
+            parts.push(describe(parent));
+        }
+        parts.push(format!("process {}", current_process_identity()));
+        parts.join("; ")
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{}; process pid {}", sidecar.display(), std::process::id())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_identity() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(|rest| rest.split_whitespace().next().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    format!(
+        "pid {} uid {} gid {}",
+        std::process::id(),
+        field("Uid:"),
+        field("Gid:")
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_process_identity() -> String {
+    format!("pid {}", std::process::id())
 }
 
 fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
@@ -3017,8 +3233,12 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 /// logged at warn level and otherwise ignored — rotation failures must never
 /// prevent the server from starting.
 fn rotate_backups_best_effort(config: &Config) {
+    let Some(database_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
+        return;
+    };
     let keep = crate::backup_rotation::resolved_keep_per_kind();
-    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, keep) {
+    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, &database_path, keep)
+    {
         Ok(report) if report.evicted() > 0 => {
             tracing::info!(
                 staged = report.staged,
@@ -3106,6 +3326,125 @@ pub fn run_stdio_startup_probes(config: &Config) -> StartupReport {
 mod tests {
     use super::*;
     use fs2::FileExt;
+
+    fn sidecar_diagnosis_config(db: &Path) -> Config {
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db.display());
+        config
+    }
+
+    fn expect_integrity_failure(result: Option<ProbeResult>) -> (String, String) {
+        match result {
+            Some(ProbeResult::Fail(ProbeFailure { name, problem, fix })) => {
+                assert_eq!(name, "integrity");
+                (problem, fix)
+            }
+            other => panic!("expected an integrity failure diagnosis, got {other:?}"),
+        }
+    }
+
+    /// GH#268: a namespace sidecar the process cannot create is an
+    /// environment failure, not a busy mailbox, and must not suggest waiting
+    /// for an owner or entering recovery.
+    #[cfg(unix)]
+    #[test]
+    fn unopenable_namespace_sidecar_is_reported_as_environment_not_busy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().join("mailbox");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        let db = mailbox.join("storage.sqlite3");
+        std::fs::write(&db, b"placeholder").unwrap();
+        let gate = mailbox.join("storage.sqlite3-fsqlite-ns-gate");
+        let config = sidecar_diagnosis_config(&db);
+        let detail = format!(
+            "Connection error: unable to open database file: '{}'",
+            gate.display()
+        );
+
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = RestoreMode(mailbox.clone());
+        if std::fs::write(mailbox.join("write-probe"), b"x").is_ok() {
+            // Directory modes are not enforced for this user (root); nothing to prove.
+            return;
+        }
+        let result = diagnose_unopenable_namespace_sidecar(&config, &detail);
+        drop(restore);
+
+        let (problem, fix) = expect_integrity_failure(result);
+        assert!(
+            problem.contains("cannot open its namespace sidecar")
+                && problem.contains("a new file cannot be created in")
+                && problem.contains("The mailbox is not busy")
+                && problem.contains("No recovery was attempted"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("mode 555"),
+            "directory mode must be reported: {problem}"
+        );
+        assert!(fix.contains("chown/chmod"), "{fix}");
+        assert!(!fix.contains("Wait for the current mailbox owner"), "{fix}");
+    }
+
+    #[test]
+    fn openable_namespace_sidecar_is_reported_as_stale_not_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"placeholder").unwrap();
+        let gate = dir.path().join("storage.sqlite3-fsqlite-ns-gate");
+        std::fs::write(&gate, b"").unwrap();
+        let config = sidecar_diagnosis_config(&db);
+        let detail = format!("unable to open database file: '{}'", gate.display());
+
+        let (problem, fix) =
+            expect_integrity_failure(diagnose_unopenable_namespace_sidecar(&config, &detail));
+        assert!(
+            problem.contains("although this process can open it")
+                && problem.contains("No recovery was attempted"),
+            "{problem}"
+        );
+        assert!(
+            fix.contains("am doctor locks") && fix.contains("stale"),
+            "{fix}"
+        );
+        assert!(
+            gate.exists(),
+            "the diagnosis must not remove the sidecar it inspected"
+        );
+    }
+
+    #[test]
+    fn namespace_sidecar_diagnosis_ignores_unrelated_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        let config = sidecar_diagnosis_config(&db);
+        assert!(diagnose_unopenable_namespace_sidecar(&config, "database is locked").is_none());
+        assert!(
+            diagnose_unopenable_namespace_sidecar(
+                &config,
+                &format!("unable to open database file: '{}'", db.display())
+            )
+            .is_none(),
+            "only namespace sidecars are diagnosed here; the main file keeps the open classifier"
+        );
+        assert!(
+            diagnose_unopenable_namespace_sidecar(&config, "unable to open database file")
+                .is_none()
+        );
+        assert_eq!(
+            quoted_path_in_message("x: 'a/b-fsqlite-ns-use' y"),
+            Some(PathBuf::from("a/b-fsqlite-ns-use"))
+        );
+    }
 
     fn default_config() -> Config {
         Config::default()
@@ -3253,6 +3592,8 @@ mod tests {
         );
 
         let mut config = default_config();
+        // Explicit CWD-relative spelling; three slashes alone would name the
+        // absolute decoy by contract.
         config.database_url = format!("sqlite:///./{}", relative_path.display());
 
         let result = probe_database(&config);
@@ -3614,8 +3955,14 @@ mod tests {
     fn run_http_startup_preflight_probes_omits_port_check() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("listener addr").port();
+        // Private mailbox paths: the probes really run, and the default
+        // relative database/storage paths are shared with every other test
+        // in this binary that also leaves them at their defaults.
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut config = default_config();
         config.http_port = port;
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
 
         let report = run_http_startup_preflight_probes(&config);
         assert!(
@@ -4327,6 +4674,44 @@ mod tests {
         assert_eq!(file_name.to_string_lossy(), "3a3a31-8765.pid");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_listener_for_pid_requires_one_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                let pid = std::process::id();
+                assert!(verified_listener_for_pid(pid).is_none());
+                let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = first.local_addr().unwrap().port();
+                let hint_path = write_listener_pid_hint("127.0.0.1", port);
+                let old_hint = ListenerPidHint {
+                    pid,
+                    exe_path: current_executable_hint_path(),
+                    created_epoch_secs: Some(0),
+                };
+                std::fs::write(hint_path, format_listener_pid_hint(&old_hint)).unwrap();
+                assert!(read_listener_pid_hint("127.0.0.1", port).is_none());
+                assert_eq!(
+                    verified_listener_for_pid(pid),
+                    Some(("127.0.0.1".into(), port))
+                );
+                assert!(verified_listener_for_pid(u32::MAX).is_none());
+                let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let _ = write_listener_pid_hint("127.0.0.1", second.local_addr().unwrap().port());
+                assert!(
+                    verified_listener_for_pid(pid).is_none(),
+                    "ambiguous listeners"
+                );
+                drop(first);
+                drop(second);
+                assert!(verified_listener_for_pid(pid).is_none(), "stale hints");
+            },
+        );
+    }
+
     #[test]
     fn listener_pid_hint_path_distinguishes_hosts_that_old_sanitizer_collided() {
         let dotted = listener_pid_hint_path("127.0.0.1", 8765);
@@ -4581,7 +4966,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_preserves_opaque_db_when_archive_recovery_is_unsafe() {
+    fn probe_integrity_recovers_corrupt_db_with_archive() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt.db");
         let storage_root = dir.path().join("storage");
@@ -4604,19 +4989,14 @@ mod tests {
         config.storage_root = storage_root;
 
         let result = probe_integrity(&config);
-        let ProbeResult::Fail(failure) = result else {
-            panic!("opaque DB bytes must fail closed instead of blank recovery: {result:?}");
-        };
         assert!(
-            failure.problem.contains("refusing blank reinitialization"),
-            "unsafe recovery must explain fail-closed preservation: {}",
-            failure.problem
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should auto-recover corrupt DB; got: {result:?}"
         );
-        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
     }
 
     #[test]
-    fn probe_integrity_preserves_opaque_db_without_archive() {
+    fn probe_integrity_recovers_corrupt_db_without_archive() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt_no_archive.db");
 
@@ -4629,17 +5009,10 @@ mod tests {
         config.storage_root = dir.path().join("no-storage");
 
         let result = probe_integrity(&config);
-        let ProbeResult::Fail(failure) = result else {
-            panic!("opaque DB bytes must fail closed instead of blank recovery: {result:?}");
-        };
         assert!(
-            failure
-                .problem
-                .contains("did not produce a safe validated mailbox candidate"),
-            "unsafe recovery must explain fail-closed preservation: {}",
-            failure.problem
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should reinit from scratch when no archive; got: {result:?}"
         );
-        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
     }
 
     #[test]
@@ -4835,6 +5208,7 @@ mod tests {
             .unwrap_or(i64::MAX),
             last_failure_reason: "startup fixture is circuit-broken".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");
@@ -5050,7 +5424,7 @@ second body
 
     #[cfg(unix)]
     #[test]
-    fn probe_integrity_fails_closed_without_crossing_symlinked_storage_root() {
+    fn probe_integrity_does_not_recover_from_archive_through_symlinked_storage_root() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5072,21 +5446,36 @@ second body
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = linked_storage_root.clone();
+        config.storage_root = linked_storage_root;
 
         let result = probe_integrity(&config);
         assert!(
-            matches!(
-                result,
-                ProbeResult::Fail(ProbeFailure {
-                    name: "integrity",
-                    ..
-                })
-            ),
-            "unsafe recovery must fail closed without trusting symlinked archive root: {result:?}"
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should still recover without trusting a symlinked archive root: {result:?}"
         );
-        assert_eq!(std::fs::read(&db_path).unwrap(), b"not-a-sqlite-db");
-        assert!(linked_storage_root.is_symlink());
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        let table_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .unwrap();
+        let has_projects_table = table_rows[0]
+            .get_named::<i64>("count")
+            .expect("projects table count")
+            > 0;
+        if has_projects_table {
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<i64>("count").expect("project count"),
+                0,
+                "startup recovery must not import archive state through a symlinked storage root"
+            );
+        }
     }
 
     #[cfg(unix)]

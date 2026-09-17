@@ -331,3 +331,205 @@ fn am_doctor_fixers_table_format_is_human_readable() {
         );
     }
 }
+
+// ── GH#311: reservation parity fixer at the binary boundary ─────────────────
+
+const PARITY_FM_ID: &str = "fm-db-state-files-reservation-db-archive-parity";
+const PARITY_LIVE_GENERATION: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PARITY_FOREIGN_GENERATION: &str =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const PARITY_RELEASE_TS: i64 = 1_700_000_000_000_000;
+
+/// Minimal reservation schema + one project/agent, with `db_identity` seeded
+/// so the parity checker attributes artifact generations.
+fn seed_parity_db(tempdir: &std::path::Path, reservation_rows: &str) {
+    let db_path = tempdir.join("storage.sqlite3");
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+        .expect("open scratch db");
+    conn.execute_raw(&format!(
+        "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+         CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT, inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, capabilities TEXT, metadata TEXT);
+         CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, released_ts INTEGER);
+         CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL);
+         CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), generation_id TEXT NOT NULL);
+         INSERT INTO projects VALUES (1, 'demo', '/synthetic/demo', 1);
+         INSERT INTO agents VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', NULL, 1, 1, NULL, NULL);
+         INSERT INTO db_identity VALUES (0, '{PARITY_LIVE_GENERATION}');
+         {reservation_rows}"
+    ))
+    .expect("seed scratch db");
+}
+
+fn parity_artifact_json(id: i64, path_pattern: &str, released_ts: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "id": id,
+        "project": "demo",
+        "agent": "BlueLake",
+        "path_pattern": path_pattern,
+        "exclusive": true,
+        "reason": "synthetic fixture",
+        "created_ts": 1,
+        "expires_ts": 2,
+        "released_ts": released_ts,
+    }))
+    .expect("serialize artifact")
+}
+
+fn parity_reservation_dir(tempdir: &std::path::Path) -> PathBuf {
+    let dir = tempdir.join("projects/demo/file_reservations");
+    std::fs::create_dir_all(&dir).expect("mkdir reservation archive");
+    dir
+}
+
+fn run_parity_fix(tempdir: &std::path::Path) -> (i32, serde_json::Value, String) {
+    let (code, stdout, stderr) = run_am(
+        tempdir,
+        &["doctor", "fix", "--only", PARITY_FM_ID, "--yes", "--json"],
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("fix must emit JSON ({e}); stderr: {stderr}"));
+    (code, envelope, stderr)
+}
+
+fn parity_remaining_findings(tempdir: &std::path::Path) -> u64 {
+    let (code, stdout, stderr) = run_am(
+        tempdir,
+        &["doctor", "fix", "--only", PARITY_FM_ID, "--list", "--json"],
+    );
+    assert_eq!(code, 0, "--list must exit 0; stderr: {stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    envelope["findings_count"].as_u64().expect("findings_count")
+}
+
+#[test]
+fn am_doctor_fix_only_parity_rewrites_legacy_artifact_not_foreign_generation_and_exits_zero() {
+    // GH#311 end to end: released live row, stale legacy `id-1.json`, and a
+    // prior-generation `id-1-g<foreign>.json` that already records the release.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    seed_parity_db(
+        td.path(),
+        &format!(
+            "INSERT INTO file_reservations VALUES (1, 1, 1, 'src/demo.txt', 1, 'synthetic fixture', 1, 2, {PARITY_RELEASE_TS});
+             INSERT INTO file_reservation_releases VALUES (1, {PARITY_RELEASE_TS});"
+        ),
+    );
+    let dir = parity_reservation_dir(td.path());
+    let legacy = dir.join("id-1.json");
+    let foreign = dir.join(format!("id-1-g{PARITY_FOREIGN_GENERATION}.json"));
+    std::fs::write(
+        &legacy,
+        parity_artifact_json(1, "src/demo.txt", serde_json::Value::Null),
+    )
+    .expect("legacy");
+    let mut foreign_json: serde_json::Value = serde_json::from_slice(&parity_artifact_json(
+        1,
+        "src/demo.txt",
+        serde_json::Value::String("2023-11-14T22:13:20Z".to_string()),
+    ))
+    .expect("foreign json");
+    foreign_json["db_generation"] =
+        serde_json::Value::String(PARITY_FOREIGN_GENERATION.to_string());
+    std::fs::write(
+        &foreign,
+        serde_json::to_vec_pretty(&foreign_json).expect("serialize"),
+    )
+    .expect("foreign");
+    let legacy_before = std::fs::read(&legacy).expect("legacy before");
+    let foreign_before = std::fs::read(&foreign).expect("foreign before");
+    assert_eq!(
+        parity_remaining_findings(td.path()),
+        1,
+        "precondition: drift detected"
+    );
+
+    let (code, envelope, stderr) = run_parity_fix(td.path());
+    assert_eq!(
+        code, 0,
+        "fix must exit 0 once drift is gone; stderr: {stderr}"
+    );
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["exit_code"], 0);
+    assert_eq!(envelope["actions_taken"], 1);
+    assert_eq!(envelope["summary"]["total_findings"], 0);
+
+    assert_ne!(std::fs::read(&legacy).expect("legacy after"), legacy_before);
+    let legacy_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&legacy).expect("legacy after")).expect("json");
+    assert_eq!(
+        legacy_json["released_ts"],
+        serde_json::json!(PARITY_RELEASE_TS)
+    );
+    assert_eq!(
+        std::fs::read(&foreign).expect("foreign after"),
+        foreign_before,
+        "foreign-generation artifact must be byte-identical"
+    );
+    assert_eq!(
+        parity_remaining_findings(td.path()),
+        0,
+        "second detector pass is clean"
+    );
+}
+
+#[test]
+fn am_doctor_fix_only_exit_code_matches_envelope_when_findings_remain() {
+    // Detect-only drift (path_pattern) that no fixer reconciles: nothing is
+    // mutated, findings remain → exit 1 (`findings_present_no_fix`), and the
+    // process exit equals the envelope's `exit_code`.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    seed_parity_db(
+        td.path(),
+        "INSERT INTO file_reservations VALUES (1, 1, 1, 'src/db-side.txt', 1, 'synthetic fixture', 1, 2, NULL);",
+    );
+    let dir = parity_reservation_dir(td.path());
+    std::fs::write(
+        dir.join("id-1.json"),
+        parity_artifact_json(1, "src/archive-side.txt", serde_json::Value::Null),
+    )
+    .expect("legacy");
+
+    let (code, envelope, stderr) = run_parity_fix(td.path());
+    assert_eq!(
+        code, 1,
+        "findings remain, nothing mutated → exit 1; stderr: {stderr}"
+    );
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["exit_code"], 1);
+    assert_eq!(envelope["actions_taken"], 0);
+    assert!(envelope["summary"]["total_findings"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn am_doctor_fix_only_exits_two_on_partial_fix() {
+    // One reconcilable release drift (row 1) plus one detect-only path drift
+    // (row 2): an action is taken, but a finding survives → exit 2
+    // (`fix_partial`), matching the envelope.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    seed_parity_db(
+        td.path(),
+        &format!(
+            "INSERT INTO file_reservations VALUES (1, 1, 1, 'src/demo.txt', 1, 'synthetic fixture', 1, 2, {PARITY_RELEASE_TS});
+             INSERT INTO file_reservation_releases VALUES (1, {PARITY_RELEASE_TS});
+             INSERT INTO file_reservations VALUES (2, 1, 1, 'src/db-side.txt', 1, 'synthetic fixture', 1, 2, NULL);"
+        ),
+    );
+    let dir = parity_reservation_dir(td.path());
+    std::fs::write(
+        dir.join("id-1.json"),
+        parity_artifact_json(1, "src/demo.txt", serde_json::Value::Null),
+    )
+    .expect("row 1 legacy");
+    std::fs::write(
+        dir.join("id-2.json"),
+        parity_artifact_json(2, "src/archive-side.txt", serde_json::Value::Null),
+    )
+    .expect("row 2 legacy");
+
+    let (code, envelope, stderr) = run_parity_fix(td.path());
+    assert_eq!(code, 2, "partial fix → exit 2; stderr: {stderr}");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["exit_code"], 2);
+    assert_eq!(envelope["actions_taken"], 1);
+    assert!(envelope["summary"]["total_findings"].as_u64().unwrap_or(0) >= 1);
+}

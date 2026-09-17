@@ -58,7 +58,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in every crate root). The `[workspace.lints]` table says `unsafe_code = "deny"` so crates can inherit it; the only permitted opt-out is `#![allow(unsafe_code)]` at the top of an integration-test file that must call `std::env::set_var`/`remove_var` (unsafe in Rust 2024). Never add such an opt-out to library or binary code.
 
 ### Async Runtime: asupersync (MANDATORY — NO TOKIO)
 
@@ -79,17 +79,19 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp_rust` (`/dp/fastmcp_rust`) | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
-| `sqlmodel_rust` (`/dp/sqlmodel_rust`) | SQLite ORM (schema, queries, migrations, pool) |
-| `frankentui` (`/dp/frankentui`) | TUI rendering for operations console |
-| `beads_rust` (`/dp/beads_rust`) | Issue tracking integration |
-| `coding_agent_session_search` (`/dp/coding_agent_session_search`) | Agent detection |
+| `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `fastmcp-rust` (`0.7.1`, immutable Git backport `c14d26b4`; imported as `fastmcp`) | MCP protocol implementation; full family pinned for legacy stdio version negotiation while retaining Asupersync 0.4.9 |
+| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`, Git revision `2633b38a26bde68db23172b12aa402ed698cc309`, tag `am-sql-compat-20260916`) is the runtime `DbConn`; the pin includes the Windows namespace identity fix |
+| `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
+| `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
+| `frankensearch` (`0.4`, path dep `../frankensearch-rel-0332`, a gated clone at dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Never point this at a live checkout: the live tree already moved to asupersync 0.4.10, which fastmcp cannot follow yet |
+| `beads_rust` (`=0.5.4`) | Issue tracking integration |
+| `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
-| `fnmatch-regex` | Glob pattern matching for file reservations |
+| `globset` | Glob pattern matching for file reservations and the pre-commit guard |
 
 ### Release Profile
 
@@ -255,16 +257,16 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 48 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 49 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
-| `mcp-agent-mail-conformance` | Supported Python compatibility (42 tools) plus 6 Rust-native tools and 25 resources |
+| `mcp-agent-mail-conformance` | Supported Python compatibility (42 tools) plus 7 Rust-native tools and 25 resources |
 | `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
 ### Test Fixtures
 
-Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to protect supported wire compatibility across 37 captured behavior tools and 25 resources. Five additional Python-compatible tools retain inventory/input-schema compatibility, Rust-owned non-empty descriptions, and focused coverage: `fetch_topic`, `list_window_identities`, `sweep_stale_agents`, `summarize_recent`, and `fetch_summary`. Six Rust-native tools are tested separately. These fixtures do not overrule Rust-native reliability or architecture decisions.
+Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to protect supported wire compatibility across 37 captured behavior tools and 25 resources. Five additional Python-compatible tools retain inventory/input-schema compatibility, Rust-owned non-empty descriptions, and focused coverage: `fetch_topic`, `list_window_identities`, `sweep_stale_agents`, `summarize_recent`, and `fetch_summary`. Seven additional Rust-native tools are tested separately. These fixtures do not overrule Rust-native reliability or architecture decisions.
 
 ---
 
@@ -278,21 +280,23 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 `am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
 
-### Verbs (counts drift fast — `am doctor fixers` / `capabilities --json` are authoritative)
+### Verbs (28 verbs; counts drift fast — `am doctor fixers` / `am doctor capabilities --format json` are authoritative)
+
+`am doctor` itself takes no flags: every option lives on a verb (`am doctor check --json`, `am doctor fix --dry-run`, ...). The table below uses the exact syntax the binary accepts.
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
-| `am doctor` (or `check`) | No | 0 healthy / 1 findings |
+| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | No | 0 healthy / 1 findings |
 | `am doctor drain` | No (read-only) | 0 |
 | `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
-| `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
-| `am doctor --dry-run --fix` | No | 0 |
-| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --yes` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
+| `am doctor fix --dry-run` | No | 0 |
+| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 1 / 2 / 3 / 4 / 64 (exit equals the envelope's `exit_code`: 1 = findings remain, nothing mutated; 2 = partial fix) |
 | `am doctor fix --only <fm-id> --list` | No | 0 |
 | `am doctor fix --list` | No | 0 |
 | `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |
 | `am doctor reclaim` | Yes (consolidates stale debris) | 0 |
-| `am doctor capabilities --json` | No | 0 |
+| `am doctor capabilities --format json` (`--json` also accepted on main) | No | 0 |
 | `am doctor fixers` | No | 0 |
 | `am doctor explain <id>` | No | 0 / 64 |
 | `am doctor robot-docs` | No | 0 |
@@ -304,8 +308,10 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 | `am doctor write-selftest` | No (write-path probe — C3) | 0 / 1 |
 | `am doctor support-bundle` (`--json`) | Writes a sanitized support bundle only (N2) | 0 |
 | `am doctor artifacts` | No (read-only run inventory) | 0 |
+| `am doctor archive-verify` | No (archive vs SQLite tamper cross-check) | see `--help` |
+| `am doctor vacuum` (main, unreleased as of 2026-09-01) | Yes (in-place VACUUM/ANALYZE; supervised-owner protocol; `--dry-run` is read-only) | see `--help` |
 
-Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
+Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
 
 **Supervised-owner guard (br-bvq1x.4.4 / D4):** `am doctor repair` and `am doctor reconstruct` now REFUSE (exit 3) when a live mailbox owner is present (owner class `live`/`wedged`/`unsafe-to-touch` from `am doctor locks`). They never ask you to kill `am`. The safe path: gracefully drain/stop the owner via your supervisor (`am service restart`, `systemctl --user stop ...`), confirm with `am doctor drain` (reports `safe_to_mutate`), then re-run — or pass `--allow-live-owner` if you have already drained it. Startup self-heal passes `--allow-live-owner` internally so boot behavior is unchanged.
 
@@ -317,8 +323,8 @@ Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `rec
 `am doctor fixers --format json` enumerates the live registry; for an
 exact current count run a quick scan of `op_pattern` / `auto_fixable`
 over `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`. As of
-2026-06-26 the registry holds **62 FMs, of which 25 are auto-fixable**
-(37 remain detect-only by design — they need operator-supplied truth,
+2026-09-01 the registry holds **65 FMs, of which 27 are auto-fixable**
+(38 remain detect-only by design — they need operator-supplied truth,
 an authoritative-side policy decision, or a source fix).
 
 Illustrative auto-fix entries (one per Op variant):
@@ -334,10 +340,13 @@ Illustrative auto-fix entries (one per Op variant):
 | `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
 | `fm-db-state-files-reservation-db-archive-parity` | P1 | `Op::DbExec`/`Op::WriteFile`/`Op::Rename` (reconcile #112 holder+release drift; collision quarantine; path/exclusive/thread/unresolved-holder stay detect-only) | db_state_files |
 
-Op coverage across the 25 auto-fix FMs (2026-06-26): `Op::WriteFile`×7,
-`Op::Chmod`×5, `Op::Rename`×7 (incl. directory-tree, symlink, and
-stale duplicate reservation-artifact quarantine), `Op::DbExec`×4,
-`Op::AppendFile`×1, `Op::SymlinkAtomic`×1.
+Op coverage across the 27 auto-fix FMs (2026-09-01): single-op
+`Op::WriteFile`×7, `Op::Chmod`×5, `Op::Rename`×7 (incl. directory-tree,
+symlink, and stale duplicate reservation-artifact quarantine),
+`Op::DbExec`×4, `Op::AppendFile`×1, `Op::SymlinkAtomic`×1, plus two
+compound-op FMs (`fm-archive-state-files-reservation-artifact-generation-normalize`
+= WriteFile + Rename; `fm-db-state-files-reservation-db-archive-parity`
+= DbExec + WriteFile + Rename).
 `Op::DbExec` is live (e.g. dependency-ordered DROP of legacy FTS
 residue); `Op::DbMigrate` remains a bookkeeping marker (migration SQL
 runs via paired `Op::DbExec`). `Op::Rename` now quarantines whole
@@ -347,10 +356,10 @@ dereferenced), both hash-witnessed and `undo`-reversible.
 ### When to run `am doctor`
 
 - **Before any session work touching the mailbox**: `am doctor health` (cheap; one line; exit 0/1)
-- **When agents report unexpected state** (stale locks, missing config, runtime issues): `am doctor --json` to see structured findings
-- **Before non-trivial repairs**: `am doctor --dry-run --fix` to preview the plan; then `am doctor --fix --yes` to apply
-- **If `--fix` went wrong**: `am doctor undo latest` (restores from `<repo>/.doctor/runs/<id>/backups/`)
-- **When you need to discover the doctor's contract programmatically**: `am doctor capabilities --json | jq`
+- **When agents report unexpected state** (stale locks, missing config, runtime issues): `am doctor check --json` to see structured findings
+- **Before non-trivial repairs**: `am doctor fix --dry-run` to preview the plan; then `am doctor fix --yes` to apply
+- **If `fix` went wrong**: `am doctor undo latest` (restores from `<repo>/.doctor/runs/<id>/backups/`)
+- **When you need to discover the doctor's contract programmatically**: `am doctor capabilities --format json | jq`
 
 ### Hard guarantees
 
@@ -365,8 +374,8 @@ dereferenced), both hash-witnessed and `undo`-reversible.
 - **Symlink-safe.** `mutate()` sets permissions on the tempfile fd before persist (defeats symlink-swap chmod attack). `undo` refuses to follow symlinks at the target (defeats symlink-redirect overwrite attack).
 - **Scope-bounded.** All writes refuse if path is outside `capabilities.write_scopes` (exit 4). `--dry-run` plan checks scopes before printing — never lies about would-be exit-4 refusals.
 - **Read-only by default.** Bare `am doctor` never mutates state.
-- **Stable JSON schema.** `--json` output always includes `schema_version`. `doctor_contract_version` documented in `capabilities --json`.
-- **Stdout = data, stderr = progress.** `am doctor --json | jq` is always safe.
+- **Stable JSON schema.** `--json` output always includes `schema_version`. `doctor_contract_version` documented in `am doctor capabilities --format json`.
+- **Stdout = data, stderr = progress.** `am doctor check --json | jq` is always safe.
 - **No file deletion.** Per RULE 1. Quarantine via `Op::Rename`.
 - **No destructive shell.** Per "Irreversible Git & Filesystem Actions" — no `rm -rf`, `git reset --hard`, `git clean -fd`.
 
@@ -398,11 +407,11 @@ Every `--fix` run creates `<repo>/.doctor/runs/<ISO>__<run-id>/`:
 am doctor health
 
 # Full diagnose (offline by default)
-am doctor --json | jq '.findings[] | select(.severity == "P0")'
+am doctor check --json | jq '.findings[] | select(.severity == "P0")'
 
 # Plan-then-fix
-am doctor --dry-run --fix
-am doctor --fix --yes
+am doctor fix --dry-run
+am doctor fix --yes
 
 # Reverse a fix that went wrong
 am doctor undo latest                           # most recent
@@ -410,14 +419,14 @@ am doctor ls                                    # see all runs
 am doctor undo 2026-05-09T16-30-15Z__abc123     # specific run
 
 # Discover the contract programmatically
-am doctor capabilities --json | jq '.detectors | length'
-am doctor capabilities --json | jq '.fm_fixers | map(.id)'      # per-FM registry
-am doctor capabilities --json | jq '.exit_codes | keys'
+am doctor capabilities --format json | jq '.detectors | length'
+am doctor capabilities --format json | jq '.fm_fixers | map(.id)'      # per-FM registry
+am doctor capabilities --format json | jq '.exit_codes | keys'
 ```
 
 ### Per-FM workflow (recommended for agents — passes 14-28)
 
-The legacy `am doctor --fix` runs every detector + fixer in a single pass; the per-FM verbs let an agent target one failure mode at a time with full chokepoint guarantees.
+The legacy `am doctor fix` (no `--only`) runs every detector + fixer in a single pass; the per-FM verbs let an agent target one failure mode at a time with full chokepoint guarantees.
 
 ```bash
 # Enumerate the registry
@@ -450,7 +459,7 @@ The `--list` (without `--only`) returns `{mode: "list_all", per_fm: [...], skipp
 # .git/hooks/pre-commit
 #!/bin/sh
 am doctor health || {
-    echo "am doctor reports findings. Run: am doctor --json | jq" >&2
+    echo "am doctor reports findings. Run: am doctor check --json | jq" >&2
     exit 1
 }
 ```
@@ -465,7 +474,7 @@ reflection surface:
 
 - `am doctor fixers --format json` — the live FM registry (id,
   severity, op_pattern, auto_fixable, one_line_description).
-- `am doctor capabilities --json` — write/read scopes, exit codes,
+- `am doctor capabilities --format json` — write/read scopes, exit codes,
   the canonical `Op` set, contract version.
 - `am doctor explain <fm-id>` — per-FM detector + fixer + remediation
   envelope (the in-code successor to the old `repair_specs/fm-*.md`).
@@ -477,7 +486,7 @@ reflection surface:
 
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 48 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 49 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -499,7 +508,7 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
                                               │
                                     ┌─────────┼─────────┐
                                     ▼         ▼         ▼
-                               48 Tools   25 Resources   TUI
+                               49 Tools   25 Resources   TUI
                                     │         │
                               mcp-agent-mail-tools
                                     │
@@ -516,18 +525,21 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
 
 ```
 mcp_agent_mail_rust/
-├── Cargo.toml                              # Workspace root (active crates only; experimental surfaces excluded)
+├── Cargo.toml                              # Workspace root (12 member crates; experimental surfaces and dashboard-wasm excluded)
 ├── crates/
 │   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
-│   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, FTS
+│   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, Search V3 integration
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
+│   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 48 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 49 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
-│   └── mcp-agent-mail-conformance/         # Python parity tests
+│   ├── mcp-agent-mail-test-helpers/        # Shared test scaffolding
+│   ├── mcp-agent-mail-dashboard-wasm/      # Public WASM dashboard replay (excluded from the workspace; built standalone)
+│   └── mcp-agent-mail-conformance/         # Python compatibility + Rust-native conformance tests
 ├── experimental/
 │   └── mcp-agent-mail-wasm/                # Parked standalone WASM/browser prototype
 ├── tests/e2e/                              # End-to-end test scripts
@@ -550,19 +562,19 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 48 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 49 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
 | `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 48 MCP Tools (9 Clusters)
+### 49 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard |
 | Identity | 11 | register_agent, create_agent_identity, list_window_identities, sweep_stale_agents, retire_agent, unretire_agent, deregister_agent, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
-| Messaging | 8 | send_message, reply_message, fetch_inbox, fetch_topic, fetch_inbox_events, get_message_delivery_receipt, acknowledge_message, mark_message_read |
+| Messaging | 9 | send_message, reply_message, fetch_inbox, fetch_topic, fetch_inbox_events, get_message_delivery_receipt, acknowledge_message, mark_message_read, mark_all_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
 | Search | 4 | search_messages, summarize_thread, summarize_recent, fetch_summary |
@@ -630,7 +642,7 @@ All configuration via environment variables. Key variables:
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
-| `DATABASE_URL` | `sqlite:///:memory:` | SQLite connection URL |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` (legacy URL form, accepted and normalized; resolves to `./storage.sqlite3` relative to the working directory) | SQLite connection URL |
 | `STORAGE_ROOT` | XDG-aware (legacy fallback to `~/.mcp_agent_mail_git_mailbox_repo`) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer an isolated `STORAGE_ROOT` for test/repro runs. |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
@@ -652,6 +664,15 @@ All configuration via environment variables. Key variables:
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
+The Air Traffic Control surface (`AM_ATC_*`, 19 variables: `AM_ATC_ENABLED`,
+`AM_ATC_EXECUTOR_MODE`, `AM_ATC_WRITE_MODE`, cadences, calibration thresholds,
+population hydration bounds, policy/canary paths) is registered in
+`crates/mcp-agent-mail-core/src/flags.rs` and documented in the README table
+"Air Traffic Control (ATC) configuration" and `docs/FLAGS_REGISTRY.md`. Inspect
+effective values with `am config atc` / `am flags list --subsystem atc`; a unit
+test fails if code reads an `AM_ATC_*` variable that is not registered and
+documented (GH#290).
+
 ### Exit Codes
 
 | Code | Meaning |
@@ -667,12 +688,23 @@ For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.r
 - **Write-behind cache** — dual-indexed ReadCache with deferred touch batching (30s flush)
 - **Async git commit coalescer** — batches writes to avoid commit storms
 - **i64 microseconds** for all timestamps — no chrono NaiveDateTime in storage layer
-- **Search V3 via frankensearch** with lexical/semantic/hybrid routing
+- **Search V3 via frankensearch** with lexical/semantic/hybrid routing; release binaries (dist.yml, Dockerfiles) are built with `--features portable` and therefore ship the lexical tier only — semantic/hybrid routing exists only in default-feature source builds (`install-local.sh`)
 - **Compatibility testing** against intentionally retained Python wire contracts,
   plus Rust-native durability and behavior fixtures. The Rust implementation is
   authoritative; legacy parity never overrides reliability, security, bounded
   work, or structured-concurrency invariants.
 - **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
+- **Per-transport lifecycle authorization** — `retire_agent`, `unretire_agent`
+  and `deregister_agent` authorize by `registration_token` on every transport.
+  A tmux pane bound to the agent stands in for the token **over stdio only**
+  (the caller is a same-user process). Over `am serve-http` the pane context
+  (`X-Tmux-Pane` / `X-Tmux-Socket`, or a body `pane_id`) is a client assertion,
+  so the daemon stamps the transport-owned `call_transport = "http"` argument and
+  the tools apply `LifecycleAuthPolicy::TokenRequired`; the refusal is
+  `AUTHENTICATION_REQUIRED` with `reason: token_required` and names where the
+  token came from (the `registration_token` field of the register_agent /
+  create_agent_identity / macro_start_session response). Agents must keep that
+  token if they intend to retire or deregister themselves over HTTP.
 - **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling
 - **Pre-commit guard** — enforces reservation compliance at `git commit` time
 - **Query-only reads** — direct reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing
@@ -703,7 +735,7 @@ lock and exits with `Ctrl-C`; `--takeover` remains explicit opt-in replacement.
 `am robot` is the non-interactive, agent-first CLI surface for TUI-equivalent situational awareness.
 Use it when you need structured snapshots quickly (especially in automated loops and when tokens matter).
 
-#### Command Reference
+#### Command Reference (19 subcommands)
 
 | Command | Purpose | Key flags |
 |---------|---------|----------|
@@ -723,6 +755,9 @@ Use it when you need structured snapshots quickly (especially in automated loops
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
 | `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+| `am robot atc` | Live ATC snapshot over `/mail/ws-state` with local SQLite fallback | `--since`, `--stratum`, `--summary-only`, `--limit` |
+| `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
+| `am robot tui-dump` (alias of `am tui-dump`) | TUI freeze escape hatch: the live situational snapshot the TUI renders, never interactive | `--format` |
 
 #### Output Formats
 
@@ -772,11 +807,11 @@ Use these reproducible checks after docs changes:
 ```bash
 # Section and command discoverability
 rg -n '^### Robot Mode \\(` AGENTS.md
-rg -n 'am robot (status|inbox|timeline|overview|thread|search|message|navigate|reservations|metrics|health|analytics|agents|contacts|projects|attachments)' AGENTS.md
+rg -n 'am robot (status|inbox|timeline|overview|thread|search|message|navigate|reservations|metrics|health|analytics|agents|contacts|projects|attachments|atc|handoff|tui-dump)' AGENTS.md
 
 # CLI command surface validation
 AM_INTERFACE_MODE=cli am robot --help
-for c in status inbox timeline overview thread search message navigate reservations metrics health analytics agents contacts projects attachments; do
+for c in status inbox timeline overview thread search message navigate reservations metrics health analytics agents contacts projects attachments atc handoff tui-dump; do
   AM_INTERFACE_MODE=cli am robot "$c" --help >/dev/null
 done
 

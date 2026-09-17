@@ -23,8 +23,10 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Production dispatch materializes live FrankenSQLite state to one retained
-//! private logical snapshot, then runs:
+//! Production dispatch first stages a retained physical family copy. A logical
+//! export is the fallback; its rebuilt indexes cannot clear physical damage in
+//! the source, which the detector re-probes through the runtime engine. On an
+//! authoritative physical source the detector runs:
 //!
 //! ```sql
 //! PRAGMA integrity_check(1)
@@ -237,8 +239,12 @@ mod tests {
             let release_path = PathBuf::from(
                 std::env::var(WAL_WRITER_RELEASE_ENV).expect("integrity WAL writer release path"),
             );
-            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
-                .expect("open cross-process integrity WAL writer");
+            // Stock SQLite is the corruption injector, not the detector:
+            // FrankenSQLite does not implement ignore_check_constraints.
+            // A separate process avoids closing canonical descriptors over
+            // any native reader's process-wide locks.
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path)
+                .expect("open cross-process canonical corruption injector");
             writer
                 .execute_raw(
                     "PRAGMA wal_autocheckpoint = 0;
@@ -405,14 +411,52 @@ mod tests {
             &db,
             "physical integrity authority test",
         );
-        let logical_result = candidate
+        assert_eq!(
+            candidate.source_kind,
+            super::super::DoctorDbReadSourceKind::StagedFamilyCopy
+        );
+        let physical_result = candidate
             .connection()
-            .expect("logical snapshot")
+            .expect("staged physical family")
+            .query_sync("PRAGMA integrity_check(1)", &[])
+            .expect("check copied physical index")[0]
+            .get_named::<String>("integrity_check")
+            .unwrap();
+        assert_ne!(physical_result, "ok", "staging must preserve index damage");
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+        assert_eq!(findings.len(), 1, "physical copy must expose index damage");
+        assert_ne!(findings[0].integrity_check_result, "ok");
+        drop(candidate);
+
+        // Exercise the logical fallback with a real engine export. The copied
+        // rows rebuild a clean index, but the detector must still consult the
+        // damaged source instead of treating the export as physical evidence.
+        let snapshot = crate::CanonicalSnapshotSource::live_full_sqlite_snapshot(
+            db.clone(),
+            &db,
+            "logical integrity fallback test",
+        )
+        .expect("export damaged source through FrankenSQLite");
+        let connection = crate::doctor_open_private_immutable_canonical_snapshot(
+            snapshot.actual_path(),
+            "logical integrity fallback test",
+        )
+        .expect("open actual logical export");
+        let logical_result = connection
             .query_sync("PRAGMA integrity_check(1)", &[])
             .expect("check rebuilt logical snapshot")[0]
             .get_named::<String>("integrity_check")
             .unwrap();
         assert_eq!(logical_result, "ok", "VACUUM should rebuild the index");
+        let candidate = super::super::DoctorDbReadCandidate {
+            target_path: db,
+            connection: Some(connection),
+            _retained_snapshot: Some(snapshot),
+            _retained_staged_family: None,
+            source_kind: super::super::DoctorDbReadSourceKind::LiveLogicalSnapshot,
+            open_error: None,
+            physical_corruption_error: None,
+        };
         let findings = detect_prepared(std::slice::from_ref(&candidate));
         assert_eq!(
             findings.len(),

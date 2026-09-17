@@ -238,6 +238,8 @@ fn error_code_catalog_is_stable() {
     let actual = collect_declared_error_codes();
     let expected: BTreeSet<String> = [
         "ACK_INTENT_WRITE_FAILED",
+        // GH#255 lifecycle tools (retire/unretire/deregister) refuse with
+        // typed codes so agents never mistake a retired identity for a typo.
         "AGENT_DEREGISTERED",
         "AGENT_NOT_FOUND",
         "AGENT_RETIRED",
@@ -271,6 +273,11 @@ fn error_code_catalog_is_stable() {
         "INVALID_PROJECT_KEY",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
+        // GH#310 caller tmux server: a present-but-malformed
+        // `tmux_socket_path` argument is a typed argument refusal.
+        "INVALID_TMUX_SOCKET_PATH",
+        // GH#259 durable message topics: malformed `topic` values are a
+        // typed argument refusal.
         "INVALID_TOPIC",
         "MALFORMED_ACTIVE_RESERVATION",
         "MISSING_FIELD",
@@ -351,6 +358,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty program must fail");
@@ -364,6 +372,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             String::new(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,
@@ -503,6 +512,7 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             "gpt-5".to_string(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,

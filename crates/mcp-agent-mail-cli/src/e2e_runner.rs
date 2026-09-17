@@ -28,7 +28,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Suite Registry
@@ -83,7 +84,7 @@ impl DurationClass {
 }
 
 /// Suite registry for discovering and managing test suites.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SuiteRegistry {
     /// Project root directory.
     project_root: PathBuf,
@@ -374,6 +375,8 @@ pub struct RunConfig {
     pub keep_tmp: bool,
     /// Force rebuild before running.
     pub force_build: bool,
+    /// Bind release evidence to this invocation and enforce its coverage.
+    pub release_scorecard: bool,
 }
 
 impl Default for RunConfig {
@@ -388,6 +391,7 @@ impl Default for RunConfig {
             parallel: false,
             keep_tmp: false,
             force_build: false,
+            release_scorecard: false,
         }
     }
 }
@@ -399,12 +403,15 @@ pub struct Runner {
     registry: SuiteRegistry,
     /// Run configuration.
     config: RunConfig,
+    /// Shared deadline for a native suite made up of multiple child commands.
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
 struct SuiteExecution {
     output: std::process::Output,
     timed_out: bool,
+    capture_incomplete: bool,
 }
 
 impl Runner {
@@ -426,7 +433,11 @@ impl Runner {
     /// Creates a new runner.
     pub fn new(project_root: impl AsRef<Path>, config: RunConfig) -> std::io::Result<Self> {
         let registry = SuiteRegistry::new(project_root)?;
-        Ok(Self { registry, config })
+        Ok(Self {
+            registry,
+            config,
+            deadline: None,
+        })
     }
 
     /// Returns the suite registry.
@@ -437,25 +448,85 @@ impl Runner {
 
     /// Runs the specified suites (or all if empty).
     pub fn run(&self, suite_names: &[String]) -> RunReport {
+        let selected = if suite_names.is_empty() {
+            self.registry.suite_names()
+        } else {
+            suite_names.to_vec()
+        };
+        self.run_selected(&selected)
+    }
+
+    /// Executes an already resolved selection. An empty selection must stay
+    /// empty: treating it as "all" would undo an explicit filter.
+    fn run_selected(&self, suite_names: &[String]) -> RunReport {
         let run_started = Utc::now();
         let start_instant = Instant::now();
-
-        // Determine which suites to run
-        let suites: Vec<&Suite> = if suite_names.is_empty() {
-            self.registry.suites()
-        } else {
-            suite_names
-                .iter()
-                .filter_map(|name| self.registry.get(name))
-                .collect()
-        };
-
-        let mut results = Vec::with_capacity(suites.len());
+        let mut results = Vec::with_capacity(suite_names.len());
         let mut passed = 0;
         let mut failed = 0;
+        let mut execution_config = self.config.clone();
+        let evidence = if self.config.release_scorecard {
+            match ReleaseRunEvidence::prepare(&self.config, suite_names) {
+                Ok(evidence) => {
+                    execution_config.artifact_dir = Some(evidence.directory.clone());
+                    execution_config.env.insert(
+                        "AM_E2E_RELEASE_RUN".to_string(),
+                        serde_json::to_string(&evidence).expect("release evidence serializes"),
+                    );
+                    Some(evidence)
+                }
+                Err(error) => {
+                    return RunReport {
+                        total: 1,
+                        passed: 0,
+                        failed: 1,
+                        skipped: 0,
+                        duration_ms: start_instant.elapsed().as_millis() as u64,
+                        started_at: run_started.to_rfc3339(),
+                        ended_at: Utc::now().to_rfc3339(),
+                        results: vec![SuiteResult {
+                            name: "release_evidence_setup".to_string(),
+                            passed: false,
+                            exit_code: 1,
+                            duration_ms: 0,
+                            stdout: String::new(),
+                            stderr: error.to_string(),
+                            assertions_passed: 0,
+                            assertions_failed: 0,
+                            assertions_skipped: 0,
+                            started_at: run_started.to_rfc3339(),
+                            ended_at: Utc::now().to_rfc3339(),
+                        }],
+                        evidence: None,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let execution_runner = Self {
+            registry: self.registry.clone(),
+            config: execution_config,
+            deadline: None,
+        };
 
-        for suite in &suites {
-            let result = self.run_suite(suite);
+        for name in suite_names {
+            let result = self.registry.get(name).map_or_else(
+                || SuiteResult {
+                    name: name.clone(),
+                    passed: false,
+                    exit_code: 2,
+                    duration_ms: 0,
+                    stdout: String::new(),
+                    stderr: format!("Suite not found: {name}"),
+                    assertions_passed: 0,
+                    assertions_failed: 0,
+                    assertions_skipped: 0,
+                    started_at: run_started.to_rfc3339(),
+                    ended_at: Utc::now().to_rfc3339(),
+                },
+                |suite| execution_runner.run_suite(suite),
+            );
             if result.passed {
                 passed += 1;
             } else {
@@ -468,7 +539,7 @@ impl Runner {
         let elapsed = start_instant.elapsed();
 
         RunReport {
-            total: suites.len() as u32,
+            total: suite_names.len() as u32,
             passed,
             failed,
             skipped: 0,
@@ -476,6 +547,7 @@ impl Runner {
             started_at: run_started.to_rfc3339(),
             ended_at: run_ended.to_rfc3339(),
             results,
+            evidence,
         }
     }
 
@@ -488,7 +560,7 @@ impl Runner {
     ) -> RunReport {
         let suites = self.registry.filter(include, exclude, tags);
         let suite_names: Vec<String> = suites.iter().map(|s| s.name.clone()).collect();
-        self.run(&suite_names)
+        self.run_selected(&suite_names)
     }
 
     /// Runs a single suite.
@@ -545,12 +617,29 @@ impl Runner {
                         self.config.max_output_bytes,
                     );
 
+                    let (assertions_passed, assertions_failed, _) = Self::parse_assertions(&stdout);
+                    let assertions_valid = assertions_passed > 0 && assertions_failed == 0;
                     let exit_code = if execution.timed_out {
                         124
+                    } else if execution.capture_incomplete {
+                        125
+                    } else if execution.output.status.success() && !assertions_valid {
+                        1
                     } else {
                         execution.output.status.code().unwrap_or(-1)
                     };
-                    let passed = !execution.timed_out && execution.output.status.success();
+                    let passed = !execution.timed_out
+                        && !execution.capture_incomplete
+                        && execution.output.status.success()
+                        && assertions_valid;
+
+                    if execution.output.status.success() && !assertions_valid {
+                        stderr.push_str("\nSuite did not report a nonzero passing assertion count with zero failed assertions");
+                    }
+
+                    if execution.capture_incomplete {
+                        stderr.push_str("\nSuite output exceeded its capture limit or a child retained its output pipes after the suite exited");
+                    }
 
                     if execution.timed_out {
                         if !stderr.is_empty() {
@@ -651,64 +740,261 @@ impl Runner {
         for (key, value) in &self.config.env {
             cmd.env(key, value);
         }
+        if let Some(root) = &self.config.artifact_dir {
+            // The producer owns a fresh directory for each attempt; retries
+            // cannot inherit a successful artifact from a failed attempt.
+            let suite_root = root.join(&suite.name);
+            fs::create_dir_all(&suite_root)?;
+            let attempt = tempfile::Builder::new()
+                .prefix("attempt-")
+                .tempdir_in(&suite_root)?
+                .keep();
+            cmd.env("AM_E2E_ARTIFACT_DIR", &attempt);
+            if self.config.release_scorecard {
+                cmd.env("AM_E2E_RELEASE_RECEIPT", attempt.join("receipt.json"));
+            }
+        }
 
-        // Capture output
+        self.execute_script(cmd)
+    }
+
+    fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Suite deadline elapsed before child admission",
+            ));
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn()?;
+        let result = self.capture_suite_child(&mut child);
+        if result.is_err() {
+            // A capture/setup error must not abandon the process we launched.
+            #[cfg(unix)]
+            crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    }
 
+    #[cfg(unix)]
+    fn capture_suite_child(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<SuiteExecution> {
         let mut stdout_pipe = child
             .stdout
             .take()
-            .ok_or_else(|| std::io::Error::other("Failed to capture stdout"))?;
+            .ok_or_else(|| std::io::Error::other("missing stdout"))?;
         let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stderr"))?;
+        Self::nonblocking_pipe(&stdout_pipe)?;
+        Self::nonblocking_pipe(&stderr_pipe)?;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let (mut stdout_done, mut stderr_done) = (false, false);
+        let started = Instant::now();
+        let mut exited_at = None;
+        let mut shutdown_at = None;
+        let mut timed_out = false;
+        let mut capture_incomplete = false;
+        loop {
+            if !stdout_done {
+                stdout_done =
+                    Self::drain_pipe(&mut stdout_pipe, &mut stdout, self.config.max_output_bytes)?;
+            }
+            if !stderr_done {
+                stderr_done =
+                    Self::drain_pipe(&mut stderr_pipe, &mut stderr, self.config.max_output_bytes)?;
+            }
+            let exited = child.try_wait()?.is_some();
+            capture_incomplete |= stdout.len() > self.config.max_output_bytes
+                || stderr.len() > self.config.max_output_bytes;
+            timed_out |= self.command_timed_out(started);
+            if exited && stdout_done && stderr_done {
+                break;
+            }
+            if exited {
+                exited_at.get_or_insert_with(Instant::now);
+            }
+            capture_incomplete |=
+                exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
+            if (timed_out || capture_incomplete) && shutdown_at.is_none() {
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGTERM);
+                shutdown_at = Some(Instant::now());
+            }
+            if shutdown_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(35)) {
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+                let _ = child.kill();
+                child.wait()?;
+                // A setsid descendant can retain the pipes outside our group.
+                // Close our nonblocking readers after the bounded drain; never
+                // detach a blocked reader thread or claim complete output.
+                stdout_done |=
+                    Self::drain_pipe(&mut stdout_pipe, &mut stdout, self.config.max_output_bytes)?;
+                stderr_done |=
+                    Self::drain_pipe(&mut stderr_pipe, &mut stderr, self.config.max_output_bytes)?;
+                capture_incomplete |= !stdout_done || !stderr_done;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        capture_incomplete |= stdout.len() > self.config.max_output_bytes
+            || stderr.len() > self.config.max_output_bytes;
+        Ok(SuiteExecution {
+            output: std::process::Output {
+                status: child.wait()?,
+                stdout,
+                stderr,
+            },
+            timed_out,
+            capture_incomplete,
+        })
+    }
+
+    #[cfg(unix)]
+    fn nonblocking_pipe(pipe: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = OFlag::from_bits_retain(fcntl(pipe, FcntlArg::F_GETFL)?);
+        fcntl(pipe, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn drain_pipe(
+        reader: &mut impl std::io::Read,
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> std::io::Result<bool> {
+        let mut buffer = [0_u8; 8192];
+        // Fairness budget: an endless writer must not starve the other stream,
+        // child-status checks or timeout enforcement.
+        for _ in 0..64 {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    let retain = count.min(limit.saturating_add(1).saturating_sub(output.len()));
+                    output.extend_from_slice(&buffer[..retain]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    fn capture_suite_child(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<SuiteExecution> {
+        let stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("Failed to capture stdout"))?;
+        let stderr_pipe = child
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("Failed to capture stderr"))?;
 
-        // Spawn threads to read stdout/stderr so the child doesn't block on full pipe buffers
-        let stdout_handle = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = std::io::copy(&mut stdout_pipe, &mut out);
-            out
-        });
-
-        let stderr_handle = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = std::io::copy(&mut stderr_pipe, &mut out);
-            out
-        });
-
+        // Drain both streams concurrently, retaining at most limit + 1 bytes.
+        // The extra byte distinguishes exact-limit output from lost evidence.
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limit = self.config.max_output_bytes;
+        let stdout_overflow = std::sync::Arc::clone(&overflow);
+        let stderr_overflow = std::sync::Arc::clone(&overflow);
+        let stdout_handle =
+            std::thread::spawn(move || Self::capture_bounded(stdout_pipe, limit, &stdout_overflow));
+        let stderr_handle =
+            std::thread::spawn(move || Self::capture_bounded(stderr_pipe, limit, &stderr_overflow));
+        let started = Instant::now();
         let mut timed_out = false;
-
-        if let Some(timeout) = self.config.timeout {
-            let timeout_start = Instant::now();
-            loop {
-                if child.try_wait()?.is_some() {
-                    break;
-                }
-
-                if timeout_start.elapsed() >= timeout {
-                    timed_out = true;
-                    let _ = child.kill();
-                    break;
-                }
-
-                std::thread::sleep(Duration::from_millis(10));
+        let mut capture_incomplete = false;
+        let mut exited_at = None;
+        let mut shutdown_at = None;
+        let mut killed = false;
+        loop {
+            let exited = child.try_wait()?.is_some();
+            timed_out |= self.command_timed_out(started);
+            if exited && stdout_handle.is_finished() && stderr_handle.is_finished() {
+                break;
             }
+            if exited {
+                exited_at.get_or_insert_with(Instant::now);
+            }
+            capture_incomplete |= overflow.load(std::sync::atomic::Ordering::Relaxed)
+                || exited_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1));
+            if (timed_out || capture_incomplete) && shutdown_at.is_none() {
+                #[cfg(unix)]
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGTERM);
+                #[cfg(not(unix))]
+                let _ = child.kill();
+                shutdown_at = Some(Instant::now());
+            }
+            if !killed && shutdown_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(35)) {
+                #[cfg(unix)]
+                crate::terminate_child_process_group(child.id(), signal_hook::consts::SIGKILL);
+                let _ = child.kill();
+                killed = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         let status = child.wait()?;
-        let stdout = stdout_handle.join().unwrap_or_default();
-        let stderr = stderr_handle.join().unwrap_or_default();
+        let stdout = stdout_handle
+            .join()
+            .map_err(|_| std::io::Error::other("suite stdout reader panicked"))??;
+        let stderr = stderr_handle
+            .join()
+            .map_err(|_| std::io::Error::other("suite stderr reader panicked"))??;
+        capture_incomplete |= overflow.load(std::sync::atomic::Ordering::Relaxed);
         let output = std::process::Output {
             status,
             stdout,
             stderr,
         };
 
-        Ok(SuiteExecution { output, timed_out })
+        Ok(SuiteExecution {
+            output,
+            timed_out,
+            capture_incomplete,
+        })
+    }
+
+    #[cfg(any(not(unix), test))]
+    fn capture_bounded(
+        mut reader: impl std::io::Read,
+        limit: usize,
+        overflow: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                return Ok(out);
+            }
+            let retain = count.min(limit.saturating_add(1).saturating_sub(out.len()));
+            out.extend_from_slice(&buffer[..retain]);
+            if out.len() > limit {
+                overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn is_native_suite(name: &str) -> bool {
@@ -729,9 +1015,6 @@ impl Runner {
     }
 
     fn run_native_http_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -755,52 +1038,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_HTTP_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native http suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_share_archive_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -824,52 +1065,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_SHARE_ARCHIVE_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native share/archive suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_mode_matrix_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -891,52 +1090,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_MODE_MATRIX_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native mode-matrix suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_security_privacy_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -958,52 +1115,10 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_SECURITY_PRIVACY_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native security/privacy suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_tui_a11y_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1027,52 +1142,10 @@ impl Runner {
         }
         // CI-quality gate: skipping keyboard/adapter cases is not acceptable.
         cmd.env("AM_E2E_TUI_A11Y_REQUIRE_NO_SKIP", "1");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output();
-        let elapsed = start_instant.elapsed();
-        let ended_at = Utc::now();
-
-        match output {
-            Ok(output) => {
-                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
-                SuiteResult {
-                    name: suite.name.clone(),
-                    passed,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    duration_ms: elapsed.as_millis() as u64,
-                    stdout,
-                    stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
-                    started_at: started_at.to_rfc3339(),
-                    ended_at: ended_at.to_rfc3339(),
-                }
-            }
-            Err(error) => SuiteResult {
-                name: suite.name.clone(),
-                passed: false,
-                exit_code: -1,
-                duration_ms: elapsed.as_millis() as u64,
-                stdout: String::new(),
-                stderr: format!("Failed to execute native tui_a11y suite: {error}"),
-                assertions_passed: 0,
-                assertions_failed: 1,
-                assertions_skipped: 0,
-                started_at: started_at.to_rfc3339(),
-                ended_at: ended_at.to_rfc3339(),
-            },
-        }
+        self.execute_native_cargo_suite(suite, cmd)
     }
 
     fn run_native_tui_transport_suite(&self, suite: &Suite) -> SuiteResult {
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-
         let mut cmd = Command::new("cargo");
         Self::scrub_operator_env(&mut cmd);
         cmd.args([
@@ -1096,28 +1169,53 @@ impl Runner {
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_TUI_ARTIFACT_DIR", artifact_root);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        self.execute_native_cargo_suite(suite, cmd)
+    }
 
-        let output = cmd.output();
+    fn execute_native_cargo_suite(&self, suite: &Suite, cmd: Command) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+        let execution = self.execute_script(cmd);
         let elapsed = start_instant.elapsed();
         let ended_at = Utc::now();
 
-        match output {
-            Ok(output) => {
+        match execution {
+            Ok(execution) => {
+                let output = &execution.output;
                 let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
-                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
-                let passed = output.status.success();
+                let mut stderr =
+                    Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let counts = self.native_cargo_counts(output);
+                let (assertions_passed, assertions_failed, assertions_skipped) =
+                    counts.unwrap_or_default();
+                let passed = !execution.timed_out
+                    && !execution.capture_incomplete
+                    && output.status.success()
+                    && assertions_passed > 0
+                    && assertions_failed == 0;
+                let exit_code = if execution.timed_out {
+                    stderr.push_str(
+                        "\nNative suite timed out; child output is not terminal evidence",
+                    );
+                    124
+                } else if execution.capture_incomplete {
+                    stderr.push_str(
+                        "\nNative suite exceeded its capture limit or retained child output pipes",
+                    );
+                    125
+                } else {
+                    output.status.code().unwrap_or(-1)
+                };
                 SuiteResult {
                     name: suite.name.clone(),
                     passed,
-                    exit_code: output.status.code().unwrap_or(-1),
+                    exit_code,
                     duration_ms: elapsed.as_millis() as u64,
                     stdout,
                     stderr,
-                    assertions_passed: if passed { 1 } else { 0 },
-                    assertions_failed: if passed { 0 } else { 1 },
-                    assertions_skipped: 0,
+                    assertions_passed,
+                    assertions_failed,
+                    assertions_skipped,
                     started_at: started_at.to_rfc3339(),
                     ended_at: ended_at.to_rfc3339(),
                 }
@@ -1128,7 +1226,7 @@ impl Runner {
                 exit_code: -1,
                 duration_ms: elapsed.as_millis() as u64,
                 stdout: String::new(),
-                stderr: format!("Failed to execute native tui transport suite: {error}"),
+                stderr: format!("Failed to execute native {} suite: {error}", suite.name),
                 assertions_passed: 0,
                 assertions_failed: 1,
                 assertions_skipped: 0,
@@ -1139,6 +1237,18 @@ impl Runner {
     }
 
     fn run_native_dual_mode_suite(&self, suite: &Suite) -> SuiteResult {
+        let bounded = Self {
+            registry: self.registry.clone(),
+            config: self.config.clone(),
+            deadline: self
+                .config
+                .timeout
+                .and_then(|limit| Instant::now().checked_add(limit)),
+        };
+        bounded.run_native_dual_mode_checks(suite)
+    }
+
+    fn run_native_dual_mode_checks(&self, suite: &Suite) -> SuiteResult {
         let started_at = Utc::now();
         let start_instant = Instant::now();
 
@@ -1719,17 +1829,19 @@ impl Runner {
         let mcp_bin = target_dir.join("debug/mcp-agent-mail");
 
         let build_package = |package: &str| -> Result<(), String> {
-            let status = Command::new("cargo")
-                .args(["build", "-p", package])
-                .current_dir(&self.config.project_root)
-                .status()
+            let mut cmd = Command::new("cargo");
+            cmd.args(["build", "-p", package]);
+            cmd.current_dir(&self.config.project_root);
+            let output = self
+                .execute_complete_command(cmd)
                 .map_err(|error| format!("Failed to run cargo build for {package}: {error}"))?;
-            if status.success() {
+            if output.status.success() {
                 Ok(())
             } else {
                 Err(format!(
-                    "cargo build -p {package} failed with exit code {:?}",
-                    status.code()
+                    "cargo build -p {package} failed with exit code {:?}: {}",
+                    output.status.code(),
+                    Self::output_excerpt(&output.stderr, 500)
                 ))
             }
         };
@@ -1763,14 +1875,48 @@ impl Runner {
         args: &[&str],
         env_map: &HashMap<String, String>,
     ) -> std::io::Result<std::process::Output> {
-        let mut cmd = Command::new(binary);
+        let mut cmd = Command::new(binary); // ubs:ignore -- Internal dual-mode callers use only the resolved am/mcp-agent-mail artifacts; requests are separate argv.
         cmd.args(args);
         cmd.current_dir(&self.config.project_root);
         Self::scrub_operator_env(&mut cmd);
         for (key, value) in env_map {
             cmd.env(key, value);
         }
-        cmd.output()
+        self.execute_complete_command(cmd)
+    }
+
+    fn command_timed_out(&self, started: Instant) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .config
+                .timeout
+                .is_some_and(|limit| started.elapsed() >= limit)
+    }
+
+    /// Preserve ordinary nonzero exits: a mode-rejection check expects them.
+    /// Timeout or incomplete capture must instead fail the check itself, even
+    /// when a termination handler exits with the expected rejection code.
+    fn execute_complete_command(&self, cmd: Command) -> std::io::Result<std::process::Output> {
+        let execution = self.execute_script(cmd)?;
+        let failure = if execution.timed_out {
+            Some((std::io::ErrorKind::TimedOut, "Command timed out"))
+        } else if execution.capture_incomplete {
+            Some((std::io::ErrorKind::Other, "Command capture is incomplete"))
+        } else {
+            None
+        };
+        if let Some((kind, reason)) = failure {
+            return Err(std::io::Error::new(
+                kind,
+                format!(
+                    "{reason}; stdout: {}; stderr: {}",
+                    Self::output_excerpt(&execution.output.stdout, 500),
+                    Self::output_excerpt(&execution.output.stderr, 500)
+                ),
+            ));
+        }
+        Ok(execution.output)
     }
 
     fn output_excerpt(bytes: &[u8], max_chars: usize) -> String {
@@ -1863,6 +2009,83 @@ impl Runner {
         Ok(())
     }
 
+    fn native_cargo_counts(&self, output: &std::process::Output) -> Option<(u32, u32, u32)> {
+        if output.stdout.len() > self.config.max_output_bytes
+            || output.stderr.len() > self.config.max_output_bytes
+        {
+            return None;
+        }
+        Self::cargo_test_counts(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Native Cargo lanes need terminal libtest counts, not a fabricated
+    /// single assertion for any process that exits zero. Ignored tests remain
+    /// visible to the release coverage gate.
+    fn cargo_test_counts(stdout: &str) -> Option<(u32, u32, u32)> {
+        let mut totals = (0_u32, 0_u32, 0_u32);
+        let mut summaries = 0;
+        for line in stdout.lines() {
+            let Some(rest) = line.strip_prefix("test result: ") else {
+                continue;
+            };
+            let successful = rest.starts_with("ok. ");
+            let rest = rest
+                .strip_prefix("ok. ")
+                .or_else(|| rest.strip_prefix("FAILED. "))?;
+            let mut fields = rest.split(';');
+            let passed = fields
+                .next()?
+                .trim()
+                .strip_suffix(" passed")?
+                .parse::<u32>()
+                .ok()?;
+            let failed = fields
+                .next()?
+                .trim()
+                .strip_suffix(" failed")?
+                .parse::<u32>()
+                .ok()?;
+            let ignored = fields
+                .next()?
+                .trim()
+                .strip_suffix(" ignored")?
+                .parse::<u32>()
+                .ok()?;
+            fields
+                .next()?
+                .trim()
+                .strip_suffix(" measured")?
+                .parse::<u32>()
+                .ok()?;
+            fields
+                .next()?
+                .trim()
+                .strip_suffix(" filtered out")?
+                .parse::<u32>()
+                .ok()?;
+            let duration = fields
+                .next()?
+                .trim()
+                .strip_prefix("finished in ")?
+                .strip_suffix('s')?
+                .parse::<f64>()
+                .ok()?;
+            if !duration.is_finite() || duration < 0.0 || fields.next().is_some() {
+                return None;
+            }
+            if successful != (failed == 0) {
+                return None;
+            }
+            totals.0 = totals.0.checked_add(passed)?;
+            totals.1 = totals.1.checked_add(failed)?;
+            totals.2 = totals.2.checked_add(ignored)?;
+            summaries += 1;
+        }
+        // Every native adapter selects exactly one integration-test binary.
+        // Extra summaries are ambiguous nested output, not extra coverage.
+        (summaries == 1).then_some(totals)
+    }
+
     /// Truncates output to max bytes.
     fn truncate_output(bytes: &[u8], max_bytes: usize) -> String {
         if bytes.len() <= max_bytes {
@@ -1948,13 +2171,16 @@ pub struct RunReport {
     pub ended_at: String,
     /// Individual suite results.
     pub results: Vec<SuiteResult>,
+    /// Exact source/executable observation and namespace for this release run.
+    pub evidence: Option<ReleaseRunEvidence>,
 }
 
 impl RunReport {
-    /// Returns true if all suites passed.
+    /// Returns true if a nonempty selection completed without a failed or
+    /// skipped suite. An empty run is not successful verification.
     #[must_use]
     pub fn success(&self) -> bool {
-        self.failed == 0
+        self.total > 0 && self.failed == 0 && self.skipped == 0 && self.passed == self.total
     }
 
     /// Returns the exit code (0 = success, 1 = failures).
@@ -2002,42 +2228,257 @@ impl RunReport {
 /// Suite whose per-incident-class scorecard feeds the release scorecard.
 pub const INCIDENT_CORPUS_SUITE: &str = "incident_corpus";
 
-/// Finds the newest `scorecard.json` under
-/// `tests/artifacts/incident_corpus/*/` and reports whether it was produced
-/// by the current run (mtime at or after `run_started_at`, with a small
-/// clock-slack allowance).
-fn newest_incident_scorecard(
-    project_root: &Path,
-    run_started_at: &str,
-) -> Option<(PathBuf, bool, serde_json::Value)> {
-    let root = project_root
-        .join("tests/artifacts")
-        .join(INCIDENT_CORPUS_SUITE);
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&root).ok()?.flatten() {
-        let candidate = entry.path().join("scorecard.json");
-        let Ok(meta) = fs::metadata(&candidate) else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-            best = Some((mtime, candidate));
+/// Identity observed before launching the selected suites. Source inputs and
+/// the runner executable are named separately: a runtime observation must not
+/// masquerade as a build-system attestation of a different child executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRunEvidence {
+    pub run_id: String,
+    pub directory: PathBuf,
+    pub required_suites: Vec<String>,
+    /// Incident ID to family, captured before any producer runs.
+    pub required_incident_cases: BTreeMap<String, String>,
+    pub runner_executable_sha256: String,
+    pub source_inputs: BTreeMap<String, String>,
+    pub target: String,
+    pub features: Vec<String>,
+}
+
+impl ReleaseRunEvidence {
+    fn prepare(config: &RunConfig, suites: &[String]) -> std::io::Result<Self> {
+        let project = fs::canonicalize(&config.project_root)?;
+        let base = config
+            .artifact_dir
+            .clone()
+            .unwrap_or_else(|| project.join("tests/artifacts/release_scorecard"));
+        reject_symlinked_path(&base)?;
+        fs::create_dir_all(&base)?;
+        let directory = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(fs::canonicalize(base)?)?
+            .keep();
+        let run_id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("invalid release run directory"))?
+            .to_string();
+        let mut source_inputs = BTreeMap::new();
+        for file in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+            source_inputs.insert(file.to_string(), sha256_file(&project.join(file))?);
+        }
+        let mut required_incident_cases = BTreeMap::new();
+        if suites.iter().any(|suite| suite == INCIDENT_CORPUS_SUITE) {
+            let manifest_path = project.join("tests/fixtures/corruption_corpus/manifest.json");
+            let bytes = fs::read(&manifest_path)?;
+            source_inputs.insert(
+                "incident_manifest_sha256".to_string(),
+                hex::encode(Sha256::digest(&bytes)),
+            );
+            let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let fixtures = manifest["fixtures"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .ok_or_else(|| std::io::Error::other("empty incident manifest"))?;
+            for fixture in fixtures {
+                let id = fixture["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| std::io::Error::other("incident fixture lacks an id"))?;
+                if required_incident_cases
+                    .insert(id.to_string(), "L1".to_string())
+                    .is_some()
+                {
+                    return Err(std::io::Error::other("duplicate incident fixture id"));
+                }
+            }
+            for (id, family) in [
+                ("cli_mcp_name_mismatch_matrix", "L2"),
+                ("http_decode_before_tool", "L2"),
+                ("fd_exhaustion_resource_busy", "L2"),
+                ("mixed_load_write_concurrency_cliff", "L3"),
+                ("tui_render_stall_heartbeat", "L3"),
+                ("atc_tick_budget_overrun", "L3"),
+                ("host_pressure_not_corruption", "EE"),
+            ] {
+                if required_incident_cases
+                    .insert(id.to_string(), family.to_string())
+                    .is_some()
+                {
+                    return Err(std::io::Error::other(
+                        "incident fixture collides with a required workflow",
+                    ));
+                }
+            }
+        }
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&project)
+            .args(["rev-parse", "HEAD"])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify release source revision",
+            ));
+        }
+        source_inputs.insert(
+            "revision".to_string(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&project)
+            .args([
+                "diff", "--binary", "HEAD", "--", "crates", "scripts", "tests", ".cargo",
+            ])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify release source overlay",
+            ));
+        }
+        source_inputs.insert(
+            "overlay_sha256".to_string(),
+            hex::encode(Sha256::digest(&output.stdout)),
+        );
+        let sibling = project.join("../frankensearch-rel-0332");
+        let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&sibling)
+            .args(["rev-parse", "HEAD"])
+            .run()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "cannot identify gated frankensearch revision",
+            ));
+        }
+        source_inputs.insert(
+            "frankensearch_revision".to_string(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
+        source_inputs.insert(
+            "frankensearch_lock_sha256".to_string(),
+            sha256_file(&sibling.join("Cargo.lock"))?,
+        );
+        Ok(Self {
+            run_id,
+            directory,
+            required_suites: suites.to_vec(),
+            required_incident_cases,
+            runner_executable_sha256: sha256_file(&std::env::current_exe()?)?,
+            source_inputs,
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            features: [
+                ("default", cfg!(feature = "default")),
+                ("portable", cfg!(feature = "portable")),
+            ]
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(name, _)| name.to_string())
+            .collect(),
+        })
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn reject_symlinked_path(path: &Path) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(
+                    "release evidence path contains a symlink",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    let (mtime, path) = best?;
-    let text = fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let fresh = chrono::DateTime::parse_from_rfc3339(run_started_at)
-        .ok()
-        .map(|started| {
-            let started: std::time::SystemTime = started.into();
-            let slack = Duration::from_secs(5);
-            mtime >= started.checked_sub(slack).unwrap_or(started)
-        })
-        .unwrap_or(false);
-    Some((path, fresh, value))
+    Ok(())
+}
+
+const RELEASE_RECEIPT_PREFIX: &str = "AM_E2E_RELEASE_RECEIPT ";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IncidentReceipt {
+    schema_version: u32,
+    run: ReleaseRunEvidence,
+    scorecard_path: PathBuf,
+    scorecard_sha256: String,
+}
+
+/// Read only the artifact explicitly returned by the terminal producer. A
+/// newer file elsewhere, even in the same second, has no authority here.
+fn read_incident_scorecard(report: &RunReport) -> Result<(PathBuf, serde_json::Value), String> {
+    let run = report.evidence.as_ref().ok_or("missing_run_identity")?;
+    let suite = report
+        .results
+        .iter()
+        .find(|r| r.name == INCIDENT_CORPUS_SUITE)
+        .ok_or("missing_incident_suite")?;
+    if !suite.passed || suite.exit_code != 0 {
+        return Err("incident_producer_failed".to_string());
+    }
+    let mut receipts = suite
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(RELEASE_RECEIPT_PREFIX));
+    let text = receipts.next().ok_or("missing_incident_receipt")?;
+    if receipts.next().is_some() {
+        return Err("duplicate_incident_receipt".to_string());
+    }
+    let receipt: IncidentReceipt =
+        serde_json::from_str(text).map_err(|error| format!("invalid_incident_receipt: {error}"))?;
+    if receipt.schema_version != 1 || &receipt.run != run {
+        return Err("incident_run_or_candidate_mismatch".to_string());
+    }
+    reject_symlinked_path(&receipt.scorecard_path)
+        .map_err(|e| format!("unsafe_incident_path: {e}"))?;
+    let path = fs::canonicalize(&receipt.scorecard_path)
+        .map_err(|e| format!("missing_incident_artifact: {e}"))?;
+    if !path.starts_with(run.directory.join(INCIDENT_CORPUS_SUITE)) {
+        return Err("incident_artifact_outside_run".to_string());
+    }
+    let file = fs::File::open(&path).map_err(|e| format!("incident_open: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("incident_metadata: {e}"))?;
+    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return Err("incident_artifact_not_bounded_regular_file".to_string());
+    }
+    // Cap the read itself as well: a producer may grow a file after metadata
+    // was inspected. Never allocate an unbounded buffer on that path.
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("incident_read: {e}"))?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("incident_artifact_not_bounded_regular_file".to_string());
+    }
+    if hex::encode(Sha256::digest(&bytes)) != receipt.scorecard_sha256 {
+        return Err("incident_digest_mismatch".to_string());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("incident_json: {e}"))?;
+    if value["schema_version"] != 1 || value["suite"] != INCIDENT_CORPUS_SUITE {
+        return Err("incident_schema_mismatch".to_string());
+    }
+    Ok((path, value))
+}
+
+/// Result consumed by the CLI exit-status gate as well as the operator.
+pub struct ReleaseScorecard {
+    pub path: PathBuf,
+    pub release_ready: bool,
+    pub problems: Vec<String>,
 }
 
 /// Writes the aggregated release-readiness scorecard for a completed run.
@@ -2047,16 +2488,48 @@ fn newest_incident_scorecard(
 /// with their originating session-history anchors are lifted from the
 /// `scorecard.json` that the `incident_corpus` suite produced during this
 /// run. The combined `release_ready` verdict is true only when every suite
-/// passed AND a fresh incident-class scorecard is itself release-ready —
+/// passed AND its exact incident-class receipt is itself release-ready —
 /// a run that omits the incident corpus can never claim release readiness.
 ///
-/// Returns the path of the written `release_scorecard.json`.
+/// Returns the published path and the verdict used by the CLI exit gate.
 pub fn write_release_scorecard(
     report: &RunReport,
     registry: &SuiteRegistry,
     project_root: &Path,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<ReleaseScorecard> {
     let mut problems: Vec<String> = Vec::new();
+    if report.total == 0 {
+        problems.push("empty_suite_selection".to_string());
+    }
+    if report.results.len() != report.total as usize {
+        problems.push("incomplete_suite_results".to_string());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for result in &report.results {
+        if !names.insert(&result.name) {
+            problems.push(format!("duplicate_suite: {}", result.name));
+        }
+        if registry.get(&result.name).is_none() {
+            problems.push(format!("unknown_suite: {}", result.name));
+        }
+        if !result.passed || result.exit_code != 0 {
+            problems.push(format!("suite_not_terminal_success: {}", result.name));
+        }
+        if result.assertions_passed == 0
+            || result.assertions_failed != 0
+            || result.assertions_skipped != 0
+        {
+            problems.push(format!("incomplete_assertion_coverage: {}", result.name));
+        }
+    }
+    if let Some(run) = &report.evidence {
+        let required: std::collections::BTreeSet<_> = run.required_suites.iter().collect();
+        if required.len() != run.required_suites.len() || required != names {
+            problems.push("required_suite_mismatch".to_string());
+        }
+    } else {
+        problems.push("missing_run_identity".to_string());
+    }
 
     let suites: Vec<serde_json::Value> = report
         .results
@@ -2087,14 +2560,17 @@ pub fn write_release_scorecard(
     let mut incident_fresh = false;
     let mut incident_ready = false;
     if corpus_ran {
-        match newest_incident_scorecard(project_root, &report.started_at) {
-            Some((path, fresh, value)) => {
-                incident_fresh = fresh;
+        match read_incident_scorecard(report) {
+            Ok((path, value)) => {
+                incident_fresh = true;
                 incident_source = Some(path.display().to_string());
                 incident_ready = value
                     .get("release_ready")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                if !incident_ready {
+                    problems.push("incident_not_release_ready".to_string());
+                }
                 incident_classes = value
                     .get("classes")
                     .cloned()
@@ -2103,16 +2579,41 @@ pub fn write_release_scorecard(
                     .get("summary")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                if !fresh {
-                    problems.push(format!(
-                        "incident_corpus ran but no scorecard.json newer than run start was found; \
-                         stale evidence at {}",
-                        path.display()
-                    ));
+                let mut classes = std::collections::BTreeSet::new();
+                let mut actual_cases = BTreeMap::new();
+                if let Some(rows) = incident_classes.as_array().filter(|rows| !rows.is_empty()) {
+                    for row in rows {
+                        if row["id"].as_str().is_none_or(str::is_empty)
+                            || row["family"].as_str().is_none_or(str::is_empty)
+                            || !classes.insert((row["family"].as_str(), row["id"].as_str()))
+                            || row["status"] != "pass"
+                        {
+                            problems.push("incomplete_or_duplicate_incident_class".to_string());
+                        }
+                        if let (Some(id), Some(family)) =
+                            (row["id"].as_str(), row["family"].as_str())
+                        {
+                            actual_cases.insert(id.to_string(), family.to_string());
+                        }
+                    }
+                    if report.evidence.as_ref().is_none_or(|run| {
+                        run.required_incident_cases.is_empty()
+                            || run.required_incident_cases != actual_cases
+                    }) {
+                        problems.push("required_incident_case_mismatch".to_string());
+                    }
+                    if incident_summary["total"].as_u64() != Some(rows.len() as u64)
+                        || incident_summary["pass"].as_u64() != Some(rows.len() as u64)
+                        || incident_summary["fail"].as_u64() != Some(0)
+                        || incident_summary["skip"].as_u64() != Some(0)
+                    {
+                        problems.push("incident_summary_mismatch".to_string());
+                    }
+                } else {
+                    problems.push("empty_incident_classes".to_string());
                 }
             }
-            None => problems
-                .push("incident_corpus ran but no scorecard.json artifact was found".to_string()),
+            Err(error) => problems.push(error),
         }
     } else {
         problems.push(
@@ -2121,12 +2622,14 @@ pub fn write_release_scorecard(
         );
     }
 
-    let release_ready = report.success() && corpus_ran && incident_fresh && incident_ready;
+    let release_ready =
+        report.success() && corpus_ran && incident_fresh && incident_ready && problems.is_empty();
 
     let scorecard = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "release_scorecard",
         "generated_at": report.ended_at,
+        "evidence": report.evidence,
         "run": {
             "started_at": report.started_at,
             "ended_at": report.ended_at,
@@ -2147,16 +2650,35 @@ pub fn write_release_scorecard(
         "release_ready": release_ready,
     });
 
-    let stamp = chrono::DateTime::parse_from_rfc3339(&report.ended_at)
-        .map(|t| t.format("%Y%m%d_%H%M%S").to_string())
-        .unwrap_or_else(|_| "latest".to_string());
-    let out_dir = project_root
-        .join("tests/artifacts/release_scorecard")
-        .join(stamp);
-    fs::create_dir_all(&out_dir)?;
+    let out_dir = if let Some(run) = &report.evidence {
+        run.directory.clone()
+    } else {
+        let base = project_root.join("tests/artifacts/release_scorecard");
+        reject_symlinked_path(&base)?;
+        fs::create_dir_all(&base)?;
+        tempfile::Builder::new()
+            .prefix("unverified-")
+            .tempdir_in(&base)?
+            .keep()
+    };
+    reject_symlinked_path(&out_dir)?;
     let out_path = out_dir.join("release_scorecard.json");
-    fs::write(&out_path, format!("{scorecard:#}\n"))?;
-    Ok(out_path)
+    // Keep the staging witness. Linking publishes a complete inode atomically
+    // and refuses to overwrite any existing report, without deleting a file.
+    let stage = out_dir.join("release_scorecard.pending.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)?;
+    use std::io::Write as _;
+    writeln!(file, "{scorecard:#}")?;
+    file.sync_all()?;
+    fs::hard_link(stage, &out_path)?;
+    Ok(ReleaseScorecard {
+        path: out_path,
+        release_ready,
+        problems,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2219,6 +2741,7 @@ mod tests {
     #[test]
     fn test_run_report_success() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 3,
             failed: 0,
@@ -2235,6 +2758,7 @@ mod tests {
     #[test]
     fn test_run_report_failure() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 2,
             failed: 1,
@@ -2246,6 +2770,108 @@ mod tests {
         };
         assert!(!report.success());
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn runner_empty_filter_does_not_execute_unselected_suite() {
+        let root = TempDir::new().expect("tempdir").keep();
+        write_suite_script(
+            &root,
+            "available",
+            "#!/bin/sh\nprintf ran > unexpected-execution\necho 'Pass: 1  Fail: 0  Skip: 0'\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("runner");
+
+        for report in [
+            runner.run_filtered(Some(&["missing".to_string()]), None, None),
+            runner.run_filtered(None, Some(&["*".to_string()]), None),
+            runner.run_filtered(None, None, Some(&["absent-tag".to_string()])),
+        ] {
+            assert_eq!(report.total, 0);
+            assert!(report.results.is_empty());
+            assert!(!report.success());
+            assert_eq!(report.exit_code(), 1);
+            assert!(!root.join("unexpected-execution").exists());
+        }
+
+        // The unfiltered command must still execute the requested real script.
+        let report = runner.run(&[]);
+        assert!(report.success());
+        assert_eq!(report.results[0].assertions_passed, 1);
+        assert_eq!(
+            fs::read_to_string(root.join("unexpected-execution")).unwrap(),
+            "ran"
+        );
+    }
+
+    #[test]
+    fn shell_exit_zero_does_not_override_missing_or_failed_assertions() {
+        let root = TempDir::new().unwrap().keep();
+        for (name, summary) in [
+            ("missing", "setup complete"),
+            ("empty", "Pass: 0 Fail: 0 Skip: 0"),
+            ("skipped", "Pass: 0 Fail: 0 Skip: 3"),
+            ("failed", "Pass: 3 Fail: 1 Skip: 0"),
+            ("positive", "Pass: 3 Fail: 0 Skip: 0"),
+        ] {
+            write_suite_script(
+                &root,
+                name,
+                &format!("#!/bin/sh\necho '{summary}'\nexit 0\n"),
+            );
+        }
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for name in ["missing", "empty", "skipped", "failed", "positive"] {
+            let report = runner.run(&[name.to_owned()]);
+            assert_eq!(report.success(), name == "positive", "{name}");
+            assert_eq!(report.results[0].exit_code, i32::from(name != "positive"));
+        }
+    }
+
+    #[test]
+    fn runner_unknown_suite_is_an_explicit_failure_even_with_a_passing_suite() {
+        let root = TempDir::new().expect("tempdir").keep();
+        write_suite_script(
+            &root,
+            "available",
+            "#!/bin/sh\necho 'Pass: 1  Fail: 0  Skip: 0'\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("runner");
+
+        for selection in [
+            vec!["missing".to_string()],
+            vec!["available".to_string(), "missing".to_string()],
+        ] {
+            let report = runner.run(&selection);
+            assert_eq!(report.total as usize, selection.len());
+            assert_eq!(report.failed, 1);
+            assert!(!report.success());
+            let missing = report.results.last().unwrap();
+            assert_eq!(missing.name, "missing");
+            assert_eq!(missing.exit_code, 2);
+            assert!(missing.stderr.contains("Suite not found"));
+        }
     }
 
     #[test]
@@ -2384,6 +3010,425 @@ exit 0
     }
 
     #[test]
+    fn runner_honors_artifact_directory_for_ordinary_runs_and_retries() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "artifact",
+            r#"#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$AM_E2E_ARTIFACT_DIR" >> attempts.txt
+printf 'owned\n' > "$AM_E2E_ARTIFACT_DIR/witness.txt"
+if [ "$(wc -l < attempts.txt)" -eq 1 ]; then exit 1; fi
+echo 'Pass: 1  Fail: 0  Skip: 0'
+"#,
+        );
+        let artifacts = root.join("requested-artifacts");
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                artifact_dir: Some(artifacts.clone()),
+                retries: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = runner.run(&["artifact".to_string()]);
+        assert!(report.success());
+        let attempts = fs::read_to_string(root.join("attempts.txt")).unwrap();
+        let paths: Vec<_> = attempts.lines().map(PathBuf::from).collect();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        for path in paths {
+            assert!(path.starts_with(artifacts.join("artifact")));
+            assert_eq!(
+                fs::read_to_string(path.join("witness.txt")).unwrap(),
+                "owned\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn e2e_remote_required_helpers_reject_missing_artifacts_without_local_build() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let source = include_str!("../../../scripts/e2e_lib.sh");
+        let ensure = source
+            .split_once("e2e_ensure_binary() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let compat = source
+            .split_once("e2e_sqlite3_compat_bin() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let stale = root.join("target/debug");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("am"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(stale.join("am"), fs::Permissions::from_mode(0o700)).unwrap();
+        for required in ["E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE"] {
+            let script = format!(
+                r#"set -eu
+e2e_log() {{ echo "$*" >&2; }}
+_e2e_build_binary() {{ printf '%s\n' "$E2E_CARGO_FORCE_LOCAL" >> build_modes; }}
+cargo() {{ printf unexpected-local-build >> forbidden; return 99; }}
+type() {{ return 1; }}
+e2e_ensure_binary() {{
+{ensure}
+}}
+e2e_sqlite3_compat_bin() {{
+{compat}
+}}
+if e2e_ensure_binary am; then exit 10; fi
+if e2e_sqlite3_compat_bin; then exit 11; fi
+test ! -e forbidden
+test "$(tail -n 1 build_modes)" = 0
+"#,
+            );
+            let script_path = root.join(format!("{required}.sh"));
+            fs::write(&script_path, script).unwrap();
+            let output = Command::new("bash")
+                .arg(script_path)
+                .current_dir(&root)
+                .env("E2E_PROJECT_ROOT", &root)
+                .env("CARGO_TARGET_DIR", root.join("expected-target"))
+                .env("E2E_CARGO_REQUIRE_RCH", "0")
+                .env("RCH_REQUIRE_REMOTE", "0")
+                .env("E2E_CARGO_FORCE_LOCAL", "0")
+                .env("E2E_FORCE_BUILD", "0")
+                .env(required, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("remote-required"));
+        }
+    }
+
+    #[test]
+    fn runner_rejects_success_before_output_overflow_and_bounds_capture() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "overflow",
+            "#!/bin/sh\necho 'Pass: 1  Fail: 0  Skip: 0'\nhead -c 1048576 /dev/zero\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                max_output_bytes: 128,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = runner.run(&["overflow".to_string()]);
+        let result = &report.results[0];
+        assert!(!report.success());
+        assert_eq!(result.exit_code, 125);
+        assert_eq!(result.assertions_passed, 1);
+        assert!(result.stdout.len() < 256);
+        assert!(result.stderr.contains("capture limit"));
+
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let exact = Runner::capture_bounded(&b"12345"[..], 5, &overflow).unwrap();
+        assert_eq!(exact, b"12345");
+        assert!(!overflow.load(std::sync::atomic::Ordering::Relaxed));
+        let excess = Runner::capture_bounded(&b"123456789"[..], 5, &overflow).unwrap();
+        assert_eq!(excess, b"123456");
+        assert!(overflow.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_timeout_terminates_descendant_holding_output_pipe() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "descendant",
+            "#!/bin/bash\nsleep 30 &\ntrap 'wait; exit 0' TERM\nwait\n",
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let report = runner.run(&["descendant".to_string()]);
+        assert_eq!(report.results[0].exit_code, 124);
+        assert!(!report.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_adapters_bound_hangs_and_both_output_streams() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("cargo"), r#"#!/bin/sh
+printf '%s\n' "$$" > "$CARGO_FIXTURE_PID"
+case "$CARGO_FIXTURE_MODE" in
+  timeout)
+    trap 'echo "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0' TERM
+    /bin/sleep 30 &
+    wait
+    ;;
+  stdout) while :; do printf '012345678901234567890123456789012345678901234567890123456789012345\n'; done ;;
+  stderr) while :; do printf '012345678901234567890123456789012345678901234567890123456789012345\n' >&2; done ;;
+esac
+"#).unwrap();
+        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o700)).unwrap();
+        for suite in [
+            "http",
+            "share",
+            "mode_matrix",
+            "security_privacy",
+            "tui_a11y",
+            "tui_interaction",
+        ] {
+            write_suite_script(&root, suite, "#!/bin/sh\nexit 99\n");
+        }
+        for mode in ["timeout", "stdout", "stderr"] {
+            let pid_path = root.join(format!("{mode}.pid"));
+            let runner = Runner::new(
+                &root,
+                RunConfig {
+                    project_root: root.clone(),
+                    max_output_bytes: 1024,
+                    timeout: Some(Duration::from_millis(500)),
+                    env: HashMap::from([
+                        ("PATH".to_string(), bin.to_string_lossy().into_owned()),
+                        ("CARGO_FIXTURE_MODE".to_string(), mode.to_string()),
+                        (
+                            "CARGO_FIXTURE_PID".to_string(),
+                            pid_path.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for suite in [
+                "http",
+                "share",
+                "mode_matrix",
+                "security_privacy",
+                "tui_a11y",
+                "tui_interaction",
+            ] {
+                let started = Instant::now();
+                let result = runner.run_suite(runner.registry.get(suite).unwrap());
+                let pid: i32 = fs::read_to_string(&pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!(!result.passed, "{suite}/{mode}: {}", result.stdout);
+                assert_eq!(
+                    result.exit_code,
+                    if mode == "timeout" { 124 } else { 125 },
+                    "{suite}/{mode}: {}",
+                    result.stderr
+                );
+                assert!(started.elapsed() < Duration::from_secs(5), "{suite}/{mode}");
+                assert!(result.stdout.len() < 1200 && result.stderr.len() < 1400);
+                assert_eq!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                    Err(nix::errno::Errno::ESRCH),
+                    "unreaped cargo peer: {suite}/{mode}"
+                );
+                if mode == "timeout" {
+                    // A valid-looking summary emitted by the TERM handler
+                    // does not turn a timed-out operation into success.
+                    assert_eq!(result.assertions_passed, 7, "{suite}");
+                    assert!(result.stderr.contains("timed out"));
+                } else {
+                    assert!(result.stderr.contains("capture limit"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dual_mode_commands_preserve_exits_and_reject_incomplete_children() {
+        let root = TempDir::new().unwrap().keep();
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                max_output_bytes: 1024,
+                timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pid_path = root.join("child.pid");
+        let env = HashMap::from([(
+            "DUAL_MODE_FIXTURE_PID".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        )]);
+        for (script, expected) in [
+            ("echo allowed; exit 0", Ok(0)),
+            ("echo rejected >&2; exit 2", Ok(2)),
+            (
+                "trap 'echo rejected >&2; exit 2' TERM; /bin/sleep 30 & wait",
+                Err(std::io::ErrorKind::TimedOut),
+            ),
+            (
+                "while :; do echo 012345678901234567890123456789; done",
+                Err(std::io::ErrorKind::Other),
+            ),
+            (
+                "while :; do echo 012345678901234567890123456789 >&2; done",
+                Err(std::io::ErrorKind::Other),
+            ),
+        ] {
+            let script = format!("printf '%s\\n' \"$$\" > \"$DUAL_MODE_FIXTURE_PID\"; {script}");
+            let started = Instant::now();
+            let output = runner.run_dual_mode_command(Path::new("/bin/sh"), &["-c", &script], &env);
+            match expected {
+                Ok(code) => assert_eq!(output.unwrap().status.code(), Some(code)),
+                Err(kind) => assert_eq!(output.unwrap_err().kind(), kind),
+            }
+            let pid: i32 = fs::read_to_string(&pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH),
+                "dual-mode child was not reaped"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dual_mode_children_share_one_deadline_and_stop_admission() {
+        let root = TempDir::new().unwrap().keep();
+        let mut runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        runner.deadline = Some(Instant::now() + Duration::from_secs(1));
+        let env = HashMap::new();
+        let first = runner
+            .run_dual_mode_command(Path::new("/bin/sh"), &["-c", "echo ready"], &env)
+            .unwrap();
+        assert!(first.status.success());
+        // Spend the suite's remaining budget in a different child. A fresh
+        // per-command 30-second timeout would leave this one running.
+        let started = Instant::now();
+        let second = runner
+            .run_dual_mode_command(
+                Path::new("/bin/sh"),
+                &["-c", "trap 'exit 2' TERM; /bin/sleep 30 & wait"],
+                &env,
+            )
+            .unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let marker = root.join("must-not-launch");
+        let env = HashMap::from([(
+            "ADMISSION_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]);
+        let refused = runner
+            .run_dual_mode_command(
+                Path::new("/bin/sh"),
+                &["-c", "echo launched > \"$ADMISSION_MARKER\""],
+                &env,
+            )
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_closes_capture_when_descendant_escapes_process_group() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(
+            &root,
+            "escaped",
+            r#"#!/bin/bash
+python3 - "$E2E_PROJECT_ROOT/escaped.pid" <<'PY' &
+import os, pathlib, sys, time
+os.setsid()
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(90)
+PY
+while [ ! -s "$E2E_PROJECT_ROOT/escaped.pid" ]; do sleep 0.01; done
+echo 'Pass: 1  Fail: 0  Skip: 0'
+exit 0
+"#,
+        );
+        let runner = Runner::new(
+            &root,
+            RunConfig {
+                project_root: root.clone(),
+                timeout: Some(Duration::from_secs(70)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let report = runner.run(&["escaped".to_string()]);
+        let elapsed = started.elapsed();
+        // This intentionally escaped fixture is owned by this test. The
+        // runner cannot reap an unrelated session; stop its exact recorded
+        // PID before assertions, even when the regression returns a failure.
+        let pid: i32 = fs::read_to_string(root.join("escaped.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let signal_result = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        assert!(
+            signal_result.is_ok(),
+            "fixture should still hold its output pipes: {signal_result:?}"
+        );
+        assert!(!report.success());
+        assert_eq!(report.results[0].exit_code, 125);
+        assert_eq!(report.results[0].assertions_passed, 1);
+        assert!(
+            report.results[0]
+                .stderr
+                .contains("retained its output pipes")
+        );
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "capture took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn test_runner_retries_failed_suite_until_success() {
         let temp = TempDir::new().expect("tempdir");
         write_suite_script(
@@ -2417,9 +3462,94 @@ exit 1
         assert!(result.stderr.contains("Attempts used: 2"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_adapters_require_real_terminal_counts_instead_of_exit_zero() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        // Controlled process output challenges the adapter contract. Actual
+        // mailbox/transport conformance is validated by the real Cargo lanes.
+        fs::write(
+            bin.join("cargo"),
+            "#!/bin/sh\nprintf '%s\\n' \"$CARGO_FIXTURE_OUTPUT\"\nexit \"$CARGO_FIXTURE_EXIT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o700)).unwrap();
+        let suites = [
+            "http",
+            "share",
+            "mode_matrix",
+            "security_privacy",
+            "tui_a11y",
+            "tui_interaction",
+        ];
+        for suite in suites {
+            write_suite_script(&root, suite, "#!/bin/sh\nexit 99\n");
+        }
+        let good = "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+        for (stdout, exit, passed, counts) in [
+            (good.to_string(), "0", true, (7, 0, 0)),
+            (good.to_string(), "7", false, (7, 0, 0)),
+            ("build succeeded".to_string(), "0", false, (0, 0, 0)),
+            (
+                "test result: ok. 7 passed; 0 failed; 0 ignored".to_string(),
+                "0",
+                false,
+                (0, 0, 0),
+            ),
+            (good.replace("7 passed", "0 passed"), "0", false, (0, 0, 0)),
+            (format!("{good}\n{good}"), "0", false, (0, 0, 0)),
+            (
+                format!("{good}\n{}", "x".repeat(256)),
+                "0",
+                false,
+                (0, 0, 0),
+            ),
+            (good.replace("0 ignored", "2 ignored"), "0", true, (7, 0, 2)),
+            (
+                good.replace("ok.", "FAILED.")
+                    .replace("0 failed", "1 failed"),
+                "1",
+                false,
+                (7, 1, 0),
+            ),
+        ] {
+            let runner = Runner::new(
+                &root,
+                RunConfig {
+                    project_root: root.clone(),
+                    max_output_bytes: 128,
+                    env: HashMap::from([
+                        ("PATH".to_string(), bin.to_string_lossy().into_owned()),
+                        ("CARGO_FIXTURE_OUTPUT".to_string(), stdout),
+                        ("CARGO_FIXTURE_EXIT".to_string(), exit.to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for suite in suites {
+                let result = runner.run_suite(runner.registry.get(suite).unwrap());
+                assert_eq!(result.passed, passed, "{suite}: {}", result.stderr);
+                assert_eq!(
+                    (
+                        result.assertions_passed,
+                        result.assertions_failed,
+                        result.assertions_skipped
+                    ),
+                    counts,
+                    "{suite}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_run_report_summary_lists_failed_suite_names() {
         let report = RunReport {
+            evidence: None,
             total: 2,
             passed: 1,
             failed: 1,
@@ -2831,6 +3961,7 @@ exit 1
     #[test]
     fn run_report_serde_roundtrip() {
         let report = RunReport {
+            evidence: None,
             total: 2,
             passed: 2,
             failed: 0,
@@ -2850,6 +3981,7 @@ exit 1
     #[test]
     fn run_report_format_summary_all_pass() {
         let report = RunReport {
+            evidence: None,
             total: 3,
             passed: 3,
             failed: 0,
@@ -3052,6 +4184,7 @@ exit 1
     fn scorecard_report(results: Vec<SuiteResult>, started_at: &str) -> RunReport {
         let failed = results.iter().filter(|r| !r.passed).count() as u32;
         RunReport {
+            evidence: None,
             total: results.len() as u32,
             passed: results.len() as u32 - failed,
             failed,
@@ -3063,51 +4196,97 @@ exit 1
         }
     }
 
+    // These fixtures exercise the real filesystem/receipt consumer. They do
+    // not stand in for the incident corpus or certify a product release.
+    fn bind_scorecard_fixture(root: &Path, report: &mut RunReport, value: &serde_json::Value) {
+        let directory = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(root)
+            .expect("run directory")
+            .keep();
+        let run = ReleaseRunEvidence {
+            run_id: directory.file_name().unwrap().to_str().unwrap().to_string(),
+            directory: directory.clone(),
+            required_suites: report.results.iter().map(|r| r.name.clone()).collect(),
+            required_incident_cases: BTreeMap::from([(
+                "zero_byte_wal".to_string(),
+                "L1".to_string(),
+            )]),
+            runner_executable_sha256: sha256_file(&std::env::current_exe().unwrap()).unwrap(),
+            source_inputs: BTreeMap::from([(
+                "fixture".to_string(),
+                "receipt consumer only".to_string(),
+            )]),
+            target: "test-fixture".to_string(),
+            features: Vec::new(),
+        };
+        let corpus = directory
+            .join(INCIDENT_CORPUS_SUITE)
+            .join("attempt-fixture");
+        fs::create_dir_all(&corpus).unwrap();
+        let path = corpus.join("scorecard.json");
+        fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        let receipt = IncidentReceipt {
+            schema_version: 1,
+            run: run.clone(),
+            scorecard_sha256: sha256_file(&path).unwrap(),
+            scorecard_path: path,
+        };
+        if let Some(result) = report
+            .results
+            .iter_mut()
+            .find(|r| r.name == INCIDENT_CORPUS_SUITE)
+        {
+            result.stdout = format!(
+                "{RELEASE_RECEIPT_PREFIX}{}\nPass: 5  Fail: 0  Skip: 0\n",
+                serde_json::to_string(&receipt).unwrap()
+            );
+        }
+        report.evidence = Some(run);
+    }
+
+    fn passing_incident_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "suite": "incident_corpus",
+            "release_ready": true,
+            "classes": [{"family": "L1", "id": "zero_byte_wal", "status": "pass",
+                         "anchor": "receipt consumer fixture"}],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skip": 0}
+        })
+    }
+
     #[test]
-    fn release_scorecard_ready_with_fresh_incident_scorecard() {
-        let temp = TempDir::new().expect("tempdir");
+    fn release_scorecard_ready_with_exact_receipt_ignores_newer_foreign_artifact() {
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             INCIDENT_CORPUS_SUITE,
             "#!/bin/bash\n# L4 harness\n# @tags: reliability, corpus\necho ok",
         );
         write_suite_script(
-            temp.path(),
+            &root,
             "corruption_taxonomy",
             "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
-
-        // A scorecard artifact written NOW is fresh relative to a run that
-        // started in the past.
-        let corpus_dir = temp
-            .path()
-            .join("tests/artifacts")
-            .join(INCIDENT_CORPUS_SUITE)
-            .join("20260212_000500");
-        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
-        fs::write(
-            corpus_dir.join("scorecard.json"),
-            r#"{"release_ready": true,
-                "classes": [{"id": "zero_byte_wal", "status": "pass",
-                             "anchor": "startup quarantine logs"}],
-                "summary": {"total": 1, "pass": 1, "fail": 0, "skip": 0}}"#,
-        )
-        .expect("write scorecard");
-
-        let report = scorecard_report(
+        let registry = SuiteRegistry::new(&root).expect("registry");
+        let mut report = scorecard_report(
             vec![
                 scorecard_suite_result(INCIDENT_CORPUS_SUITE, true),
                 scorecard_suite_result("corruption_taxonomy", true),
             ],
             "2026-02-12T00:00:00+00:00",
         );
-
-        let path = write_release_scorecard(&report, &registry, temp.path())
-            .expect("write release scorecard");
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let foreign = root.join("tests/artifacts/incident_corpus/20990101_000000");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("scorecard.json"), r#"{"release_ready":false}"#).unwrap();
+        let outcome =
+            write_release_scorecard(&report, &registry, &root).expect("write release scorecard");
         let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+            serde_json::from_str(&fs::read_to_string(&outcome.path).expect("read")).expect("parse");
 
+        assert!(outcome.release_ready);
         assert_eq!(value["kind"], "release_scorecard");
         assert_eq!(value["release_ready"], true);
         assert_eq!(value["problems"].as_array().map(Vec::len), Some(0));
@@ -3127,77 +4306,499 @@ exit 1
 
     #[test]
     fn release_scorecard_not_ready_without_incident_corpus() {
-        let temp = TempDir::new().expect("tempdir");
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             "corruption_taxonomy",
             "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        let registry = SuiteRegistry::new(&root).expect("registry");
 
-        let report = scorecard_report(
+        let mut report = scorecard_report(
             vec![scorecard_suite_result("corruption_taxonomy", true)],
             "2026-02-12T00:00:00+00:00",
         );
-
-        let path = write_release_scorecard(&report, &registry, temp.path())
-            .expect("write release scorecard");
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let outcome =
+            write_release_scorecard(&report, &registry, &root).expect("write release scorecard");
         let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+            serde_json::from_str(&fs::read_to_string(&outcome.path).expect("read")).expect("parse");
 
         // All suites green, but no incident-class evidence -> never ready.
         assert_eq!(value["release_ready"], false);
         assert!(
-            value["problems"][0]
-                .as_str()
-                .unwrap()
-                .contains("not part of this run")
+            outcome
+                .problems
+                .iter()
+                .any(|problem| problem.contains("not part of this run"))
         );
     }
 
     #[test]
-    fn release_scorecard_not_ready_with_failed_suite_or_stale_evidence() {
-        let temp = TempDir::new().expect("tempdir");
+    fn release_scorecard_not_ready_with_failed_producer_or_wrong_run() {
+        let root = TempDir::new().expect("tempdir").keep();
         write_suite_script(
-            temp.path(),
+            &root,
             INCIDENT_CORPUS_SUITE,
             "#!/bin/bash\n# L4 harness\n# @tags: reliability\necho ok",
         );
-        let registry = SuiteRegistry::new(temp.path()).expect("registry");
-
-        let corpus_dir = temp
-            .path()
-            .join("tests/artifacts")
-            .join(INCIDENT_CORPUS_SUITE)
-            .join("20990101_000000");
-        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
-        fs::write(
-            corpus_dir.join("scorecard.json"),
-            r#"{"release_ready": true}"#,
-        )
-        .expect("write scorecard");
-
-        // Failed suite -> not ready even with fresh, ready class evidence.
-        let report = scorecard_report(
+        let registry = SuiteRegistry::new(&root).expect("registry");
+        let mut report = scorecard_report(
             vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, false)],
             "2026-02-12T00:00:00+00:00",
         );
-        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
-        assert_eq!(value["release_ready"], false);
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let outcome = write_release_scorecard(&report, &registry, &root).expect("write");
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_producer_failed")
+        );
 
-        // Stale evidence (run "started" far in the future) -> not ready + problem.
-        let report = scorecard_report(
+        let mut report = scorecard_report(
             vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
             "2099-01-01T00:00:00+00:00",
         );
-        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
-        assert_eq!(value["release_ready"], false);
-        assert_eq!(value["incident_scorecard"]["fresh"], false);
-        assert!(value["problems"][0].as_str().unwrap().contains("stale"));
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        report
+            .evidence
+            .as_mut()
+            .unwrap()
+            .run_id
+            .push_str("-different-run");
+        let outcome = write_release_scorecard(&report, &registry, &root).expect("write");
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_run_or_candidate_mismatch")
+        );
+    }
+
+    #[test]
+    fn release_scorecard_rejects_incomplete_coverage_and_candidate_substitution() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        for defect in [
+            "zero",
+            "skip",
+            "missing_suite",
+            "duplicate_suite",
+            "candidate",
+            "features",
+            "target",
+            "missing_receipt",
+            "duplicate_receipt",
+            "truncated_receipt",
+            "empty_classes",
+            "duplicate_class",
+            "unknown_class",
+            "failed_class",
+            "wrong_summary",
+        ] {
+            let mut report = scorecard_report(
+                vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                "2026-09-04T00:00:00Z",
+            );
+            let mut value = passing_incident_fixture();
+            match defect {
+                "empty_classes" => value["classes"] = serde_json::json!([]),
+                "duplicate_class" => {
+                    let duplicate = value["classes"][0].clone();
+                    value["classes"].as_array_mut().unwrap().push(duplicate);
+                }
+                "failed_class" => value["classes"][0]["status"] = "fail".into(),
+                "unknown_class" => value["classes"][0]["id"] = "not-in-the-required-set".into(),
+                "wrong_summary" => value["summary"]["total"] = 20.into(),
+                _ => {}
+            }
+            bind_scorecard_fixture(&root, &mut report, &value);
+            match defect {
+                "zero" => report.results[0].assertions_passed = 0,
+                "skip" => report.results[0].assertions_skipped = 1,
+                "missing_suite" => report
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .required_suites
+                    .push("http".into()),
+                "duplicate_suite" => {
+                    report.results.push(report.results[0].clone());
+                    report.total += 1;
+                    report.passed += 1;
+                }
+                "candidate" => {
+                    report.evidence.as_mut().unwrap().runner_executable_sha256 =
+                        "another ELF".into()
+                }
+                "features" => report
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .features
+                    .push("portable".into()),
+                "target" => report.evidence.as_mut().unwrap().target = "another target".into(),
+                "missing_receipt" => report.results[0].stdout.clear(),
+                "duplicate_receipt" => {
+                    let duplicate = report.results[0].stdout.clone();
+                    report.results[0].stdout.push_str(&duplicate);
+                }
+                "truncated_receipt" => {
+                    report.results[0].stdout = format!("{RELEASE_RECEIPT_PREFIX}{{")
+                }
+                _ => {}
+            }
+            let outcome = write_release_scorecard(&report, &registry, &root).unwrap();
+            assert!(!outcome.release_ready, "accepted {defect}");
+            assert!(!outcome.problems.is_empty(), "unexplained {defect}");
+        }
+    }
+
+    #[test]
+    fn release_scorecard_rejects_changed_bytes_and_never_clobbers_publication() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        let mut report = scorecard_report(
+            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+            "2026-09-04T00:00:00Z",
+        );
+        bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+        let (path, _) = read_incident_scorecard(&report).unwrap();
+        // Simulate replacement after the terminal receipt was issued.
+        fs::write(path, b"{\"release_ready\":true}").unwrap();
+        let outcome = write_release_scorecard(&report, &registry, &root).unwrap();
+        assert!(!outcome.release_ready);
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p == "incident_digest_mismatch")
+        );
+        let original = fs::read(&outcome.path).unwrap();
+        assert!(write_release_scorecard(&report, &registry, &root).is_err());
+        assert_eq!(fs::read(&outcome.path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_scorecard_rejects_symlink_and_outside_run_paths() {
+        let root = TempDir::new().unwrap().keep();
+        for symlink in [false, true] {
+            let mut report = scorecard_report(
+                vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                "2026-09-04T00:00:00Z",
+            );
+            bind_scorecard_fixture(&root, &mut report, &passing_incident_fixture());
+            let (path, _) = read_incident_scorecard(&report).unwrap();
+            let foreign = tempfile::Builder::new()
+                .prefix("foreign-")
+                .tempdir_in(&root)
+                .unwrap()
+                .keep();
+            let replacement = foreign.join("scorecard.json");
+            if symlink {
+                std::os::unix::fs::symlink(&path, &replacement).unwrap();
+            } else {
+                fs::copy(&path, &replacement).unwrap();
+            }
+            let receipt = IncidentReceipt {
+                schema_version: 1,
+                run: report.evidence.clone().unwrap(),
+                scorecard_sha256: sha256_file(&replacement).unwrap(),
+                scorecard_path: replacement,
+            };
+            report.results[0].stdout = format!(
+                "{RELEASE_RECEIPT_PREFIX}{}",
+                serde_json::to_string(&receipt).unwrap()
+            );
+            let error = read_incident_scorecard(&report).unwrap_err();
+            assert!(
+                error.starts_with(if symlink {
+                    "unsafe_incident_path"
+                } else {
+                    "incident_artifact_outside_run"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_scorecard_concurrent_opposite_verdicts_stay_with_their_runs() {
+        let root = TempDir::new().unwrap().keep();
+        write_suite_script(&root, INCIDENT_CORPUS_SUITE, "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(&root).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = [false, true]
+                .into_iter()
+                .map(|ready| {
+                    let root = &root;
+                    let registry = &registry;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut report = scorecard_report(
+                            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+                            "2026-09-04T00:00:00Z",
+                        );
+                        let mut value = passing_incident_fixture();
+                        value["release_ready"] = ready.into();
+                        bind_scorecard_fixture(root, &mut report, &value);
+                        barrier.wait();
+                        let outcome = write_release_scorecard(&report, registry, root).unwrap();
+                        assert_eq!(outcome.release_ready, ready);
+                        outcome.path
+                    })
+                })
+                .collect();
+            let paths: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            assert_ne!(paths[0], paths[1]);
+        });
+    }
+
+    #[test]
+    fn release_scorecard_actual_incident_producer_publishes_terminal_receipt() {
+        let root = TempDir::new().unwrap().keep();
+        let script = include_str!("../../../tests/e2e/test_incident_corpus.sh");
+        let producer = script
+            .split_once("if python3 - \"${SCORECARD_ROWS}\"")
+            .unwrap()
+            .1
+            .split_once("<<'PY'\n")
+            .unwrap()
+            .1
+            .split_once("\nPY\n")
+            .unwrap()
+            .0;
+        let manifest = root.join("manifest.json");
+        fs::write(
+            &manifest,
+            r#"{"corpus_id":"producer-contract-test","fixtures":[{"id":"zero_byte_wal"}]}"#,
+        )
+        .unwrap();
+        for skip in [false, true] {
+            let run_dir = tempfile::Builder::new()
+                .prefix("producer-")
+                .tempdir_in(&root)
+                .unwrap()
+                .keep();
+            let rows = run_dir.join("rows.tsv");
+            let mut contents = "L1\tzero_byte_wal\tfixture\tpass\tfixture\tfixture\n".to_string();
+            for id in [
+                "cli_mcp_name_mismatch_matrix",
+                "http_decode_before_tool",
+                "fd_exhaustion_resource_busy",
+                "mixed_load_write_concurrency_cliff",
+                "tui_render_stall_heartbeat",
+                "atc_tick_budget_overrun",
+                "host_pressure_not_corruption",
+            ] {
+                let status = if skip && id == "atc_tick_budget_overrun" {
+                    "skip"
+                } else {
+                    "pass"
+                };
+                contents.push_str(&format!("L2\t{id}\tfixture\t{status}\tfixture\tfixture\n"));
+            }
+            fs::write(&rows, contents).unwrap();
+            let scorecard = run_dir.join("scorecard.json");
+            let receipt = run_dir.join("receipt.json");
+            let producer_path = run_dir.join("producer.py");
+            fs::write(&producer_path, producer).unwrap();
+            let output = Command::new("python3")
+                .arg(producer_path)
+                .arg(&rows)
+                .arg(&manifest)
+                .arg(&scorecard)
+                .args(["test-fixture", ""])
+                .env(
+                    "AM_E2E_RELEASE_RUN",
+                    r#"{"run_id":"producer-contract-test"}"#,
+                )
+                .env("AM_E2E_RELEASE_RECEIPT", &receipt)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&scorecard).unwrap()).unwrap();
+            assert_eq!(value["release_ready"], !skip);
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+            assert_eq!(value["scorecard_sha256"], sha256_file(&scorecard).unwrap());
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with(RELEASE_RECEIPT_PREFIX))
+            );
+        }
+    }
+
+    #[test]
+    fn release_scorecard_incident_fixture_requires_terminal_cargo_success() {
+        let root = TempDir::new().unwrap().keep();
+        let script = include_str!("../../../tests/e2e/test_incident_corpus.sh");
+        let body = script
+            .split_once("run_cargo_fixture() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        for (exit, count, expected) in [(0, 5, true), (7, 5, false), (0, 0, false)] {
+            // Fault injection at the cargo subprocess boundary checks the
+            // actual shell validator; these are not product conformance rows.
+            let command = format!(
+                "e2e_run_cargo() {{ printf 'test result: ok. {count} passed; 0 failed;\\n'; return {exit}; }}\nrun_cargo_fixture() {{\n{body}\n}}\nrun_cargo_fixture case-{exit}-{count}.log 1"
+            );
+            let script_path = root.join(format!("case-{exit}-{count}.sh"));
+            fs::write(&script_path, command).unwrap();
+            let output = Command::new("bash")
+                .arg(script_path)
+                .env("E2E_ARTIFACT_DIR", &root)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), expected, "{exit}/{count}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_driver_orders_handshake_and_rejects_incomplete_children() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap().keep();
+        let source = include_str!("../../../tests/e2e/test_workflow_happy_path.sh");
+        let driver = source
+            .split_once("send_jsonrpc_session() {\n")
+            .unwrap()
+            .1
+            .split_once("<<'PY'\n")
+            .unwrap()
+            .1
+            .split_once("\nPY\n")
+            .unwrap()
+            .0;
+        let binary = root.join("protocol_fixture.py");
+        // An adversarial protocol peer checks this driver's ordering and
+        // lifecycle. Product conformance still requires the actual am binary.
+        fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+initialized = False
+mode = os.environ['WORKFLOW_DRIVER_MODE']
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'notifications/initialized':
+        initialized = True
+        continue
+    if req['method'] != 'initialize' and not initialized:
+        sys.exit(9)
+    if req['method'] != 'initialize':
+        if mode == 'eof': sys.exit(0)
+        if mode == 'hang': time.sleep(60)
+    response_id = 999 if mode == 'wrong_id' else req['id']
+    print(json.dumps({'jsonrpc':'2.0','id':response_id,'result':{}}), flush=True)
+sys.exit(7 if mode == 'unclean' else 0)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        for mode in ["complete", "eof", "wrong_id", "unclean", "hang"] {
+            let work = root.join(mode);
+            fs::create_dir(&work).unwrap();
+            let timeout = if mode == "hang" { "0.2" } else { "10" };
+            let driver_path = work.join("driver.py");
+            fs::write(&driver_path, driver).unwrap();
+            let output = Command::new("python3")
+                .arg(driver_path)
+                .arg(work.join("mailbox.sqlite3"))
+                .arg(work.join("archive"))
+                .arg(&work)
+                .arg(&binary)
+                .arg(timeout)
+                .args([
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}"#,
+                ])
+                .env("WORKFLOW_DRIVER_MODE", mode)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                mode == "complete",
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let terminal = &records.last().unwrap()["workflow_session"];
+            assert_eq!(terminal["passed"], mode == "complete", "{mode}");
+            if mode == "complete" {
+                assert_eq!(terminal["completed_ids"], serde_json::json!([1, 2]));
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_response_validator_requires_reply_and_terminal_session() {
+        let root = TempDir::new().unwrap().keep();
+        let source = include_str!("../../../tests/e2e/test_workflow_happy_path.sh");
+        let body = source
+            .split_once("is_error_result() {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let command = format!("is_error_result() {{\n{body}\n}}\nis_error_result \"$1\" 2");
+        let script_path = root.join("validator.sh");
+        fs::write(&script_path, command).unwrap();
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
+        let terminal = r#"{"workflow_session":{"passed":true,"completed_ids":[1,2]}}"#;
+        for (payload, expected) in [
+            (format!("{reply}\n{terminal}"), "false"),
+            (reply.to_string(), "true"),
+            (terminal.to_string(), "true"),
+            (format!("{reply}\n{reply}\n{terminal}"), "true"),
+            (
+                format!("{reply}\n{{\"workflow_session\":{{\"passed\":false}}}}"),
+                "true",
+            ),
+            (format!("{reply}\n{{\"workflow_session\":null}}"), "true"),
+            (
+                format!(
+                    "{reply}\n{{\"workflow_session\":{{\"passed\":true,\"completed_ids\":\"12\"}}}}"
+                ),
+                "true",
+            ),
+            (String::new(), "true"),
+        ] {
+            let output = Command::new("bash")
+                .arg(&script_path)
+                .arg(&payload)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
     }
 
     // ── write_dual_mode_step_artifact: pass case ─────────────────────────
@@ -3259,6 +4860,7 @@ exit 1
     #[test]
     fn run_report_exit_code_zero_on_success() {
         let r = RunReport {
+            evidence: None,
             total: 1,
             passed: 1,
             failed: 0,
@@ -3274,6 +4876,7 @@ exit 1
     #[test]
     fn run_report_exit_code_one_on_failure() {
         let r = RunReport {
+            evidence: None,
             total: 2,
             passed: 1,
             failed: 1,

@@ -111,8 +111,8 @@ pub use backpressure::{
     shedding_enabled, should_shed_tool,
 };
 pub use config::{
-    AppEnvironment, AtcWriteMode, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend,
-    canonical_config_env_path, compute_ephemeral_storage_root,
+    AppEnvironment, AtcExecutorMode, AtcWriteMode, Config, InterfaceMode, ProjectIdentityMode,
+    RateLimitBackend, canonical_config_env_path, compute_ephemeral_storage_root,
 };
 pub use diagnostics::{
     ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,
@@ -194,13 +194,18 @@ pub use models::{
     looks_like_program_name, looks_like_unix_username,
 };
 pub use pane_identity::{
-    PaneBindingLiveness, PaneBindingStatus, PaneIdentityRecord, binding_liveness,
+    CallTransport, CallTransportError, DEFAULT_TMUX_PROBE_TIMEOUT, LifecycleAuthPolicy,
+    PaneBindingLiveness, PaneBindingStatus, PaneIdentityRecord, TMUX_PROBE_TIMEOUT_CODE,
+    TMUX_PROBE_TIMEOUT_ENV, TmuxProbeError, TmuxServer, TmuxSocketPathError, binding_liveness,
     binding_liveness_with, canonical_identity_path, cleanup_all_stale_identities,
     cleanup_stale_identities, get_composite_tmux_pane_id, identity_source_category,
     is_agent_pane_command, list_identities, list_identities_with_paths, read_identity_record,
     resolve_identity, resolve_identity_current_pane, resolve_identity_with_binding,
-    resolve_identity_with_optional_pane, resolve_identity_with_path, write_identity,
-    write_identity_current_pane, write_identity_with_optional_pane,
+    resolve_identity_with_binding_on_server, resolve_identity_with_optional_pane,
+    resolve_identity_with_optional_pane_on_server, resolve_identity_with_path,
+    tmux_env_socket_path_validated, validate_tmux_socket_path, write_identity,
+    write_identity_current_pane, write_identity_on_server, write_identity_with_optional_pane,
+    write_identity_with_optional_pane_on_server,
 };
 pub use search_types::{
     DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,

@@ -50,6 +50,14 @@
 //! `thread_provenance`, `missing_archive`, `archive_without_db`) stays
 //! detect-only: it needs operator-supplied truth about which side is
 //! authoritative.
+//!
+//! Every archive mutation resolves its target with the same generation
+//! attribution the detector used (`report.live_generation`): the
+//! current-generation or legacy artifact, never a prior-generation
+//! `id-<id>-g<other>.json` (GH#311). Foreign-generation artifacts are history,
+//! not drift, and are left byte-identical; if the flagged artifact cannot be
+//! identified unambiguously the fixer skips it and the drift stays visible in
+//! the post-fix detection.
 
 #![forbid(unsafe_code)]
 
@@ -255,31 +263,80 @@ fn file_mode(_path: &Path) -> u32 {
     0o644
 }
 
+/// Resolve the archive artifact the parity checker compared for
+/// `(project_slug, reservation_id)` — the current-generation or legacy file,
+/// never a prior-generation (`id-<id>-g<other>.json`) artifact (GH#311).
+///
+/// The checker excludes foreign-generation artifacts from comparison; a fixer
+/// that resolved by the generation-blind `find_reservation_artifact` would
+/// prefer exactly that debris, rewrite history that was never flagged, and
+/// leave the flagged artifact untouched. Returns `None` when the checker's
+/// selection cannot be reproduced safely (unseeded generation with several
+/// stamped candidates) or the artifact vanished — the caller skips explicitly.
+fn locate_flagged_artifact(
+    finding: &ReservationDbArchiveParityFinding,
+    project_slug: &str,
+    reservation_id: i64,
+) -> Option<PathBuf> {
+    let reservation_dir = finding
+        .storage_root
+        .join("projects")
+        .join(project_slug)
+        .join("file_reservations");
+    let located =
+        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact_for_generation(
+            &reservation_dir,
+            reservation_id,
+            finding.report.live_generation.as_deref(),
+        );
+    if located.is_none() {
+        tracing::warn!(
+            project = project_slug,
+            reservation_id,
+            live_generation = finding
+                .report
+                .live_generation
+                .as_deref()
+                .unwrap_or("<unseeded>"),
+            "reservation parity fixer: flagged archive artifact could not be identified unambiguously; skipping"
+        );
+    }
+    located
+}
+
 /// Build the archive-side rewrite for a stale-active artifact: set only its
 /// `released_ts` to the canonical release timestamp, preserving every other
 /// field and the original byte mode. Returns `None` (counted as ambiguous) if
-/// the artifact is unreadable, unparseable, or its `id` does not match — never
-/// fabricate or clobber a mismatched artifact.
+/// the artifact cannot be resolved to the one the checker flagged, is
+/// unreadable, unparseable, or its `id` does not match — never fabricate or
+/// clobber a mismatched artifact.
 fn build_archive_release_rewrite(
-    storage_root: &Path,
+    finding: &ReservationDbArchiveParityFinding,
     project_slug: &str,
     reservation_id: i64,
     released_ts: i64,
 ) -> Option<ArchiveReleaseRewrite> {
-    // Locate the stable artifact by id (generation-stamped or legacy, br-n8qh6).
-    let reservation_dir = storage_root
-        .join("projects")
-        .join(project_slug)
-        .join("file_reservations");
-    let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-        &reservation_dir,
-        reservation_id,
-    )?;
+    let path = locate_flagged_artifact(finding, project_slug, reservation_id)?;
     let raw = std::fs::read_to_string(&path).ok()?;
     let mut json: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let object = json.as_object_mut()?;
     // Defensive: only rewrite when the artifact's own id matches the target.
     if object.get("id").and_then(serde_json::Value::as_i64) != Some(reservation_id) {
+        return None;
+    }
+    // The detector attributes a legacy-named artifact by its embedded
+    // `db_generation` field when the filename carries none; a value foreign to
+    // the live generation makes it prior-generation debris the detector never
+    // compared. Mirror that rule so the fixer cannot rewrite it either (GH#311).
+    let embedded_generation = object
+        .get("db_generation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|generation| !generation.is_empty());
+    if mcp_agent_mail_tools::reservation_parity::is_foreign_generation(
+        finding.report.live_generation.as_deref(),
+        embedded_generation,
+    ) {
         return None;
     }
     object.insert(
@@ -351,7 +408,7 @@ fn build_reconcile_plan(
                 if drift.released_archive != Some(canonical_ts) {
                     // Archive lags → rewrite only its released_ts.
                     match build_archive_release_rewrite(
-                        &finding.storage_root,
+                        finding,
                         &project_slug,
                         reservation_id,
                         canonical_ts,
@@ -469,21 +526,16 @@ pub(crate) fn fix_prepared(
         if example.field != "archive_id_collision" {
             continue;
         }
-        // Locate the stale duplicate artifact (generation-stamped or legacy,
-        // br-n8qh6) under the project slug it lives beneath, by reservation id.
-        let reservation_dir = fresh_finding
-            .storage_root
-            .join("projects")
-            .join(&example.project_slug)
-            .join("file_reservations");
-        // Idempotent: if the duplicate already vanished between detect and fix,
-        // there is nothing to quarantine.
-        let Some(archive_path) =
-            mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-                &reservation_dir,
-                example.reservation_id,
-            )
-        else {
+        // Locate the stale duplicate artifact the checker flagged (current
+        // generation or legacy, br-n8qh6 / GH#311) under the project slug it
+        // lives beneath, by reservation id. Idempotent: if the duplicate
+        // already vanished between detect and fix, there is nothing to
+        // quarantine.
+        let Some(archive_path) = locate_flagged_artifact(
+            &fresh_finding,
+            &example.project_slug,
+            example.reservation_id,
+        ) else {
             actions_skipped += 1;
             continue;
         };
@@ -1059,6 +1111,193 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
             detect(Some(storage_root.path()), std::slice::from_ref(&db_path)).is_empty(),
             "release reconcile must drive drift to 0"
         );
+    }
+
+    // ── GH#311: generation-aware artifact selection ──────────────────────────
+
+    const LIVE_GENERATION: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FOREIGN_GENERATION: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Fixture 3 (DB released / legacy archive still active) plus a
+    /// *prior-generation* artifact sharing the same numeric id that already
+    /// records the release — exactly the shape from GH#311. `db_identity` is
+    /// seeded with `LIVE_GENERATION` so the checker attributes generations.
+    /// Returns `(storage_root, db_path, legacy_path, foreign_path)`.
+    fn materialize_foreign_generation_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let (td, db_path) = materialize_fixture(ARCHIVE_ACTIVE_SQL, ARCHIVE_ACTIVE_JSON, 301);
+        let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&format!(
+            "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), generation_id TEXT NOT NULL);
+             INSERT INTO db_identity (singleton, generation_id) VALUES (0, '{LIVE_GENERATION}');"
+        ))
+        .expect("seed db_identity");
+        drop(conn);
+
+        let reservation_dir = td
+            .path()
+            .join("projects/reservation-regression/file_reservations");
+        let legacy = reservation_dir.join("id-301.json");
+        let foreign = reservation_dir.join(format!("id-301-g{FOREIGN_GENERATION}.json"));
+        let mut foreign_json: serde_json::Value =
+            serde_json::from_str(ARCHIVE_ACTIVE_JSON).expect("fixture json");
+        foreign_json["db_generation"] = serde_json::Value::String(FOREIGN_GENERATION.to_string());
+        // RFC3339 (the archive writer's native form) — a fixer that touched this
+        // file would betray itself by normalizing the representation.
+        foreign_json["released_ts"] = serde_json::Value::String("2023-11-14T22:13:20Z".to_string());
+        std::fs::write(
+            &foreign,
+            serde_json::to_vec_pretty(&foreign_json).expect("serialize"),
+        )
+        .expect("write foreign-generation artifact");
+        (td, db_path, legacy, foreign)
+    }
+
+    #[test]
+    fn detector_reports_live_generation_and_flags_only_the_legacy_artifact() {
+        let (storage_root, db_path, _legacy, _foreign) = materialize_foreign_generation_fixture();
+        let findings = detect(Some(storage_root.path()), std::slice::from_ref(&db_path));
+        assert_eq!(findings.len(), 1);
+        let report = &findings[0].report;
+        assert_eq!(report.live_generation.as_deref(), Some(LIVE_GENERATION));
+        assert_eq!(report.drift.released_ts_mismatches, 1);
+        assert_eq!(report.drift.foreign_generation_artifacts, 1);
+        assert_eq!(
+            report.archive_reservations, 1,
+            "the foreign artifact is excluded from comparison"
+        );
+    }
+
+    #[test]
+    fn fixer_rewrites_the_flagged_legacy_artifact_and_leaves_foreign_generation_bytes_intact() {
+        // GH#311: released live row + stale legacy artifact + foreign-generation
+        // artifact sharing the id. Only the legacy artifact may change; the
+        // foreign bytes must be identical; one pass must reach zero drift.
+        let (storage_root, db_path, legacy, foreign) = materialize_foreign_generation_fixture();
+        let legacy_before = std::fs::read(&legacy).expect("legacy before");
+        let foreign_before = std::fs::read(&foreign).expect("foreign before");
+
+        let finding = detect(Some(storage_root.path()), std::slice::from_ref(&db_path))
+            .pop()
+            .expect("precondition: release drift present");
+        let ctx = collision_ctx(&storage_root, "2026-09-05T00-00-00Z__gh311");
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1, "exactly one archive rewrite");
+        assert_eq!(outcome.actions_skipped, 0, "nothing ambiguous to skip");
+        assert!(outcome.quarantined_paths.is_empty());
+
+        let legacy_after = std::fs::read(&legacy).expect("legacy after");
+        assert_ne!(
+            legacy_before, legacy_after,
+            "the flagged legacy artifact must change"
+        );
+        let legacy_json: serde_json::Value =
+            serde_json::from_slice(&legacy_after).expect("legacy json");
+        assert_eq!(
+            legacy_json["released_ts"],
+            serde_json::json!(1_700_003_010_000_000_i64)
+        );
+
+        let foreign_after = std::fs::read(&foreign).expect("foreign after");
+        assert_eq!(
+            foreign_before, foreign_after,
+            "prior-generation history must be byte-identical"
+        );
+
+        let after = detect(Some(storage_root.path()), std::slice::from_ref(&db_path));
+        assert!(
+            after.is_empty(),
+            "second detector pass must be clean: {after:?}"
+        );
+    }
+
+    #[test]
+    fn archive_rewrite_refuses_legacy_named_artifact_with_foreign_embedded_generation() {
+        // The detector attributes a legacy-named file by its embedded
+        // `db_generation`; when that token is foreign the file is debris the
+        // detector never compared. The rewrite builder must apply the same rule
+        // (this shape can only reach the fixer if the file changed between the
+        // fresh detection and the rewrite, so it is exercised directly).
+        let (storage_root, db_path, legacy, _foreign) = materialize_foreign_generation_fixture();
+        let finding = detect(Some(storage_root.path()), std::slice::from_ref(&db_path))
+            .pop()
+            .expect("precondition: release drift present");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy).expect("legacy")).expect("json");
+        json["db_generation"] = serde_json::Value::String(FOREIGN_GENERATION.to_string());
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&json).expect("serialize"),
+        )
+        .expect("rewrite legacy with a foreign embedded generation");
+
+        assert!(
+            build_archive_release_rewrite(
+                &finding,
+                "reservation-regression",
+                301,
+                1_700_003_010_000_000
+            )
+            .is_none(),
+            "foreign embedded generation must not be rewritten"
+        );
+
+        // Same file stamped with the LIVE generation is a legitimate target.
+        json["db_generation"] = serde_json::Value::String(LIVE_GENERATION.to_string());
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&json).expect("serialize"),
+        )
+        .expect("rewrite legacy with the live embedded generation");
+        let rewrite = build_archive_release_rewrite(
+            &finding,
+            "reservation-regression",
+            301,
+            1_700_003_010_000_000,
+        )
+        .expect("live embedded generation is rewritable");
+        assert_eq!(rewrite.path, legacy);
+    }
+
+    #[test]
+    fn fixer_skips_explicitly_when_the_flagged_artifact_cannot_be_identified() {
+        // Unseeded DB (no `db_identity`) with TWO stamped stale-active artifacts
+        // for the id: the checker admits both and compares whichever `read_dir`
+        // yields first, so the flagged file cannot be reproduced safely. The
+        // fixer must skip explicitly and mutate nothing, rather than guess.
+        let (storage_root, db_path) =
+            materialize_fixture(ARCHIVE_ACTIVE_SQL, ARCHIVE_ACTIVE_JSON, 301);
+        let reservation_dir = storage_root
+            .path()
+            .join("projects/reservation-regression/file_reservations");
+        let stamped_a = reservation_dir.join(format!("id-301-g{LIVE_GENERATION}.json"));
+        let stamped_b = reservation_dir.join(format!("id-301-g{FOREIGN_GENERATION}.json"));
+        std::fs::write(&stamped_a, ARCHIVE_ACTIVE_JSON).expect("stamped a");
+        std::fs::write(&stamped_b, ARCHIVE_ACTIVE_JSON).expect("stamped b");
+        let snapshot = |path: &Path| std::fs::read(path).expect("read artifact");
+        let before = [
+            snapshot(&reservation_dir.join("id-301.json")),
+            snapshot(&stamped_a),
+            snapshot(&stamped_b),
+        ];
+
+        let finding = detect(Some(storage_root.path()), std::slice::from_ref(&db_path))
+            .pop()
+            .expect("precondition: release drift present");
+        assert_eq!(finding.report.live_generation, None, "unseeded fixture");
+        assert_eq!(finding.report.drift.released_ts_mismatches, 1);
+
+        let ctx = collision_ctx(&storage_root, "2026-09-05T00-00-01Z__gh311-skip");
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0, "nothing may be mutated");
+        assert_eq!(outcome.actions_skipped, 1, "the skip must be reported");
+        let after = [
+            snapshot(&reservation_dir.join("id-301.json")),
+            snapshot(&stamped_a),
+            snapshot(&stamped_b),
+        ];
+        assert_eq!(before, after, "no artifact may change on an ambiguous skip");
     }
 
     #[test]

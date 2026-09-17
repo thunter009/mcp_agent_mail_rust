@@ -72,7 +72,7 @@ e2e_run_cargo() {
         return $?
     fi
 
-    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ]; then
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
         e2e_log "ERROR: rch is required but not available in PATH."
         return 127
     fi
@@ -93,6 +93,11 @@ e2e_sqlite3_compat_bin() {
     if [ -x "${bin}" ]; then
         printf '%s\n' "${bin}"
         return 0
+    fi
+
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
+        e2e_log "ERROR: sqlite3 and the prepared test_db binary are unavailable; remote-required mode forbids a local helper build."
+        return 127
     fi
 
     # test_db is executed by this local shell as a sqlite3 compatibility shim.
@@ -172,7 +177,7 @@ else
 fi
 
 # Artifact directory for this run
-E2E_ARTIFACT_DIR="${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}"
+E2E_ARTIFACT_DIR="${AM_E2E_ARTIFACT_DIR:-${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}}"
 
 # Run timing (used for artifact bundle metadata/metrics)
 E2E_RUN_ENDED_AT=""
@@ -496,6 +501,34 @@ e2e_assert_exit_code() {
 # ---------------------------------------------------------------------------
 # Temp workspace management
 # ---------------------------------------------------------------------------
+
+# Assert membership without replacing an accepted nonzero exit with a fake zero.
+# Arguments: label, observed exit code, one or more allowed exit codes.
+e2e_assert_exit_code_in() {
+    local label="$1" actual="$2"
+    shift 2
+    local code matched=0 valid=1 separator=""
+    local _E2E_EXIT_EXPECTED_JSON="[" _E2E_EXIT_ACTUAL="$actual"
+    [ "$#" -gt 0 ] || valid=0
+    for code in "$@"; do
+        _E2E_EXIT_EXPECTED_JSON+="${separator}\"$(_e2e_json_escape "$code")\""
+        separator=","
+        if [[ ! "$code" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$code" -gt 255 ]; then
+            valid=0
+        fi
+        [ "$actual" != "$code" ] || matched=1
+    done
+    _E2E_EXIT_EXPECTED_JSON+="]"
+    if [[ ! "$actual" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$actual" -gt 255 ]; then
+        valid=0
+    fi
+    local message="$label (expected exits={${*:-empty}}, actual exit=$actual)"
+    if [ "$valid" -eq 1 ] && [ "$matched" -eq 1 ]; then
+        e2e_pass "$message"
+    else
+        e2e_fail "$message; exit not allowed or invalid exit-code set"
+    fi
+}
 
 # Create a temp directory and register it for cleanup
 e2e_mktemp() {
@@ -1295,6 +1328,9 @@ _e2e_trace_event() {
 
     # Build optional v2 fields (br-1xt0m.1.13.13)
     local v2_fields=""
+    if [ -n "${_E2E_EXIT_EXPECTED_JSON:-}" ]; then
+        v2_fields="${v2_fields},\"expected_exit_codes\":${_E2E_EXIT_EXPECTED_JSON},\"actual_exit_code\":\"$(_e2e_json_escape "$_E2E_EXIT_ACTUAL")\""
+    fi
     if [ -n "$assertion_id" ]; then
         v2_fields="${v2_fields},\"assertion_id\":\"$(_e2e_json_escape "$assertion_id")\""
     fi
@@ -2732,6 +2768,11 @@ e2e_ensure_binary() {
     if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
         _e2e_build_binary "${bin_name}"
+    fi
+
+    if [ ! -x "$bin_path" ] && { [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; }; then
+        e2e_log "ERROR: remote build did not provide ${bin_name} at ${bin_path}; remote-required mode forbids a fallback binary or local retry."
+        return 1
     fi
 
     # Some environments (including remote runners) may ignore/override CARGO_TARGET_DIR.

@@ -628,7 +628,7 @@ fn stress_commit_coalescer_batching_100_writes() {
                 // Write a file to disk
                 let file_name = format!("stress-file-{i}.txt");
                 let file_path = archive_root.join(&file_name);
-                let rel_path = format!("projects/coalesce-stress/{}", file_name);
+                let rel_path = format!("projects/coalesce-stress/{file_name}");
 
                 if let Err(e) = std::fs::write(&file_path, format!("content-{i}")) {
                     eprintln!("  file write error {i}: {e}");
@@ -666,17 +666,15 @@ fn stress_commit_coalescer_batching_100_writes() {
         max_archive_lag_us,
         adaptive_target_ms,
         adaptive_effective_ms,
-    ) = repo_stats
-        .map(|s| {
-            (
-                s.enqueued_total,
-                s.commits_total,
-                s.max_archive_lag_us,
-                s.adaptive_flush_target_ms,
-                s.adaptive_flush_effective_ms,
-            )
-        })
-        .unwrap_or((0, 0, 0, 0, 0));
+    ) = repo_stats.map_or((0, 0, 0, 0, 0), |s| {
+        (
+            s.enqueued_total,
+            s.commits_total,
+            s.max_archive_lag_us,
+            s.adaptive_flush_target_ms,
+            s.adaptive_flush_effective_ms,
+        )
+    });
 
     eprintln!("\n=== stress_commit_coalescer_batching_100_writes ===");
     eprintln!("  Writes enqueued: {n_writes}");
@@ -1590,7 +1588,7 @@ fn stress_sustained_mixed_workload_30s() {
     );
     eprintln!("  Total ops: {total}, Success: {total_ok}, Errors: {total_err}");
     eprintln!("  Actual RPS: {:.0}", total as f64 / elapsed.as_secs_f64());
-    eprintln!("  RSS: {} KB", rss);
+    eprintln!("  RSS: {rss} KB");
     report.print("Mixed workload");
 
     let wbq = wbq_stats();
@@ -1721,7 +1719,7 @@ fn stress_agent_registration_thundering_herd() {
     eprintln!("  Threads: {n_threads}, Agent: {agent_name_str}");
     eprintln!("  IDs returned: {}, unique: {}", ids.len(), {
         let mut sorted = ids.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         sorted.dedup();
         sorted.len()
     });
@@ -2030,8 +2028,7 @@ fn stress_150_agent_message_storm() {
                         let thread_id = format!("s150-{i}-{msg_idx}");
                         let subject = format!("Storm msg {msg_idx} from agent {i}");
                         let body = format!(
-                            "Message body from agent {} to agent {} number {}",
-                            i, recipient_idx, msg_idx
+                            "Message body from agent {i} to agent {recipient_idx} number {msg_idx}"
                         );
 
                         // DB write with retry
@@ -3505,8 +3502,7 @@ fn stress_sustained_100_agents_60s() {
     let rss_growth_kb = rss_after.saturating_sub(rss_before);
     assert!(
         rss_growth_kb < 500_000,
-        "RSS grew by {} KB — possible memory leak",
-        rss_growth_kb,
+        "RSS grew by {rss_growth_kb} KB — possible memory leak",
     );
 
     // Check for latency degradation: last interval avg should not be >3x first interval

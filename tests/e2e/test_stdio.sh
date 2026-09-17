@@ -107,6 +107,38 @@ out_file.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encodi
 PY
 }
 
+# Keep stdin open until a request receives its response. Closing it immediately
+# cancels queued work; fixed sleeps race against fresh-database startup.
+wait_stdio_response() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+output = pathlib.Path(sys.argv[1])
+try:
+    request = json.loads(sys.argv[2])
+except json.JSONDecodeError:
+    request = {"id": None}
+if "id" not in request:
+    sys.exit(0)
+deadline = time.monotonic() + float(sys.argv[3])
+while time.monotonic() < deadline:
+    if output.exists():
+        for line in output.read_text().splitlines():
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") == request["id"] and ("result" in response or "error" in response):
+                sys.exit(0)
+    time.sleep(0.02)
+print("Timed out waiting for stdio response", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
 # Helper: send a JSON-RPC request to the server via stdin and capture the response.
 # Uses a FIFO and background process. Each call starts a fresh server because
 # the stdio transport doesn't support multiplexing easily in bash.
@@ -144,18 +176,20 @@ send_jsonrpc() {
     # Give server a moment to start
     sleep 0.3
 
-    # Send the request (with a newline) and close the FIFO
-    echo "$request" > "$fifo" &
+    # Complete the request/response exchange before closing stdin.
+    {
+        echo "$request"
+        wait_stdio_response "$response_raw_file" "$request" "$timeout_s"
+    } > "$fifo" &
     local write_pid=$!
 
-    # Wait for response with timeout
+    # Wait for process completion, not merely the first response. A parse-error
+    # response must not hide a shutdown hang or a subsequent crash.
     local deadline_ms now_ms
     deadline_ms=$((start_ms + timeout_s * 1000))
     local timed_out=false
     while true; do
-        if [ -s "$response_raw_file" ]; then
-            # Got some output, wait a tiny bit more for it to complete
-            sleep 0.2
+        if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
         now_ms="$(_e2e_now_ms)"
@@ -169,9 +203,9 @@ send_jsonrpc() {
     # Clean up: close the FIFO to signal EOF to server
     wait "$write_pid" 2>/dev/null || true
 
-    # Give server a moment to exit
-    sleep 0.3
-    kill "$srv_pid" 2>/dev/null || true
+    if [ "$timed_out" = true ]; then
+        kill "$srv_pid" 2>/dev/null || true
+    fi
     local srv_exit=0
     if wait "$srv_pid" 2>/dev/null; then
         srv_exit=0
@@ -237,18 +271,19 @@ send_jsonrpc_session() {
 
     sleep 0.3
 
-    # Send all requests, with small delays between them
+    local timeout_s="${STDIO_SESSION_TIMEOUT_S:-30}"
+    # Wait for each response before the next request, including initialize.
+    # Notifications have no response and can proceed immediately.
     {
         for req in "${requests[@]}"; do
             echo "$req"
-            sleep 0.3
+            wait_stdio_response "$response_raw_file" "$req" "$timeout_s" || break
         done
         # Close stdin to signal server to exit
     } > "$fifo" &
     local write_pid=$!
 
     # Wait for all responses
-    local timeout_s="${STDIO_SESSION_TIMEOUT_S:-30}"
     local deadline_ms now_ms
     deadline_ms=$((start_ms + timeout_s * 1000))
     local timed_out=false
@@ -306,6 +341,7 @@ send_jsonrpc_session() {
 e2e_case_banner "Server responds to initialize"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}'
+INITIALIZED_NOTIFICATION='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 INIT_RESP="$(send_jsonrpc "$STDIO_DB" "case_01_initialize" "$INIT_REQ")"
 e2e_save_artifact "case_01_init_response.txt" "$INIT_RESP"
@@ -346,11 +382,88 @@ fi
 # ===========================================================================
 # Case 2: Server lists tools
 # ===========================================================================
+e2e_case_banner "Initialize proposals negotiate and retain usable stdio sessions"
+if python3 - "$WORK" "$E2E_ARTIFACT_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+
+work, artifacts = map(Path, sys.argv[1:])
+receipts = []
+scenarios = [(version, False) for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01", 2025]]
+scenarios.append(("2025-06-18", True))
+for index, (proposal, mixed_era) in enumerate(scenarios):
+    case = work / f"negotiation-{index}"
+    case.mkdir()
+    env = dict(os.environ, DATABASE_URL=f"sqlite://{case / 'mail.sqlite3'}",
+               STORAGE_ROOT=str(case / "archive"), RUST_LOG="error")
+    stderr_path = artifacts / f"negotiation-{index}.stderr.txt"
+    receipt = {"proposal": proposal, "mixed_era": mixed_era, "responses": [], "stderr": str(stderr_path)}
+    receipts.append(receipt)
+    with stderr_path.open("w") as stderr:
+        process = subprocess.Popen(["am", "serve-stdio"], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=stderr, env=env, text=True)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def send(message):
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+
+        def response(request_id):
+            assert selector.select(30), f"{proposal}: response timeout"
+            line = process.stdout.readline()
+            assert line, f"{proposal}: server exited before response"
+            result = json.loads(line)
+            receipt["responses"].append(result)
+            assert result.get("id") == request_id, result
+            return result
+
+        try:
+            send({"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {
+                "protocolVersion": proposal, "capabilities": {},
+                "clientInfo": {"name": "e2e-negotiation", "version": "1.0"}}})
+            initialized = response(101)
+            if isinstance(proposal, str):
+                assert "error" not in initialized, initialized
+                assert initialized["result"]["protocolVersion"] == "2024-11-05", initialized
+                send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                send({"jsonrpc": "2.0", "id": 102, "method": "tools/list", "params": {}})
+                catalog = response(102)
+                assert "error" not in catalog, catalog
+                assert any(tool["name"] == "send_message" for tool in catalog["result"]["tools"])
+                if mixed_era:
+                    send({"jsonrpc": "2.0", "id": 103, "method": "tools/list", "params": {
+                        "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}})
+                    rejected = response(103)
+                    assert rejected["error"]["code"] == -32600, rejected
+            else:
+                assert initialized["error"]["code"] == -32600, initialized
+            process.stdin.close()
+            receipt["exit_code"] = process.wait(timeout=30)
+            assert receipt["exit_code"] == (1 if mixed_era else 0), receipt
+        finally:
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            receipt.setdefault("exit_code", process.returncode)
+            (artifacts / "negotiation-receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+PY
+then
+    e2e_pass "proposal negotiation, initialized session, tools and malformed/mixed-era controls"
+else
+    e2e_fail "stdio proposal negotiation regression (see negotiation receipts and stderr)"
+fi
+
 e2e_case_banner "Server lists tools via tools/list"
 
 TOOLS_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
-TOOLS_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_02_tools_list" "$INIT_REQ" "$TOOLS_REQ")"
+TOOLS_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_02_tools_list" "$INIT_REQ" "$INITIALIZED_NOTIFICATION" "$TOOLS_REQ")"
 e2e_save_artifact "case_02_tools_response.txt" "$TOOLS_RESP"
 
 # Parse last JSON-RPC response (tools/list)
@@ -411,7 +524,7 @@ e2e_case_banner "Server executes ensure_project tool call"
 
 TOOL_CALL_REQ='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e_stdio_test_project"}}}'
 
-TOOL_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_03_ensure_project" "$INIT_REQ" "$TOOL_CALL_REQ")"
+TOOL_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_03_ensure_project" "$INIT_REQ" "$INITIALIZED_NOTIFICATION" "$TOOL_CALL_REQ")"
 e2e_save_artifact "case_03_tool_call_response.txt" "$TOOL_RESP"
 
 # Parse the tool call response
@@ -455,31 +568,25 @@ INVALID_REQ='{"this is not valid json'
 INVALID_RESP="$(send_jsonrpc "$STDIO_DB" "case_04_invalid_json" "$INVALID_REQ" 5)"
 e2e_save_artifact "case_04_invalid_json_response.txt" "$INVALID_RESP"
 
-# The server should either return a JSON-RPC error or handle gracefully
-if [ -n "$INVALID_RESP" ]; then
-    if echo "$INVALID_RESP" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-        if 'error' in d:
-            print('ERROR_RESPONSE')
-            sys.exit(0)
-    except json.JSONDecodeError:
-        pass
-print('OTHER')
-sys.exit(0)
-" 2>/dev/null | grep -q "ERROR_RESPONSE"; then
-        e2e_pass "server returned JSON-RPC error for invalid JSON"
-    else
-        e2e_pass "server handled invalid JSON without crash"
-    fi
+# Malformed input must produce a parse error and a deliberate failure exit.
+# Empty output, an unrelated error, a signal, or a timeout is not success.
+if python3 - "${E2E_ARTIFACT_DIR}/case_04_invalid_json" <<'PY'
+import json
+import pathlib
+import sys
+
+case = pathlib.Path(sys.argv[1])
+headers = dict(line.split("=", 1) for line in (case / "headers.txt").read_text().splitlines())
+responses = [json.loads(line) for line in (case / "response.raw.txt").read_text().splitlines() if line.strip()]
+assert headers["timed_out"] == "false", headers
+assert headers["server_exit_code"] == "1", headers
+assert len(responses) == 1, responses
+assert responses[0].get("error", {}).get("code") == -32700, responses
+PY
+then
+    e2e_pass "invalid JSON returned parse error and deliberate failure exit"
 else
-    # Empty response is also acceptable (server may just close)
-    e2e_pass "server handled invalid JSON (no response, clean exit)"
+    e2e_fail "invalid JSON response or process exit violated the transport contract"
 fi
 
 # ===========================================================================
@@ -525,7 +632,11 @@ if ! kill -0 "$SRV_PID" 2>/dev/null; then
     CASE_05_TIMED_OUT=false
     wait "$SRV_PID" 2>/dev/null
     EXIT_CODE=$?
-    e2e_pass "server exited after stdin close (exit=$EXIT_CODE, wait_loops=${WAIT_COUNT})"
+    if [ "$EXIT_CODE" -eq 0 ]; then
+        e2e_pass "server exited cleanly after stdin close (wait_loops=${WAIT_COUNT})"
+    else
+        e2e_fail "server failed after stdin close (exit=$EXIT_CODE)"
+    fi
 else
     kill "$SRV_PID" 2>/dev/null
     wait "$SRV_PID" 2>/dev/null
@@ -568,6 +679,7 @@ FR_DB="${WORK}/force_release_test.sqlite3"
 SETUP_REQS=(
     # Initialize
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
+    "$INITIALIZED_NOTIFICATION"
     # Create project
     '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e_force_release_project"}}}'
     # Register AgentA (will hold the reservation)
@@ -618,6 +730,7 @@ e2e_pass "setup: made GreenLake stale (last_active_ts set to 2h ago)"
 # Step 3: BluePeak force-releases GreenLake's reservation
 FORCE_REQS=(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
+    "$INITIALIZED_NOTIFICATION"
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"/tmp/e2e_force_release_project\",\"agent_name\":\"BluePeak\",\"file_reservation_id\":$RES_ID,\"note\":\"e2e test force release\",\"notify_previous\":true}}}"
 )
 
@@ -675,13 +788,13 @@ fi
 if echo "$FORCE_RESULT" | grep -q "notified=True"; then
     e2e_pass "force-release sent notification to previous holder"
 else
-    # Notification may fail if no recipients set up - still acceptable
-    e2e_pass "force-release completed (notification may vary)"
+    e2e_fail "force-release did not notify the registered previous holder"
 fi
 
 # Step 4: Verify force-release error path (non-existent reservation)
 ERROR_REQS=(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
+    "$INITIALIZED_NOTIFICATION"
     '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"force_release_file_reservation","arguments":{"project_key":"/tmp/e2e_force_release_project","agent_name":"BluePeak","file_reservation_id":99999}}}'
 )
 

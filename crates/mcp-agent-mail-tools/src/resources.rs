@@ -459,6 +459,100 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     params
 }
 
+/// The `?{query}` aliases of the static tooling/config resources document a
+/// single parameter, `format`, and only `json` is produced. Refuse anything
+/// else instead of silently discarding it, so a caller who passes
+/// `?project=` or `?format=yaml` learns the parameter did nothing.
+/// The metrics aliases have always accepted `?window=<seconds>` alongside
+/// `format=json`. The counters are cumulative since process start, so a
+/// window cannot be applied; instead of dropping the parameter silently the
+/// response reports it back with `window_applied: false`.
+fn metrics_query_window(resource: &str, query: &str) -> McpResult<Option<u64>> {
+    let params = parse_query(query);
+    let mut window = None;
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("{resource}: unsupported format {value:?}; only json is available"),
+                ));
+            }
+            "window" => {
+                window = Some(value.trim().parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        format!("{resource}: window must be a positive integer number of seconds, got {value:?}"),
+                    )
+                })?);
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "{resource} does not accept query parameter {other:?}; supported: window, format"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(window)
+}
+
+fn annotate_unapplied_metrics_window(raw: &str, window_seconds: Option<u64>) -> McpResult<String> {
+    let Some(window_seconds) = window_seconds else {
+        return Ok(raw.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "window_seconds".to_string(),
+            serde_json::json!(window_seconds),
+        );
+        object.insert("window_applied".to_string(), serde_json::json!(false));
+        object.insert(
+            "window_note".to_string(),
+            serde_json::json!(
+                "counters are cumulative since process start; windowed metrics are not implemented, use resource://tooling/recent/<window_seconds> for recent calls"
+            ),
+        );
+    }
+    serde_json::to_string(&value)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+fn reject_unsupported_query(resource: &str, query: &str) -> McpResult<()> {
+    let params = parse_query(query);
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("{resource}: unsupported format {value:?}; only json is available"),
+                ));
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "{resource} does not accept query parameter {other:?}; only format=json is supported"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn percent_decode_path_component(input: &str) -> String {
     percent_decode_component(input, false)
 }
@@ -706,7 +800,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     description = "Inspect the server's current environment and HTTP settings.\n\nWhen to use\n-----------\n- Debugging client connection issues (wrong host/port/path).\n- Verifying which environment (dev/stage/prod) the server is running in.\n\nNotes\n-----\n- This surfaces configuration only; it does not perform live health checks.\n\nReturns\n-------\ndict\n    {\n      \"environment\": str,\n      \"database_url\": str,\n      \"http\": { \"host\": str, \"port\": int, \"path\": str }\n    }\n\nExample (JSON-RPC)\n------------------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://config/environment\"}}\n```"
 )]
 pub fn config_environment_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://config/environment", &query)?;
     config_environment(ctx)
 }
 
@@ -1231,6 +1325,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "mark_all_read".to_string(),
+                    summary: "Bulk-mark an agent's unread project inbox read in bounded batches (GH#273).".to_string(),
+                    use_when: "Clearing a departed agent's backlog or draining aged mail without a browser.".to_string(),
+                    related: vec!["mark_message_read".to_string(), "fetch_inbox".to_string()],
+                    expected_frequency: "Occasional operator/coordinator cleanup.".to_string(),
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Drain backlog".to_string(), sample: "mark_all_read(project_key='backend', agent_name='BlueLake', older_than_days=7)".to_string() }],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "acknowledge_message".to_string(),
                     summary: "Set read_ts and ack_ts so senders know action items landed.".to_string(),
                     use_when: "Responding to ack_required messages.".to_string(),
@@ -1657,7 +1762,7 @@ pub fn tooling_directory(_ctx: &McpContext) -> McpResult<String> {
     description = "Provide a clustered view of exposed MCP tools to combat option overload.\n\nThe directory groups tools by workflow, outlines primary use cases,\nhighlights nearby alternatives, and shares starter playbooks so agents\ncan focus on the verbs relevant to their immediate task."
 )]
 pub fn tooling_directory_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/directory", &query)?;
     tooling_directory(ctx)
 }
 
@@ -1804,8 +1909,58 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose JSON-like parameter schemas for tools/macros to prevent drift.\n\nThis is a lightweight, hand-maintained view focusing on the most error-prone\nparameters and accepted aliases to guide clients."
 )]
 pub fn tooling_schemas_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
-    tooling_schemas(ctx)
+    let params = parse_query(&query);
+    let mut cluster: Option<String> = None;
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = params[key].as_str();
+        match key.as_str() {
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/schemas: unsupported format {value:?}; only json is available"
+                    ),
+                ));
+            }
+            "cluster" if !value.trim().is_empty() => cluster = Some(value.trim().to_string()),
+            "cluster" => {}
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/schemas does not accept query parameter {other:?}; supported: cluster, format"
+                    ),
+                ));
+            }
+        }
+    }
+    let raw = tooling_schemas(ctx)?;
+    let Some(cluster) = cluster else {
+        return Ok(raw);
+    };
+    let mut known_clusters: Vec<&'static str> =
+        crate::TOOL_CLUSTER_MAP.iter().map(|(_, c)| *c).collect();
+    known_clusters.sort_unstable();
+    known_clusters.dedup();
+    if !known_clusters.contains(&cluster.as_str()) {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!(
+                "resource://tooling/schemas: unknown cluster {cluster:?}; known clusters: {}",
+                known_clusters.join(", ")
+            ),
+        ));
+    }
+    let mut response: ToolSchemasResponse = serde_json::from_str(&raw)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    response
+        .tools
+        .retain(|name, _| crate::tool_cluster(name) == Some(cluster.as_str()));
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 /// Tool metrics entry
@@ -1822,6 +1977,12 @@ pub struct ToolMetricsEntry {
     pub cluster: String,
     pub capabilities: Vec<String>,
     pub complexity: String,
+    /// Per-tool latency statistics (avg/min/max/p50/p95/p99 in ms). `None`
+    /// when the tool has recorded no latency sample. Additive (br-4myjj):
+    /// omitted from the JSON when absent, so consumers and fixtures written
+    /// before this field existed keep matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<crate::metrics::LatencySnapshot>,
 }
 
 /// Tool metrics response
@@ -1853,6 +2014,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
             cluster: e.cluster,
             capabilities: e.capabilities,
             complexity: e.complexity,
+            latency: e.latency,
         })
         .collect();
 
@@ -1876,8 +2038,9 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
     description = "Expose aggregated tool call/error counts for analysis."
 )]
 pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
-    tooling_metrics(ctx)
+    let window_seconds = metrics_query_window("resource://tooling/metrics", &query)?;
+    let raw = tooling_metrics(ctx)?;
+    annotate_unapplied_metrics_window(&raw, window_seconds)
 }
 
 /// Core system metrics response.
@@ -1924,8 +2087,9 @@ pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
     description = "Core system metrics (HTTP/DB/Storage) (with query)"
 )]
 pub fn tooling_metrics_core_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
-    tooling_metrics_core(ctx)
+    let window_seconds = metrics_query_window("resource://tooling/metrics_core", &query)?;
+    let raw = tooling_metrics_core(ctx)?;
+    annotate_unapplied_metrics_window(&raw, window_seconds)
 }
 
 /// Get a comprehensive diagnostic report combining all system health metrics.
@@ -1956,7 +2120,7 @@ pub fn tooling_diagnostics(_ctx: &McpContext) -> McpResult<String> {
     description = "Comprehensive diagnostic report with health metrics and recommendations (with query)"
 )]
 pub fn tooling_diagnostics_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/diagnostics", &query)?;
     tooling_diagnostics(ctx)
 }
 
@@ -2093,7 +2257,7 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
     description = "Return lock metadata from the shared archive storage."
 )]
 pub fn tooling_locks_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
+    reject_unsupported_query("resource://tooling/locks", &query)?;
     tooling_locks(ctx)
 }
 
@@ -2130,11 +2294,14 @@ pub fn tooling_capabilities(_ctx: &McpContext, agent: String) -> McpResult<Strin
 /// Recent tool activity entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolingRecentEntry {
+    /// RFC 3339 time at which the call finished.
     pub timestamp: Option<String>,
     pub tool: String,
     pub project: String,
     pub agent: String,
     pub cluster: String,
+    pub latency_ms: u64,
+    pub outcome: crate::metrics::RecentToolCallOutcome,
 }
 
 /// Recent tool activity snapshot
@@ -2146,31 +2313,131 @@ pub struct ToolingRecentSnapshot {
     pub entries: Vec<ToolingRecentEntry>,
 }
 
+/// RFC 3339 rendering of a microsecond Unix timestamp, without a lossy
+/// float round trip.
+fn micros_to_rfc3339(micros: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(micros).map(|dt| dt.to_rfc3339())
+}
+
+/// Longest window the recent-activity resource accepts (7 days).
+const TOOLING_RECENT_MAX_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Default and hard cap on entries returned per read.
+const TOOLING_RECENT_DEFAULT_LIMIT: usize = 100;
+const TOOLING_RECENT_MAX_LIMIT: usize = crate::metrics::RECENT_TOOL_CALL_CAPACITY;
+
 /// Get recent tool activity within a time window.
+///
+/// Reads the server's bounded in-memory ring of finished tool calls (the
+/// dispatch wrapper records every call with its `project_key` /
+/// `agent_name` arguments). The ring holds the last
+/// [`crate::metrics::RECENT_TOOL_CALL_CAPACITY`] calls of this process only;
+/// it is not persisted across restarts. Query parameters: `agent` and
+/// `project` filter by exact argument value, `limit` caps the entry count
+/// (default 100), `format=json` is accepted as a no-op; any other parameter
+/// is refused.
 #[resource(
     uri = "resource://tooling/recent/{window_seconds}",
     description = "Recent tool activity"
 )]
-#[allow(clippy::too_many_lines)]
 pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<String> {
     let config = &Config::get();
     let (window_seconds_str, query) = split_param_and_query(&window_seconds);
-    let window_seconds: u64 = window_seconds_str.parse().unwrap_or(0);
-    let agent = query.get("agent").cloned();
-    let project = query.get("project").cloned();
+    let window_seconds: u64 = window_seconds_str
+        .trim()
+        .parse()
+        .ok()
+        .filter(|seconds| (1..=TOOLING_RECENT_MAX_WINDOW_SECONDS).contains(seconds))
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!(
+                    "resource://tooling/recent/{{window_seconds}}: window_seconds must be an integer between 1 and {TOOLING_RECENT_MAX_WINDOW_SECONDS}, got {window_seconds_str:?}"
+                ),
+            )
+        })?;
 
-    // Per-tool activity tracking is not yet implemented; return real data only.
-    // Previously returned hardcoded static entries which misled consumers.
-    let _ = (agent, project, config);
-    let mut entries: Vec<ToolingRecentEntry> = vec![];
-
-    if config.tool_filter.enabled {
-        entries.retain(|entry| tool_filter_allows(config, &entry.tool));
+    let mut agent = None;
+    let mut project = None;
+    let mut limit = TOOLING_RECENT_DEFAULT_LIMIT;
+    let mut keys: Vec<&String> = query.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = query[key].as_str();
+        match key.as_str() {
+            "agent" if !value.trim().is_empty() => agent = Some(value.trim().to_string()),
+            "project" if !value.trim().is_empty() => project = Some(value.trim().to_string()),
+            "agent" | "project" => {}
+            "limit" => {
+                limit = value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=TOOLING_RECENT_MAX_LIMIT).contains(n))
+                    .ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!(
+                                "resource://tooling/recent: limit must be an integer between 1 and {TOOLING_RECENT_MAX_LIMIT}, got {value:?}"
+                            ),
+                        )
+                    })?;
+            }
+            "format" if value.is_empty() || value.eq_ignore_ascii_case("json") => {}
+            "format" => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/recent: unsupported format {value:?}; only json is available"
+                    ),
+                ));
+            }
+            other => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!(
+                        "resource://tooling/recent does not accept query parameter {other:?}; supported: agent, project, limit, format"
+                    ),
+                ));
+            }
+        }
     }
+
+    let now_micros = mcp_agent_mail_core::now_micros();
+    let cutoff_micros = now_micros.saturating_sub(
+        i64::try_from(window_seconds)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000),
+    );
+    let entries: Vec<ToolingRecentEntry> = crate::metrics::recent_calls_since(cutoff_micros)
+        .into_iter()
+        .filter(|call| {
+            agent
+                .as_deref()
+                .is_none_or(|wanted| call.agent.as_deref() == Some(wanted))
+        })
+        .filter(|call| {
+            project
+                .as_deref()
+                .is_none_or(|wanted| call.project.as_deref() == Some(wanted))
+        })
+        .filter(|call| !config.tool_filter.enabled || tool_filter_allows(config, &call.tool))
+        .take(limit)
+        .map(|call| ToolingRecentEntry {
+            timestamp: micros_to_rfc3339(call.finished_at_micros),
+            cluster: crate::tool_cluster(&call.tool)
+                .unwrap_or("unknown")
+                .to_string(),
+            tool: call.tool,
+            project: call.project.unwrap_or_default(),
+            agent: call.agent.unwrap_or_default(),
+            latency_ms: call.latency_us / 1000,
+            outcome: call.outcome,
+        })
+        .collect();
 
     let count = entries.len();
     let snapshot = ToolingRecentSnapshot {
-        generated_at: None,
+        generated_at: micros_to_rfc3339(now_micros),
         window_seconds,
         count,
         entries,
@@ -4897,11 +5164,13 @@ mod resource_shape_tests {
         F: FnOnce(Cx) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx))
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs resource test context");
+            f(cx).await
+        })
     }
 
     fn write_archive_ahead_files() -> (PathBuf, PathBuf) {
@@ -5463,6 +5732,71 @@ mod resource_shape_tests {
         assert_eq!(outbox_value["agent"], fixture.sender_name);
     }
 
+    /// br-4myjj: `resource://tooling/metrics` carries per-tool latency so a
+    /// CLI reading the daemon's counters can report avg/p95/p99 without a
+    /// second round-trip. Tools without samples omit the key (legacy shape).
+    #[test]
+    fn tooling_metrics_entries_carry_latency_when_recorded() {
+        let _metrics_guard = crate::metrics::tests::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::metrics::reset_tool_metrics();
+        crate::metrics::record_call("health_check");
+        crate::metrics::record_latency("health_check", 1_500);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let value = parse_json(&tooling_metrics(&ctx).expect("tooling metrics"));
+        let tools = value["tools"].as_array().expect("tools array");
+
+        let sampled = tools
+            .iter()
+            .find(|entry| entry["name"] == "health_check")
+            .expect("health_check entry present in the full catalogue");
+        assert_eq!(sampled["calls"], 1);
+        let avg_ms = sampled["latency"]["avg_ms"]
+            .as_f64()
+            .expect("latency.avg_ms present for a sampled tool");
+        assert!(
+            (avg_ms - 1.5).abs() < 1e-9,
+            "1500us sample must surface as 1.5ms avg, got {avg_ms}"
+        );
+        assert!(
+            sampled["latency"]["p95_ms"]
+                .as_f64()
+                .is_some_and(|p95| p95 > 0.0),
+            "p95 must be populated: {sampled}"
+        );
+        assert!(
+            sampled["latency"]["p99_ms"].is_number() && sampled["latency"]["p50_ms"].is_number(),
+            "p50/p99 must be populated: {sampled}"
+        );
+
+        let unsampled = tools
+            .iter()
+            .find(|entry| entry["name"] == "whois")
+            .expect("whois entry present in the full catalogue");
+        assert_eq!(unsampled["calls"], 0);
+        assert!(
+            unsampled.get("latency").is_none(),
+            "tools without samples must omit `latency` (legacy wire shape): {unsampled}"
+        );
+
+        // Payloads produced before the field existed still deserialize.
+        let legacy: ToolMetricsEntry = serde_json::from_value(serde_json::json!({
+            "name": "whois",
+            "calls": 3,
+            "errors": 0,
+            "rejections": 0,
+            "cluster": "identity",
+            "capabilities": ["identity"],
+            "complexity": "low",
+        }))
+        .expect("legacy entry without latency deserializes");
+        assert!(legacy.latency.is_none());
+
+        crate::metrics::reset_tool_metrics();
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn empty_dataset_resources_return_expected_shapes() {
@@ -5869,6 +6203,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -5883,6 +6218,7 @@ mod resource_shape_tests {
                         "gpt-5".to_string(),
                         Some("GreenCastle".to_string()),
                         Some("resource visibility regression".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5951,6 +6287,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -5961,6 +6298,7 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7378,15 +7716,13 @@ mod resource_shape_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("custom.sqlite3");
         let database_url = format!("sqlite:///{}", db_path.display());
-        let xdg_data_home = temp.path().join("xdg");
-        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-            ],
-            || {
+        // br-99aih: redirect the *default* storage root into a private tempdir
+        // (HOME + XDG_DATA_HOME); an XDG-only override still resolved to the
+        // operator's live archive on any host that had run the daemon.
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            |_isolated_default_root| {
                 Config::reset_cached();
                 let storage_root = Config::from_env().storage_root;
                 let project_dir = storage_root.join("projects").join("ahead-project");
@@ -7451,6 +7787,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -7462,6 +7799,7 @@ mod resource_shape_tests {
                     "sonnet-4.5".to_string(),
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7559,6 +7897,222 @@ mod query_param_tests {
     // -----------------------------------------------------------------------
     // parse_query
     // -----------------------------------------------------------------------
+
+    fn recent_call(
+        tool: &str,
+        agent: &str,
+        project: &str,
+        age_secs: i64,
+    ) -> crate::metrics::RecentToolCall {
+        crate::metrics::RecentToolCall {
+            finished_at_micros: mcp_agent_mail_core::now_micros() - age_secs * 1_000_000,
+            tool: tool.to_string(),
+            project: Some(project.to_string()),
+            agent: Some(agent.to_string()),
+            latency_us: 1_500,
+            outcome: crate::metrics::RecentToolCallOutcome::Ok,
+        }
+    }
+
+    fn tooling_recent_snapshot(param: &str) -> ToolingRecentSnapshot {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let raw = tooling_recent(&ctx, param.to_string()).expect("tooling/recent read");
+        serde_json::from_str(&raw).expect("tooling/recent json")
+    }
+
+    /// br-ciwph: the resource reads the dispatch ring and honors its filters.
+    /// Other tests share the process-wide ring, so every assertion is scoped
+    /// to agent/project names unique to this test.
+    #[test]
+    fn tooling_recent_reads_ring_and_filters_by_agent_project_and_window() {
+        crate::metrics::record_recent_call(recent_call(
+            "send_message",
+            "RecentAlpha",
+            "recent-proj-a",
+            5,
+        ));
+        crate::metrics::record_recent_call(recent_call(
+            "fetch_inbox",
+            "RecentAlpha",
+            "recent-proj-a",
+            2,
+        ));
+        crate::metrics::record_recent_call(recent_call("whois", "RecentBeta", "recent-proj-a", 1));
+        crate::metrics::record_recent_call(recent_call(
+            "send_message",
+            "RecentAlpha",
+            "recent-proj-b",
+            1,
+        ));
+        crate::metrics::record_recent_call(recent_call(
+            "health_check",
+            "RecentAlpha",
+            "recent-proj-a",
+            3_600,
+        ));
+
+        let snap = tooling_recent_snapshot("60?agent=RecentAlpha&project=recent-proj-a");
+        assert_eq!(snap.window_seconds, 60);
+        assert_eq!(snap.count, 2, "{snap:?}");
+        assert!(snap.generated_at.is_some());
+        let tools: Vec<&str> = snap.entries.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(tools, ["fetch_inbox", "send_message"], "newest first");
+        assert!(
+            snap.entries
+                .iter()
+                .all(|e| e.agent == "RecentAlpha" && e.project == "recent-proj-a")
+        );
+        assert_eq!(snap.entries[0].cluster, "messaging");
+        assert_eq!(snap.entries[0].latency_ms, 1);
+        assert!(
+            snap.entries[0]
+                .timestamp
+                .as_deref()
+                .is_some_and(|t| t.starts_with("20"))
+        );
+
+        let by_project = tooling_recent_snapshot("60?project=recent-proj-a");
+        let agents: Vec<&str> = by_project
+            .entries
+            .iter()
+            .map(|e| e.agent.as_str())
+            .collect();
+        assert!(
+            agents.contains(&"RecentBeta") && agents.contains(&"RecentAlpha"),
+            "{agents:?}"
+        );
+        assert!(
+            by_project
+                .entries
+                .iter()
+                .all(|e| e.project == "recent-proj-a")
+        );
+        assert!(
+            by_project.entries.iter().all(|e| e.tool != "health_check"),
+            "outside the window"
+        );
+
+        let wide = tooling_recent_snapshot("7200?agent=RecentAlpha&project=recent-proj-a&limit=1");
+        assert_eq!(wide.count, 1, "limit caps the entries");
+
+        let wide_all = tooling_recent_snapshot("7200?agent=RecentAlpha&project=recent-proj-a");
+        assert!(
+            wide_all.entries.iter().any(|e| e.tool == "health_check"),
+            "wider window includes the hour-old call"
+        );
+
+        let unknown = tooling_recent_snapshot("60?agent=RecentNobody&project=recent-proj-a");
+        assert_eq!(unknown.count, 0);
+        assert!(unknown.entries.is_empty());
+    }
+
+    #[test]
+    fn tooling_recent_refuses_bad_window_and_unknown_parameters() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        for bad in ["0", "abc", "", "-5", "9999999999"] {
+            let err = tooling_recent(&ctx, bad.to_string()).expect_err(bad);
+            assert_eq!(err.code, McpErrorCode::InvalidParams, "{bad}: {err:?}");
+        }
+        let err = tooling_recent(&ctx, "60?since=yesterday".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("since"), "{err:?}");
+        let err = tooling_recent(&ctx, "60?limit=0".to_string()).expect_err("zero limit");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        let err = tooling_recent(&ctx, "60?format=yaml".to_string()).expect_err("yaml");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        tooling_recent(&ctx, "60?format=json".to_string())
+            .expect("json format is the documented no-op");
+    }
+
+    /// `tooling/schemas?cluster=` is the one documented filter among the
+    /// query aliases; it narrows the hand-maintained schema map to one
+    /// cluster and refuses names that are not clusters.
+    #[test]
+    fn tooling_schemas_query_filters_by_cluster_and_refuses_unknown_clusters() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let all: ToolSchemasResponse =
+            serde_json::from_str(&tooling_schemas(&ctx).expect("schemas")).expect("json");
+        let messaging: ToolSchemasResponse = serde_json::from_str(
+            &tooling_schemas_query(&ctx, "cluster=messaging".to_string()).expect("filtered"),
+        )
+        .expect("json");
+        assert!(
+            !messaging.tools.is_empty(),
+            "messaging tools must have schema entries"
+        );
+        assert!(
+            messaging.tools.len() < all.tools.len(),
+            "the filter must drop other clusters"
+        );
+        assert!(
+            messaging
+                .tools
+                .keys()
+                .all(|name| crate::tool_cluster(name) == Some("messaging")),
+            "{:?}",
+            messaging.tools.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(messaging.global_optional, all.global_optional);
+
+        let unchanged: ToolSchemasResponse = serde_json::from_str(
+            &tooling_schemas_query(&ctx, "format=json".to_string()).expect("format only"),
+        )
+        .expect("json");
+        assert_eq!(unchanged.tools.len(), all.tools.len());
+
+        let err = tooling_schemas_query(&ctx, "cluster=nope".to_string()).expect_err("unknown");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("known clusters"), "{err:?}");
+        let err = tooling_schemas_query(&ctx, "project=x".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn metrics_query_window_is_reported_back_not_applied() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let plain: serde_json::Value =
+            serde_json::from_str(&tooling_metrics_query(&ctx, "format=json".to_string()).unwrap())
+                .unwrap();
+        assert!(plain.get("window_seconds").is_none());
+        let windowed: serde_json::Value =
+            serde_json::from_str(&tooling_metrics_query(&ctx, "window=60".to_string()).unwrap())
+                .unwrap();
+        assert_eq!(windowed["window_seconds"], 60);
+        assert_eq!(windowed["window_applied"], false);
+        assert!(
+            windowed["window_note"]
+                .as_str()
+                .unwrap()
+                .contains("tooling/recent")
+        );
+        let core: serde_json::Value = serde_json::from_str(
+            &tooling_metrics_core_query(&ctx, "window=60".to_string()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(core["window_applied"], false);
+        let err = tooling_metrics_query(&ctx, "window=abc".to_string()).expect_err("bad window");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        let err = tooling_metrics_query(&ctx, "project=x".to_string()).expect_err("unknown key");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn query_aliases_accept_only_format_json() {
+        reject_unsupported_query("resource://tooling/metrics", "").unwrap();
+        reject_unsupported_query("resource://tooling/metrics", "format=json").unwrap();
+        reject_unsupported_query("resource://tooling/metrics", "format=JSON").unwrap();
+        let err =
+            reject_unsupported_query("resource://tooling/metrics", "format=yaml").unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("yaml"));
+        let err = reject_unsupported_query("resource://tooling/locks", "project=abc&format=json")
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("resource://tooling/locks") && err.message.contains("project"),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn parse_query_basic() {

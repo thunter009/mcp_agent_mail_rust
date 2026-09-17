@@ -25,7 +25,7 @@ struct FixtureTool {
     input_schema: Value,
 }
 
-/// Root structure of tool_descriptions.json fixture.
+/// Root structure of `tool_descriptions.json` fixture.
 #[derive(Debug, Deserialize)]
 struct ToolDescriptionsFixture {
     tools: Vec<FixtureTool>,
@@ -42,6 +42,7 @@ const TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE: &[&str] = &[
     "fetch_inbox_events",
     "get_message_delivery_receipt",
     "list_agents",
+    "mark_all_read",
     "resolve_pane_identity",
 ];
 
@@ -70,11 +71,7 @@ fn get_rust_tools() -> Vec<Tool> {
     let cx = Cx::for_testing();
 
     let tools_result = router
-        .handle_tools_list(
-            &McpContext::new(cx.clone(), 1),
-            ListToolsParams::default(),
-            None,
-        )
+        .handle_tools_list(&McpContext::new(cx, 1), ListToolsParams::default(), None)
         .expect("tools/list failed");
 
     tools_result.tools
@@ -114,34 +111,49 @@ fn normalized_property_names(schema: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Normalize a JSON Schema property to its non-null base type.
+///
+/// Nullable parameters have two legal spellings and both must map to the
+/// same base type:
+///
+/// - `{"anyOf": [{"type": "integer"}, {"type": "null"}]}`
+/// - `{"type": ["integer", "null"]}` — what fastmcp >= 0.7.1 publishes for
+///   `Option<T>` tool parameters so callers may spell "omitted" as an
+///   explicit JSON `null` (CHANGELOG v0.3.31, GH#255). This is the intended
+///   wire contract, not a regression: the base type is still asserted
+///   against the Python fixture, only the `null` widening is normalized away.
+///
+/// A property with no non-null type at all still returns `None` so a real
+/// type regression keeps failing the comparison.
 fn normalized_property_type(prop: &Value) -> Option<String> {
     if let Some(kind) = prop.get("type").and_then(Value::as_str) {
         return Some(kind.to_string());
     }
-
     let mut non_null: Vec<String> = prop
         .get("type")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
+        .map(|types| {
+            types
+                .iter()
                 .filter_map(Value::as_str)
                 .filter(|kind| *kind != "null")
                 .map(ToString::to_string)
                 .collect()
         })
         .unwrap_or_default();
-    non_null.extend(
-        prop.get("anyOf")
+    if non_null.is_empty() {
+        non_null = prop
+            .get("anyOf")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|branch| branch.get("type").and_then(Value::as_str))
                     .filter(|kind| *kind != "null")
                     .map(ToString::to_string)
-                    .collect::<Vec<String>>()
+                    .collect()
             })
-            .unwrap_or_default(),
-    );
+            .unwrap_or_default();
+    }
     if non_null.is_empty() {
         return None;
     }
@@ -151,11 +163,46 @@ fn normalized_property_type(prop: &Value) -> Option<String> {
 }
 
 #[test]
-fn normalized_property_type_handles_nullable_type_arrays() {
-    let nullable = serde_json::json!({"type": ["string", "null"]});
+fn normalized_property_type_reads_nullable_type_arrays_as_base_type() {
     assert_eq!(
-        normalized_property_type(&nullable).as_deref(),
-        Some("string")
+        normalized_property_type(&serde_json::json!({"type": ["integer", "null"]})),
+        Some("integer".to_string()),
+        "fastmcp >= 0.7.1 nullable spelling must normalize to the base type"
+    );
+    assert_eq!(
+        normalized_property_type(
+            &serde_json::json!({"type": ["array", "null"], "items": {"type": "string"}})
+        ),
+        Some("array".to_string())
+    );
+    assert_eq!(
+        normalized_property_type(
+            &serde_json::json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]})
+        ),
+        Some("boolean".to_string()),
+        "the anyOf nullable spelling must keep normalizing"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"type": "string"})),
+        Some("string".to_string())
+    );
+}
+
+#[test]
+fn normalized_property_type_still_rejects_typeless_properties() {
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"description": "no type at all"})),
+        None,
+        "a property with no type must not be normalized into a passing value"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"type": ["null"]})),
+        None,
+        "null-only type arrays carry no base type"
+    );
+    assert_eq!(
+        normalized_property_type(&serde_json::json!({"anyOf": [{"type": "null"}]})),
+        None
     );
 }
 
@@ -210,8 +257,7 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
                 let act_type = normalized_property_type(act_prop);
                 if exp_type != act_type {
                     errors.push(format!(
-                        "[{tool_name}].{prop_name} type mismatch: expected={:?}, actual={:?}",
-                        exp_type, act_type
+                        "[{tool_name}].{prop_name} type mismatch: expected={exp_type:?}, actual={act_type:?}"
                     ));
                 }
             }
@@ -229,7 +275,9 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
 /// description. Historical wording is diagnostic only, not product authority.
 #[test]
 fn supported_tools_have_rust_owned_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
@@ -274,7 +322,10 @@ fn supported_tools_have_rust_owned_descriptions() {
             if description_matches_fixture(historical_desc, rust_desc) {
                 eprintln!("PASS");
             } else {
-                eprintln!("PASS (Rust wording revised)");
+                // Not a parity check: the Rust wording is allowed to differ from the
+                // Python fixture on purpose, so this branch only proves the tool has a
+                // non-empty description. Drift in the Rust text is not detected here.
+                eprintln!("PASS (non-empty; wording differs from the Python fixture by design)");
             }
             passed += 1;
         }
@@ -285,11 +336,11 @@ fn supported_tools_have_rust_owned_descriptions() {
     for rust_name in rust_by_name.keys() {
         if !fixture_names.contains(rust_name.as_str()) {
             if TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE.contains(&rust_name.as_str()) {
-                eprintln!("RUST-NATIVE: {} (not in Python fixture)", rust_name);
+                eprintln!("RUST-NATIVE: {rust_name} (not in Python fixture)");
                 passed += 1;
                 continue;
             }
-            eprintln!("EXTRA: {} (unexpected Rust-only tool)", rust_name);
+            eprintln!("EXTRA: {rust_name} (unexpected Rust-only tool)");
             failures.push(format!(
                 "[{rust_name}] EXTRA: registered in Rust but not declared Rust-native"
             ));
@@ -309,7 +360,9 @@ fn supported_tools_have_rust_owned_descriptions() {
 /// Test that all shared tools have matching inputSchema property names and required arrays.
 #[test]
 fn tool_input_schemas_preserve_supported_compatibility() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
@@ -446,7 +499,9 @@ fn schema_compatibility_allows_relaxed_requirements_but_rejects_new_ones() {
 /// Verify the Rust tool count matches expected shared tool count.
 #[test]
 fn rust_tool_count_matches_expected() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let rust_tools = get_rust_tools();
     let fixture = load_fixture();
@@ -489,10 +544,12 @@ fn rust_tool_count_matches_expected() {
 // Per-cluster tests for granular reporting
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Infrastructure cluster: health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard
+/// Infrastructure cluster: `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard`
 #[test]
 fn cluster_infrastructure_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "health_check",
         "ensure_project",
@@ -504,7 +561,9 @@ fn cluster_infrastructure_descriptions() {
 /// Identity cluster: registration, lifecycle, lookup, and roster tools.
 #[test]
 fn cluster_identity_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "register_agent",
         "create_agent_identity",
@@ -517,11 +576,13 @@ fn cluster_identity_descriptions() {
     ]);
 }
 
-/// Messaging cluster: send_message, reply_message, fetch_inbox, fetch_inbox_events,
-/// get_message_delivery_receipt, mark_message_read, acknowledge_message
+/// Messaging cluster: `send_message`, `reply_message`, `fetch_inbox`, `fetch_inbox_events`,
+/// `get_message_delivery_receipt`, `mark_message_read`, `acknowledge_message`
 #[test]
 fn cluster_messaging_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "send_message",
         "reply_message",
@@ -534,10 +595,12 @@ fn cluster_messaging_descriptions() {
     ]);
 }
 
-/// Contacts cluster: request_contact, respond_contact, list_contacts, set_contact_policy
+/// Contacts cluster: `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy`
 #[test]
 fn cluster_contacts_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "request_contact",
         "respond_contact",
@@ -546,10 +609,12 @@ fn cluster_contacts_descriptions() {
     ]);
 }
 
-/// File reservations cluster: file_reservation_paths, release_file_reservations, renew_file_reservations, force_release_file_reservation
+/// File reservations cluster: `file_reservation_paths`, `release_file_reservations`, `renew_file_reservations`, `force_release_file_reservation`
 #[test]
 fn cluster_file_reservations_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "file_reservation_paths",
         "release_file_reservations",
@@ -558,10 +623,12 @@ fn cluster_file_reservations_descriptions() {
     ]);
 }
 
-/// Search cluster descriptions.
+/// Search cluster: `search_messages`, `summarize_thread`, `summarize_recent`, `fetch_summary`
 #[test]
 fn cluster_search_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "search_messages",
         "summarize_thread",
@@ -570,10 +637,12 @@ fn cluster_search_descriptions() {
     ]);
 }
 
-/// Macros cluster: macro_start_session, macro_prepare_thread, macro_file_reservation_cycle, macro_contact_handshake
+/// Macros cluster: `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`
 #[test]
 fn cluster_macros_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "macro_start_session",
         "macro_prepare_thread",
@@ -582,10 +651,12 @@ fn cluster_macros_descriptions() {
     ]);
 }
 
-/// Product bus cluster: ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product
+/// Product bus cluster: `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product`
 #[test]
 fn cluster_product_bus_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "ensure_product",
         "products_link",
@@ -595,10 +666,12 @@ fn cluster_product_bus_descriptions() {
     ]);
 }
 
-/// Build slots cluster: acquire_build_slot, renew_build_slot, release_build_slot
+/// Build slots cluster: `acquire_build_slot`, `renew_build_slot`, `release_build_slot`
 #[test]
 fn cluster_build_slots_descriptions() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_cluster_descriptions(&[
         "acquire_build_slot",
         "renew_build_slot",
@@ -643,10 +716,9 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "Cluster description coverage failures:\n\n{}",
-            failures.join("\n\n")
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "Cluster description coverage failures:\n\n{}",
+        failures.join("\n\n")
+    );
 }

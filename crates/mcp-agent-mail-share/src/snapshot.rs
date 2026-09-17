@@ -102,6 +102,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "project_id",
             "sender_id",
             "thread_id",
+            "topic",
             "subject",
             "body_md",
             "importance",
@@ -209,9 +210,9 @@ const KNOWN_TABLES: &[KnownTable] = &[
     },
 ];
 
-/// Create a snapshot of a live FrankenSQLite database at `destination`.
+/// Create a snapshot of a live `FrankenSQLite` database at `destination`.
 ///
-/// The source must already be admitted by FrankenSQLite and retain its complete
+/// The source must already be admitted by `FrankenSQLite` and retain its complete
 /// namespace sidecar pair. It is opened through the guarded, engine-enforced
 /// read-only seam and copied inside one read transaction, so committed rows in
 /// the primary file and WAL are observed as one consistent database snapshot.
@@ -222,7 +223,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
 /// Use [`create_private_canonical_sqlite_snapshot`] for a caller-owned,
 /// engine-exclusive canonical SQLite artifact. There is intentionally no
 /// namespace-absent fallback here: missing, incomplete, malformed, or stale
-/// FrankenSQLite namespace authority fails closed.
+/// `FrankenSQLite` namespace authority fails closed.
 ///
 /// Returns the destination path on success.
 ///
@@ -350,7 +351,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
     // closed export profile before the first destination write.
     let dest_str = staged_dest.display().to_string();
     // The source is the live FrankenSQLite database, but the destination is a
-    // disposable export image that will be renamed into place. Creating that
+    // disposable export image that will be published into place. Creating that
     // image through FrankenSQLite would bind persistent namespace records to
     // the staging pathname. Canonical SQLite has no pathname-bound namespace,
     // so it is the correct writer for portable export artifacts.
@@ -404,21 +405,91 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             ),
         })?;
     drop(dst_conn);
-    // Staging ran with synchronous=OFF (br-gi4z3), so force the finished image
-    // to disk once, here, before the rename publishes it.
-    std::fs::File::open(&staged_dest)
-        .and_then(|file| file.sync_all())
-        .map_err(ShareError::Io)?;
-    std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
+    publish_sqlite_snapshot(stage_dir, &staged_dest, &dest, sync_snapshot_parent)?;
 
     Ok(dest)
+}
+
+fn publish_sqlite_snapshot(
+    stage_dir: tempfile::TempDir,
+    staged: &Path,
+    destination: &Path,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), ShareError> {
+    let result = publish_sqlite_snapshot_image(staged, destination, sync_parent);
+    if result.is_err() {
+        // Keep the completed private image on collision or uncertain durability.
+        // Never roll back a published name another process can now see.
+        let _preserved_stage = stage_dir.keep();
+    }
+    result
+}
+
+fn publish_sqlite_snapshot_image(
+    staged: &Path,
+    destination: &Path,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), ShareError> {
+    // Staging uses synchronous=OFF, so flush the completed image first. Windows
+    // FlushFileBuffers requires write access; File::open is read-only there.
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged)?;
+    image.sync_all()?;
+
+    // Unlike rename, hard_link atomically refuses every occupied destination,
+    // including dangling symlinks. Both names are on the same filesystem because
+    // staging is created inside the destination parent. The private link remains
+    // owned by the staging directory until the publication has been flushed.
+    std::fs::hard_link(staged, destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            ShareError::SnapshotDestinationExists {
+                path: destination.display().to_string(),
+            }
+        } else {
+            ShareError::Io(error)
+        }
+    })?;
+    // Flush file metadata after adding the link as well as its contents before.
+    image.sync_all()?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no parent directory"))?;
+    sync_parent(parent).map_err(|error| {
+        ShareError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "snapshot {} was published but parent durability could not be confirmed: {error}; \
+                 private image retained at {}",
+                destination.display(),
+                staged.display()
+            ),
+        ))
+    })
+}
+
+fn sync_snapshot_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable std has no directory flush API on Windows. The image handle
+        // is flushed before and after linking; do not claim a Unix directory
+        // fsync guarantee on this platform.
+        let _ = parent;
+        Ok(())
+    }
 }
 
 /// Relax durability on the staged destination while tables stream in.
 ///
 /// br-gi4z3: the destination lives in a `.snapshot-stage.` tempdir that is
-/// discarded on any failure and only published via checkpoint + `sync_all` +
-/// rename on success, so per-statement durability during staging buys nothing.
+/// published only after checkpoint + `sync_all`, using atomic no-clobber linking.
+/// Publication failures retain the private image. Per-statement durability
+/// during staging buys nothing.
 /// Without this, autocommit fsyncs made live-snapshot creation take minutes
 /// (~2 fsyncs/row; 4,149 journal create/unlink events observed in a 2-minute
 /// strace window on a 1,690-message mailbox).
@@ -902,7 +973,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
     column.ends_with("_ts") || column.ends_with("_at")
 }
 
-/// Full snapshot preparation pipeline for a live FrankenSQLite mailbox.
+/// Full snapshot preparation pipeline for a live `FrankenSQLite` mailbox.
 ///
 /// 1. Create snapshot
 /// 2. Apply project scope
@@ -910,7 +981,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
 /// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
 ///
 /// The source assumptions are the same as [`create_sqlite_snapshot`]: a
-/// complete, valid FrankenSQLite namespace pair is mandatory and the source
+/// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
 /// is opened only through the guarded read-only seam.
 pub fn create_snapshot_context(
     source: &Path,
@@ -925,7 +996,7 @@ pub fn create_snapshot_context(
 /// Full snapshot preparation pipeline for a private canonical SQLite source.
 ///
 /// The source must be a caller-owned, engine-exclusive archive reconstruction
-/// or materialized snapshot. Never pass a live FrankenSQLite mailbox path;
+/// or materialized snapshot. Never pass a live `FrankenSQLite` mailbox path;
 /// use [`create_snapshot_context`] for that case.
 ///
 /// # Errors
@@ -1268,7 +1339,7 @@ mod tests {
             CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
         let (writer_trigger_tx, writer_trigger_rx) = std::sync::mpsc::sync_channel(0);
         let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(0);
-        let writer_path = source.clone();
+        let writer_path = source;
         let writer = std::thread::spawn(move || {
             let conn = DbConn::open_file(writer_path.display().to_string()).unwrap();
             conn.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
@@ -1320,11 +1391,18 @@ mod tests {
         const CHILD_WITNESS: &str = "share-snapshot-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
-            let contender = CanonicalDbConn::open_file(PathBuf::from(path).display().to_string())
-                .expect("child opens competing canonical connection");
-            contender
-                .execute_raw("PRAGMA busy_timeout = 0")
-                .expect("child disables busy retry");
+            // Competing writer through the runtime engine (FrankenSQLite): canonical
+            // SQLite is never a mailbox writer and is not excluded by FrankenSQLite's
+            // namespace/WAL-certificate coordination (br-0dw2c). The watchdog turns a
+            // blocking engine into a visible failure instead of a hung suite.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                eprintln!("child lock probe watchdog: competing write did not fail within 15 s");
+                std::process::exit(3);
+            });
+            let contender = DbConn::open_file(PathBuf::from(path).display().to_string())
+                .expect("child opens competing runtime-engine connection");
+            let _ = contender.execute_raw("PRAGMA busy_timeout = 10");
             let error = contender
                 .execute_raw("BEGIN IMMEDIATE")
                 .expect_err("separate process must not acquire the parent's reserved lock");
@@ -1446,6 +1524,129 @@ mod tests {
             result,
             Err(ShareError::SnapshotDestinationExists { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_publication_preserves_raced_destination_and_private_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+        let staged = stage_dir.path().join("private.sqlite3");
+        let destination = dir.path().join("published.sqlite3");
+        std::fs::write(&staged, b"complete private snapshot").unwrap();
+        assert!(!destination.exists(), "name was available when selected");
+        std::fs::write(&destination, b"another publisher won").unwrap();
+
+        let error = publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
+            panic!("a collision must fail before the success durability barrier")
+        })
+        .expect_err("publication must not overwrite the raced-in destination");
+
+        assert!(matches!(
+            error,
+            ShareError::SnapshotDestinationExists { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"another publisher won"
+        );
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"complete private snapshot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_preserves_raced_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+        let staged = stage_dir.path().join("private.sqlite3");
+        let destination = dir.path().join("published.sqlite3");
+        let absent_target = dir.path().join("absent.sqlite3");
+        std::fs::write(&staged, b"complete private snapshot").unwrap();
+        std::os::unix::fs::symlink(&absent_target, &destination).unwrap();
+        assert!(!destination.exists(), "exists() misses a dangling symlink");
+
+        let error = publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
+            panic!("symlink collision must not reach the durability barrier")
+        })
+        .expect_err("publication must not replace a dangling symlink");
+
+        assert!(matches!(
+            error,
+            ShareError::SnapshotDestinationExists { .. }
+        ));
+        assert_eq!(std::fs::read_link(&destination).unwrap(), absent_target);
+        assert!(!absent_target.exists());
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"complete private snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_publication_reports_parent_sync_failure_without_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+        let staged = stage_dir.path().join("private.sqlite3");
+        let destination = dir.path().join("published.sqlite3");
+        std::fs::write(&staged, b"complete private snapshot").unwrap();
+
+        let error = publish_sqlite_snapshot(stage_dir, &staged, &destination, |parent| {
+            assert_eq!(parent, dir.path());
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"complete private snapshot"
+            );
+            Err(std::io::Error::other("injected directory sync failure"))
+        })
+        .expect_err("failed directory durability must not report success");
+
+        assert!(
+            error
+                .to_string()
+                .contains("published but parent durability")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory sync failure")
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"complete private snapshot"
+        );
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"complete private snapshot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_syncs_parent_after_complete_image_is_visible() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+        let staged = stage_dir.path().join("private.sqlite3");
+        let destination = dir.path().join("published.sqlite3");
+        std::fs::write(&staged, b"complete private snapshot").unwrap();
+        let mut synced = false;
+
+        publish_sqlite_snapshot(stage_dir, &staged, &destination, |parent| {
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"complete private snapshot"
+            );
+            sync_snapshot_parent(parent)?;
+            synced = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(synced, "success must run the parent durability barrier");
+        assert_eq!(std::fs::metadata(&destination).unwrap().nlink(), 1);
     }
 
     #[test]

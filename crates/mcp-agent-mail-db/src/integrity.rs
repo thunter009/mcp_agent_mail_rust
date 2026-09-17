@@ -268,7 +268,10 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         };
     }
 
-    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
+    // Engine-dispatching: a family without a FrankenSQLite namespace pair
+    // (canonical-written, restored, reconstructed) is checked through
+    // canonical SQLite instead of being reported Broken at open time.
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
         db_path,
         "mailbox integrity diagnostic",
     ) {
@@ -282,7 +285,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
             };
         }
     };
-    match run_check(&conn, kind) {
+    match run_check_with(|sql| conn.query_sync(sql, &[]), kind) {
         Ok(check) => MailboxIntegrityVerdict {
             status: MailboxIntegrityStatus::Healthy,
             metrics: integrity_metrics(),
@@ -377,7 +380,8 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 ///
 /// Returns `Some(index_names)` only when at least one row is index-class
 /// damage (`wrong # of entries in index <name>` or `row <N> missing from
-/// index <name>`) and every other row is either the `*** in database ... ***`
+/// index <name>`, or FrankenSQLite's exact index key-order complaint) and
+/// every other row is either the `*** in database ... ***`
 /// section header or a benign finding (freelist/sidecar slack, per
 /// [`integrity_details_are_suspect`]'s classes). Any other row — page-level
 /// damage, fragmentation accounting, b-tree errors — disqualifies the fast
@@ -390,25 +394,6 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 /// every distinct owner table, which rebuilds all of that table's indexes.
 #[must_use]
 pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<String>> {
-    fn index_name_from_detail(detail: &str) -> Option<&str> {
-        let trimmed = detail.trim();
-        if let Some(name) = trimmed.strip_prefix("wrong # of entries in index ") {
-            return Some(name.trim());
-        }
-        if trimmed.starts_with("row ")
-            && let Some(pos) = trimmed.find(" missing from index ")
-        {
-            let name = trimmed[pos + " missing from index ".len()..].trim();
-            // The prefix between "row " and the marker must be a bare rowid;
-            // anything else is a message we did not anticipate.
-            let rowid = &trimmed["row ".len()..pos];
-            if !rowid.is_empty() && rowid.chars().all(|c| c.is_ascii_digit()) {
-                return Some(name);
-            }
-        }
-        None
-    }
-
     fn detail_is_unused_page_row(detail: &str) -> bool {
         let lower = detail.trim().to_ascii_lowercase();
         lower.contains("never used") || lower.contains("unused")
@@ -428,7 +413,7 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
     let mut names: Vec<String> = Vec::new();
     let mut unused_page_rows = 0_usize;
     for detail in details {
-        if let Some(name) = index_name_from_detail(detail) {
+        if let Some(name) = index_damage_index_name(detail) {
             if name.is_empty() {
                 return None;
             }
@@ -450,6 +435,109 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
         }
     }
     if names.is_empty() { None } else { Some(names) }
+}
+
+/// Share the exact index-damage grammar between repair and typed diagnostics.
+fn index_damage_index_name(detail: &str) -> Option<&str> {
+    let trimmed = detail.trim();
+    if let Some(name) = trimmed.strip_prefix("wrong # of entries in index ") {
+        return Some(name.trim());
+    }
+    if trimmed.starts_with("row ")
+        && let Some(pos) = trimmed.find(" missing from index ")
+    {
+        let name = trimmed[pos + " missing from index ".len()..].trim();
+        let rowid = &trimmed["row ".len()..pos];
+        if !rowid.is_empty() && rowid.chars().all(|c| c.is_ascii_digit()) {
+            return Some(name);
+        }
+    }
+
+    // FrankenSQLite 0.3.18 returns this complete diagnostic as an
+    // integrity_check row. Match the whole message: a broad substring match
+    // could mistake a structural error mentioning an index for repairable
+    // index-only damage. Backtick-ambiguous names remain unclassified.
+    let franken = trimmed
+        .strip_prefix("database disk image is malformed: ")
+        .unwrap_or(trimmed);
+    let name = franken
+        .strip_prefix("index `")?
+        .strip_suffix("` entries are out of order for their declared key directions")?;
+    (!name.is_empty() && !name.contains('`') && !name.chars().any(char::is_control)).then_some(name)
+}
+
+/// GH#293: index names when every integrity-check row is a collated-index
+/// ordering or lookup complaint.
+///
+/// Matches when EVERY non-benign integrity-check row is
+/// an index *ordering* or *lookup* complaint — canonical SQLite's
+/// `row <N> missing from index <name>` or the primary engine's
+/// ``index `<name>` entries are out of order …`` — and no row reports an
+/// entry-count mismatch or any other damage.
+///
+/// That exact signature is what two engines produce when they fold a
+/// `COLLATE NOCASE` key in opposite directions: every entry is present (the
+/// counts agree), but the checker's binary search misses the rows whose
+/// position depends on how `[` (0x5B) compares to ASCII letters. Callers
+/// confirm each named index really declares a non-BINARY collation before
+/// treating the verdict as a collation disagreement rather than damage. A
+/// genuinely torn index also loses entries, which surfaces as
+/// `wrong # of entries in index …` and disqualifies this class.
+#[must_use]
+pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec<String>> {
+    fn detail_is_ignorable(detail: &str) -> bool {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        (trimmed.starts_with("***") && trimmed.ends_with("***"))
+            || lower == "ok"
+            || lower.contains("wal without shm")
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for detail in details {
+        if detail_is_ignorable(detail) {
+            continue;
+        }
+        let name = index_order_complaint_index_name(detail)?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// The index an ordering/lookup complaint names.
+///
+/// Understands every spelling the two engines use: ``index `NAME` entries are out of order …`` and
+/// ``table `t` rowid N is missing from index `NAME` `` (primary engine),
+/// `row N missing from index NAME` (canonical SQLite), and the older
+/// `… for index NAME` form. `None` for every other row, including
+/// `wrong # of entries in index NAME`, which is a real count mismatch.
+#[must_use]
+pub fn index_order_complaint_index_name(detail: &str) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    if !(lower.contains("entries are out of order") || lower.contains("missing from index")) {
+        return None;
+    }
+    let name_token = |rest: &str| -> Option<String> {
+        let rest = rest.trim_start().trim_start_matches(['`', '"']);
+        let name: String = rest
+            .chars()
+            .take_while(|c| !(c.is_whitespace() || matches!(c, '`' | '"' | ';' | ',' | ')')))
+            .collect();
+        (!name.is_empty()).then_some(name)
+    };
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("index ") {
+        let after = search_from + rel + "index ".len();
+        if let Some(name) = name_token(&detail[after..])
+            && !matches!(name.as_str(), "entries" | "entry" | "is" | "for")
+        {
+            return Some(name);
+        }
+        search_from = after;
+    }
+    None
 }
 
 /// Run `PRAGMA quick_check` on an open connection.
@@ -550,9 +638,24 @@ where
         return Ok(Vec::new());
     }
     Err(format!(
-        "every {kind} probe form failed — {}",
+        "every {kind}{PROBE_FORMS_EXHAUSTED_MARKER} — {}",
         errors.join("; ")
     ))
+}
+
+/// Message fragment [`probe_check_rows`] emits when every SQL form of one
+/// check failed, i.e. the connection opened but the check statement itself
+/// could not run.
+const PROBE_FORMS_EXHAUSTED_MARKER: &str = " probe form failed";
+
+/// Whether `message` is (or wraps) a [`probe_check_rows`] failure in which
+/// every probe form of a check failed on an open connection.
+///
+/// Callers use this to tell "SQLite opened the file but could not execute
+/// `integrity_check` on it" apart from open/staging failures.
+#[must_use]
+pub fn is_probe_forms_exhausted_message(message: &str) -> bool {
+    message.contains(PROBE_FORMS_EXHAUSTED_MARKER)
 }
 
 /// Compact, bounded rendering of integrity-check detail rows.
@@ -658,18 +761,155 @@ pub fn extract_check_details(rows: &[Row], kind: CheckKind) -> Vec<String> {
     details
 }
 
+/// The first `limit` detail rows joined for a one-line diagnostic.
+///
+/// Integrity output can run to hundreds of rows (one per orphaned page); a
+/// verdict detail only needs the leading ones, plus a count of the rest.
+#[must_use]
+pub fn first_detail_rows(details: &[String], limit: usize) -> String {
+    let shown: Vec<&str> = details
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty())
+        .take(limit)
+        .collect();
+    let total = details.iter().filter(|row| !row.trim().is_empty()).count();
+    if shown.is_empty() {
+        return "(no detail rows)".to_string();
+    }
+    let mut text = shown.join("; ");
+    if total > shown.len() {
+        use std::fmt::Write as _;
+        let _ = write!(text, " (+{} more)", total - shown.len());
+    }
+    text
+}
+
 #[must_use]
 pub fn details_indicate_ok(details: &[String]) -> bool {
     details.len() == 1 && details[0].trim().eq_ignore_ascii_case("ok")
 }
 
+/// GH#286: machine-readable class of an integrity-check verdict.
+///
+/// `PRAGMA integrity_check` reports space-accounting waste (`Page N: never
+/// used`) and genuine structural damage in one undifferentiated stream, so a
+/// single P0 "possible corruption" verdict covered both "206 MB of dead space,
+/// every row readable" and "b-tree pages cross-linked". Operators (and alert
+/// rules) need to tell those apart without shelling out to canonical `sqlite3`
+/// and re-parsing its English error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityClass {
+    /// Every detail row is benign (`ok`, section headers, WAL/sidecar slack).
+    Clean,
+    /// Only orphaned/unaccounted pages (`Page N: never used`): space
+    /// accounting waste. Every b-tree and index is intact and every row is
+    /// readable — reclaim (VACUUM) is the remediation, not reconstruct.
+    LeakedPagesOnly,
+    /// Only index-level damage that a `REINDEX` can rebuild (possibly
+    /// alongside benign rows / small page slack).
+    IndexOnly,
+    /// At least one structural error (b-tree damage, cross-linked pages,
+    /// unreadable cells, …). Repair/reconstruct territory.
+    Structural,
+}
+
+impl IntegrityClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::LeakedPagesOnly => "leaked_pages_only",
+            Self::IndexOnly => "index_only",
+            Self::Structural => "structural",
+        }
+    }
+}
+
+/// GH#286: classification of one integrity-check detail set, with the counts
+/// an alerting rule needs to branch on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityClassification {
+    pub class: IntegrityClass,
+    /// `Page N: never used` (and `... unused`) rows.
+    pub leaked_pages: usize,
+    /// Rows that are neither benign nor index-only damage.
+    pub structural_errors: usize,
+    /// Index-level damage rows (`wrong # of entries in index …`,
+    /// `row N missing from index …`, or the runtime's exact key-order error).
+    pub index_errors: usize,
+    /// First structural error verbatim, for triage without the full stream.
+    pub first_structural_error: Option<String>,
+}
+
+/// GH#286: classify integrity-check detail rows into a typed verdict.
+///
+/// Row taxonomy matches the existing classifiers exactly
+/// ([`integrity_details_are_suspect`] for the benign/unused classes,
+/// [`index_only_corruption_index_names`] for the index-damage grammar), so
+/// this adds a machine-readable label without changing what any of those
+/// callers decide.
+#[must_use]
+pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
+    let mut leaked_pages = 0_usize;
+    let mut structural_errors = 0_usize;
+    let mut index_errors = 0_usize;
+    let mut first_structural_error: Option<String> = None;
+    for detail in details {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "ok"
+            || lower.contains("wal without shm")
+            || (trimmed.starts_with("***") && trimmed.ends_with("***"))
+        {
+            continue;
+        }
+        if lower.contains("never used") || lower.contains("unused") {
+            leaked_pages += 1;
+            continue;
+        }
+        if index_damage_index_name(trimmed).is_some_and(|name| !name.is_empty()) {
+            index_errors += 1;
+            continue;
+        }
+        structural_errors += 1;
+        if first_structural_error.is_none() {
+            first_structural_error = Some(trimmed.to_string());
+        }
+    }
+    let class = if structural_errors > 0 {
+        IntegrityClass::Structural
+    } else if index_errors > 0 {
+        IntegrityClass::IndexOnly
+    } else if leaked_pages > 0 {
+        IntegrityClass::LeakedPagesOnly
+    } else {
+        IntegrityClass::Clean
+    };
+    IntegrityClassification {
+        class,
+        leaked_pages,
+        structural_errors,
+        index_errors,
+        first_structural_error,
+    }
+}
+
 fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+    run_check_with(|sql| conn.query_sync(sql, &[]), kind)
+}
+
+/// Run an integrity check through any query function, so a check can be
+/// issued over whichever engine the guarded read-only opener dispatched to.
+fn run_check_with<F>(mut query: F, kind: CheckKind) -> DbResult<IntegrityCheckResult>
+where
+    F: FnMut(&str) -> Result<Vec<Row>, sqlmodel_core::Error>,
+{
     let start = std::time::Instant::now();
-    let rows: Vec<Row> = probe_check_rows(
-        |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
-        kind,
-    )
-    .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+    let rows: Vec<Row> =
+        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind)
+            .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
@@ -868,6 +1108,10 @@ impl CrossCountMismatch {
 /// optimization, which would otherwise resolve the hint and then discard it,
 /// silently comparing an index to itself; measured by the GH#213 reporter).
 /// Any disagreement is returned as a [`CrossCountMismatch`].
+/// All probes share a read snapshot: a writer committing between the table
+/// and index scans must not turn a healthy database into a corruption finding.
+/// A savepoint preserves an existing caller transaction and is released even
+/// if a query fails. It neither enables writes nor reserves a writer lock.
 ///
 /// Skipped, by design:
 /// - missing tables (fresh/partial schemas are not findings);
@@ -883,7 +1127,23 @@ impl CrossCountMismatch {
 /// where table and indexes are mutually consistent but acknowledged rows are
 /// absent — only a client-side acknowledgement ledger sees that.
 pub fn index_table_cross_count(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
+    tables: &[&str],
+) -> DbResult<Vec<CrossCountMismatch>> {
+    conn.execute_raw("SAVEPOINT am_integrity_cross_count")
+        .map_err(|error| DbError::Sqlite(format!("cross-count snapshot start failed: {error}")))?;
+    let result = index_table_cross_count_snapshot(conn, tables);
+    // Release only our savepoint, including on the error path. An enclosing
+    // transaction remains owned by the caller; never COMMIT or ROLLBACK it.
+    conn.execute_raw("RELEASE SAVEPOINT am_integrity_cross_count")
+        .map_err(|error| {
+            DbError::Sqlite(format!("cross-count snapshot release failed: {error}"))
+        })?;
+    result
+}
+
+fn index_table_cross_count_snapshot(
+    conn: &impl crate::pool::SyncQuery,
     tables: &[&str],
 ) -> DbResult<Vec<CrossCountMismatch>> {
     let mut mismatches = Vec::new();
@@ -967,6 +1227,66 @@ pub fn index_table_cross_count(
 mod tests {
     use super::*;
     use std::sync::{LazyLock, Mutex};
+
+    // GH#286: typed classification of integrity-check detail rows.
+    #[test]
+    fn classify_clean_details() {
+        let c = classify_check_details(&["ok".to_string()]);
+        assert_eq!(c.class, IntegrityClass::Clean);
+        assert_eq!(
+            (c.leaked_pages, c.structural_errors, c.index_errors),
+            (0, 0, 0)
+        );
+        assert!(c.first_structural_error.is_none());
+
+        let c = classify_check_details(&[]);
+        assert_eq!(c.class, IntegrityClass::Clean);
+    }
+
+    #[test]
+    fn classify_leaked_pages_only_details() {
+        let mut details = vec!["*** in database main ***".to_string()];
+        details.extend((2..=50_291).map(|n| format!("Page {n}: never used")));
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::LeakedPagesOnly);
+        assert_eq!(c.leaked_pages, 50_290);
+        assert_eq!(c.structural_errors, 0);
+        assert_eq!(c.index_errors, 0);
+        assert!(c.first_structural_error.is_none());
+    }
+
+    #[test]
+    fn classify_structural_details_even_with_leaked_page_flood() {
+        // GH#286's field trap: the structural rows arrive AFTER the
+        // never-used flood, so a magnitude-capped reader misses them.
+        let mut details: Vec<String> = (2..=201).map(|n| format!("Page {n}: never used")).collect();
+        details.push("Tree 60 page 93829: btreeInitPage() returns error code 11".to_string());
+        details.push("wrong # of entries in index idx_msg_thread_created".to_string());
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::Structural);
+        assert_eq!(c.leaked_pages, 200);
+        assert_eq!(c.structural_errors, 1);
+        assert_eq!(c.index_errors, 1);
+        assert_eq!(
+            c.first_structural_error.as_deref(),
+            Some("Tree 60 page 93829: btreeInitPage() returns error code 11")
+        );
+    }
+
+    #[test]
+    fn classify_index_only_details() {
+        let details = vec![
+            "*** in database main ***".to_string(),
+            "wrong # of entries in index idx_inbox_delivery_events_agent_seq".to_string(),
+            "row 17 missing from index sqlite_autoindex_inbox_delivery_events_1".to_string(),
+            "Page 9: never used".to_string(),
+        ];
+        let c = classify_check_details(&details);
+        assert_eq!(c.class, IntegrityClass::IndexOnly);
+        assert_eq!(c.index_errors, 2);
+        assert_eq!(c.leaked_pages, 1);
+        assert_eq!(c.structural_errors, 0);
+    }
 
     static TEST_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1517,6 +1837,48 @@ mod tests {
     }
 
     #[test]
+    fn index_only_classifier_accepts_runtime_key_order_damage() {
+        for prefix in ["", "database disk image is malformed: "] {
+            let details = vec![format!(
+                "{prefix}index `idx_agents_project_name` entries are out of order for their declared key directions"
+            )];
+            assert_eq!(
+                index_only_corruption_index_names(&details),
+                Some(vec!["idx_agents_project_name".to_string()])
+            );
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.index_errors, 1);
+            assert_eq!(classification.structural_errors, 0);
+
+            let mut mixed = details;
+            mixed.push("Page 3: b-tree page is malformed".to_string());
+            assert!(index_only_corruption_index_names(&mixed).is_none());
+            assert_eq!(classify_check_details(&mixed).structural_errors, 1);
+        }
+    }
+
+    #[test]
+    fn index_only_classifier_rejects_ambiguous_runtime_order_messages() {
+        for detail in [
+            "index `` entries are out of order for their declared key directions",
+            "index `idx`extra` entries are out of order for their declared key directions",
+            "index `idx\nname` entries are out of order for their declared key directions",
+            "index `idx` entries are out of order on a malformed page",
+            "index `idx` entries are out of order for their declared key directions; page 3 is corrupt",
+            "page corruption: index `idx` entries are out of order for their declared key directions",
+        ] {
+            let details = vec![detail.to_string()];
+            assert!(
+                index_only_corruption_index_names(&details).is_none(),
+                "must not authorize REINDEX for {detail:?}"
+            );
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.index_errors, 0, "{detail:?}");
+            assert_eq!(classification.structural_errors, 1, "{detail:?}");
+        }
+    }
+
+    #[test]
     fn index_only_classifier_rejects_non_index_and_healthy_inputs() {
         for details in [
             vec!["ok".to_string()],
@@ -1772,6 +2134,239 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "healthy table must not report desync: {mismatches:?}"
+        );
+    }
+
+    /// Runs every query against the real reader, committing one real writer
+    /// insert after the table scan. No query results or errors are substituted.
+    struct CrossCountConcurrentInsert<'a, C> {
+        reader: &'a C,
+        writer: &'a C,
+        inserted: std::cell::Cell<bool>,
+    }
+
+    impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountConcurrentInsert<'_, C> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            let rows = self.reader.query_sync(sql, params)?;
+            if sql.contains("NOT INDEXED") && !self.inserted.replace(true) {
+                self.writer
+                    .execute_raw("INSERT INTO cc_race (name) VALUES ('committed-between-scans')")?;
+            }
+            Ok(rows)
+        }
+
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.reader.execute_raw(sql)
+        }
+    }
+
+    fn cross_count_concurrent_insert_is_not_corruption<C: crate::pool::SyncQuery>(
+        reader: &C,
+        writer: &C,
+    ) {
+        writer
+            .execute_raw("PRAGMA journal_mode=WAL")
+            .expect("enable concurrent WAL reads");
+        writer
+            .execute_raw("CREATE TABLE cc_race (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create real table");
+        writer
+            .execute_raw("CREATE INDEX idx_cc_race_name ON cc_race(name)")
+            .expect("create real index");
+        reader
+            .execute_raw("PRAGMA query_only=ON")
+            .expect("keep the observer query-only");
+        let scheduled = CrossCountConcurrentInsert {
+            reader,
+            writer,
+            inserted: std::cell::Cell::new(false),
+        };
+        let mismatches = index_table_cross_count(&scheduled, &["cc_race"])
+            .expect("cross-count concurrent real writer");
+        assert!(scheduled.inserted.get(), "the competing write must execute");
+        let durable = writer
+            .query_sync("SELECT count(*) AS c FROM cc_race", &[])
+            .expect("independent committed row witness");
+        assert_eq!(durable[0].get_named::<i64>("c").expect("row count"), 1);
+        assert!(
+            mismatches.is_empty(),
+            "a committed insert between probes is not corruption: {mismatches:?}"
+        );
+        // Ending the diagnostic snapshot must expose the committed row to the
+        // next observer query without making the observer writable.
+        let visible = reader
+            .query_sync("SELECT count(*) AS c FROM cc_race", &[])
+            .expect("read after diagnostic snapshot");
+        assert_eq!(visible[0].get_named::<i64>("c").expect("row count"), 1);
+        assert!(
+            reader
+                .execute_raw("INSERT INTO cc_race (name) VALUES ('forbidden-observer-write')")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_count_canonical_concurrent_insert_is_not_corruption() {
+        let directory = tempfile::tempdir()
+            .expect("retained canonical fixture")
+            .keep();
+        let path = directory.join("canonical-cross-count.sqlite3");
+        let writer = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open canonical writer");
+        let reader = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open canonical reader");
+        cross_count_concurrent_insert_is_not_corruption(&reader, &writer);
+    }
+
+    #[test]
+    fn cross_count_franken_concurrent_insert_is_not_corruption() {
+        let directory = tempfile::tempdir()
+            .expect("retained runtime fixture")
+            .keep();
+        let path = directory.join("franken-cross-count.sqlite3");
+        let writer =
+            DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime writer");
+        let reader =
+            DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime reader");
+        cross_count_concurrent_insert_is_not_corruption(&reader, &writer);
+    }
+
+    fn cross_count_preserves_caller_transaction(conn: &impl crate::pool::SyncQuery) {
+        conn.execute_raw("CREATE TABLE cc_scope (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create transaction fixture");
+        conn.execute_raw("CREATE INDEX idx_cc_scope_name ON cc_scope(name)")
+            .expect("create transaction fixture index");
+        conn.execute_raw("BEGIN").expect("begin caller transaction");
+        conn.execute_raw("INSERT INTO cc_scope (name) VALUES ('caller-owned')")
+            .expect("write uncommitted caller row");
+        assert_eq!(
+            index_table_cross_count(conn, &["cc_scope"]).expect("probe inside caller transaction"),
+            Vec::<CrossCountMismatch>::new()
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("caller still owns its transaction");
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM cc_scope", &[])
+            .expect("read rolled-back caller state");
+        assert_eq!(rows[0].get_named::<i64>("c").expect("row count"), 0);
+    }
+
+    #[test]
+    fn cross_count_canonical_preserves_caller_transaction() {
+        cross_count_preserves_caller_transaction(
+            &crate::CanonicalDbConn::open_memory().expect("canonical transaction fixture"),
+        );
+    }
+
+    #[test]
+    fn cross_count_snapshot_still_reports_a_real_index_mismatch() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical corruption fixture");
+        conn.execute_raw(
+            "CREATE TABLE cc_corrupt (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_cc_corrupt_name ON cc_corrupt(name); \
+             INSERT INTO cc_corrupt (name) VALUES ('first'), ('second'); \
+             CREATE TABLE cc_empty (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_cc_empty_name ON cc_empty(name);",
+        )
+        .expect("create real table and index btrees");
+        // Redirect only this private in-memory index to an empty index btree.
+        // The forced-index scan now returns real inconsistent data; no query
+        // result is mocked, and no mailbox file is opened or modified.
+        conn.execute_raw(
+            "PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET rootpage=( \
+                 SELECT rootpage FROM sqlite_master WHERE name='idx_cc_empty_name' \
+             ) WHERE name='idx_cc_corrupt_name'; \
+             PRAGMA writable_schema=OFF; \
+             PRAGMA schema_version=100;",
+        )
+        .expect("create owned index/table inconsistency and reload the schema");
+        assert_eq!(
+            index_table_cross_count(&conn, &["cc_corrupt"])
+                .expect("scan actual inconsistent index"),
+            vec![CrossCountMismatch {
+                table: "cc_corrupt".to_string(),
+                index: "idx_cc_corrupt_name".to_string(),
+                table_rows: 2,
+                index_rows: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_count_franken_preserves_caller_transaction() {
+        cross_count_preserves_caller_transaction(
+            &DbConn::open_memory().expect("runtime transaction fixture"),
+        );
+    }
+
+    /// Exercise cleanup with a real SQL query error, rather than a synthetic
+    /// error value. All transaction control is still delegated unchanged.
+    struct CrossCountQueryError<'a, C>(&'a C);
+
+    impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountQueryError<'_, C> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            if sql.contains("NOT INDEXED") {
+                self.0
+                    .query_sync("SELECT missing FROM nonexistent_cross_count_fixture", &[])
+            } else {
+                self.0.query_sync(sql, params)
+            }
+        }
+
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.0.execute_raw(sql)
+        }
+    }
+
+    fn cross_count_releases_snapshot_after_query_error(conn: &impl crate::pool::SyncQuery) {
+        conn.execute_raw("CREATE TABLE cc_error (id INTEGER PRIMARY KEY)")
+            .expect("create real query-error fixture");
+        let error = index_table_cross_count(&CrossCountQueryError(conn), &["cc_error"])
+            .expect_err("actual engine error must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("NOT INDEXED scan of cc_error failed")
+        );
+        conn.execute_raw("BEGIN")
+            .expect("diagnostic must release its snapshot on error");
+        conn.execute_raw("INSERT INTO cc_error (id) VALUES (1)")
+            .expect("write caller transaction");
+        index_table_cross_count(&CrossCountQueryError(conn), &["cc_error"])
+            .expect_err("nested diagnostic query error");
+        conn.execute_raw("ROLLBACK")
+            .expect("nested diagnostic must leave caller transaction open");
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM cc_error", &[])
+            .expect("read rollback witness");
+        assert_eq!(rows[0].get_named::<i64>("c").expect("row count"), 0);
+        assert_eq!(
+            index_table_cross_count(conn, &["cc_error"])
+                .expect("connection remains usable after diagnostic errors"),
+            Vec::<CrossCountMismatch>::new()
+        );
+    }
+
+    #[test]
+    fn cross_count_canonical_releases_snapshot_after_query_error() {
+        cross_count_releases_snapshot_after_query_error(
+            &crate::CanonicalDbConn::open_memory().expect("canonical error fixture"),
+        );
+    }
+
+    #[test]
+    fn cross_count_franken_releases_snapshot_after_query_error() {
+        cross_count_releases_snapshot_after_query_error(
+            &DbConn::open_memory().expect("runtime error fixture"),
         );
     }
 

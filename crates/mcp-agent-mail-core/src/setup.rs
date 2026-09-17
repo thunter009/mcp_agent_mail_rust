@@ -773,6 +773,72 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     generate_token()
 }
 
+/// A setup token bound to the file generation from which it was resolved.
+///
+/// Explicit tokens choose the replacement value, but do not bypass concurrent
+/// edits or unsafe file authorities. This intentionally does not implement
+/// `Debug`: its contents include a credential.
+pub struct ResolvedSetupToken {
+    token: String,
+    path: PathBuf,
+    authority: Option<SetupDirectoryAuthority>,
+    snapshot: Option<SetupFileSnapshot>,
+}
+
+impl ResolvedSetupToken {
+    /// Borrow the credential for the client configurations in this setup run.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// Resolve a token for a later compare-and-swap save, without creating files.
+pub fn resolve_token_for_save(
+    explicit: Option<&str>,
+    env_file: &Path,
+) -> Result<ResolvedSetupToken, SetupError> {
+    let path = std::path::absolute(env_file)?;
+    validate_setup_file_target(&path, "token env file")?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let authority = if check_setup_real_directory(parent, "token env file", false)? {
+        Some(open_setup_directory_authority(parent)?)
+    } else {
+        None
+    };
+    let snapshot = read_setup_file_with_authority(&path, "token env file", authority.as_ref())?;
+    if snapshot.as_ref().is_some_and(|snapshot| {
+        u64::try_from(snapshot.content.len()).unwrap_or(u64::MAX)
+            > crate::config::ENV_AUTHORITY_FILE_MAX_BYTES
+    }) {
+        return Err(invalid_setup_path(
+            "token env file",
+            &path,
+            "exceeds the environment authority size limit",
+        ));
+    }
+    let token = if let Some(token) = explicit.filter(|token| !token.is_empty()) {
+        token.to_owned()
+    } else if let Some(token) = snapshot
+        .as_ref()
+        .and_then(|snapshot| token_from_env_text(&snapshot.content))
+    {
+        token
+    } else if let Some(token) =
+        utf8_env_value_for_setup("HTTP_BEARER_TOKEN")?.filter(|token| !token.is_empty())
+    {
+        token
+    } else {
+        generate_token()?
+    };
+    Ok(ResolvedSetupToken {
+        token,
+        path,
+        authority,
+        snapshot,
+    })
+}
+
 /// Resolve an existing bearer token without generating or writing a replacement.
 pub fn resolve_existing_token(
     explicit: Option<&str>,
@@ -794,32 +860,56 @@ fn read_env_file_token(path: &Path) -> Result<Option<String>, SetupError> {
     let Some(content) = crate::config::read_env_authority_text(path)? else {
         return Ok(None);
     };
+    Ok(token_from_env_text(&content))
+}
+
+fn token_from_env_text(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(val) = trimmed.strip_prefix("HTTP_BEARER_TOKEN=") {
             let val = val.trim().trim_matches('"').trim_matches('\'');
             if !val.is_empty() {
-                return Ok(Some(val.to_string()));
+                return Some(val.to_string());
             }
         }
     }
-    Ok(None)
+    None
 }
 
-/// Save the bearer token to a .env file (create or update).
-pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupError> {
+/// Save only if the token authority still matches the resolution generation.
+/// On drift the caller must resolve again and rebuild its client config plan.
+pub fn save_token_to_env_file(resolved: &ResolvedSetupToken) -> Result<(), SetupError> {
+    let env_path = &resolved.path;
+    let token = resolved.token();
     if token.contains('\n') || token.contains('\r') {
         return Err(SetupError::Other("Token must not contain newlines".into()));
     }
-    ensure_setup_parent_dir(env_path, "token env file")?;
-    with_secret_config_git_protection(env_path, |authority| {
+    let verify = |authority: Option<&SetupDirectoryAuthority>| {
+        let observed = read_setup_file_with_authority(env_path, "token env file", authority)?;
+        let matches = match (&resolved.snapshot, &observed) {
+            (None, None) => true,
+            (Some(expected), Some(observed)) => setup_snapshots_match(expected, observed),
+            _ => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(invalid_setup_path(
+                "token env file",
+                env_path,
+                "changed since token resolution; retry setup",
+            ))
+        }
+    };
+    verify(resolved.authority.as_ref())?;
+    with_secret_config_git_protection_bound(env_path, resolved.authority.as_ref(), |authority| {
+        verify(Some(authority))?;
         validate_setup_file_target(env_path, "token env file")?;
 
         // Keep token reads under the same no-follow, regular-file-only contract as
         // setup config reads. An `exists()` + `read_to_string()` pair leaves a
         // symlink/FIFO substitution window between validation and the read.
-        let existing_file =
-            read_setup_file_with_authority(env_path, "token env file", Some(authority))?;
+        let existing_file = &resolved.snapshot;
         let existing_content = existing_file
             .as_ref()
             .map(|snapshot| snapshot.content.as_str());
@@ -2767,11 +2857,11 @@ fn create_unique_setup_file_at(
 ) -> Result<(String, std::fs::File), SetupError> {
     use rustix::fs::{Mode, OFlags, RawMode, fchmod, openat};
 
-    let permissions = RawMode::try_from(permissions).map_err(|_| {
-        SetupError::Other(format!(
-            "setup file permissions {permissions:#o} exceed the platform mode range"
-        ))
-    })?;
+    // `RawMode` is `u32` on Linux but `u16` on Apple targets (libc `mode_t`),
+    // so the caller's `u32` permission bits are narrowed explicitly. Setup
+    // permissions are always <= 0o7777 and therefore lossless under this cast.
+    #[allow(clippy::unnecessary_cast, clippy::cast_possible_truncation)]
+    let raw_mode = permissions as RawMode;
     let pid = std::process::id();
     let now = crate::timestamps::now_micros();
     for attempt in 0..1024 {
@@ -2780,11 +2870,11 @@ fn create_unique_setup_file_at(
             &authority.fd,
             candidate.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(permissions),
+            Mode::from_raw_mode(raw_mode),
         ) {
             Ok(fd) => {
                 let file = std::fs::File::from(fd);
-                fchmod(&file, Mode::from_raw_mode(permissions)).map_err(std::io::Error::from)?;
+                fchmod(&file, Mode::from_raw_mode(raw_mode)).map_err(std::io::Error::from)?;
                 return Ok((candidate, file));
             }
             Err(rustix::io::Errno::EXIST) => {}
@@ -2837,13 +2927,15 @@ fn snapshot_setup_authority_leaf(
     snapshot_open_setup_file(file.into_std(), display_path, label).map(Some)
 }
 
-#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnapshot) -> bool {
+    #[cfg(any(unix, windows))]
+    let same_identity = expected.device == observed.device && expected.inode == observed.inode;
+    #[cfg(not(any(unix, windows)))]
+    let same_identity = false;
     expected.content == observed.content
         && expected.permissions == observed.permissions
         && expected.link_count == observed.link_count
-        && expected.device == observed.device
-        && expected.inode == observed.inode
+        && same_identity
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3767,7 +3859,7 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     };
     // Serialize the tracked-file probe and any .gitignore update. Callers that
     // also mutate credential bytes must use
-    // `with_secret_config_git_protection` so this same authority remains held
+    // `with_secret_config_git_protection_bound` so this authority remains held
     // through the write and post-write verification.
     let secret_mutex = secure_gitignore.then(|| crate::GitRepoLocks::global().lock_for(&repo_root));
     let _secret_mutex_guard = secret_mutex.as_ref().map(|mutex| {
@@ -3798,21 +3890,28 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, secure_gitignore)
 }
 
-fn with_secret_config_git_protection<T>(
+fn with_secret_config_git_protection_bound<T>(
     path: &Path,
+    authority: Option<&SetupDirectoryAuthority>,
     operation: impl FnOnce(&SetupDirectoryAuthority) -> Result<T, SetupError>,
 ) -> Result<T, SetupError> {
-    ensure_setup_parent_dir(path, "secret config")?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let authority = open_setup_directory_authority(parent)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    let owned_authority;
+    let authority = if let Some(authority) = authority {
+        authority
+    } else {
+        ensure_setup_parent_dir(path, "secret config")?;
+        owned_authority = open_setup_directory_authority(parent)?;
+        &owned_authority
+    };
+    revalidate_setup_directory_authority(parent, authority)?;
 
     let Some((repo_root, relative)) = resolve_secret_git_context(path, true)? else {
-        let result = operation(&authority)?;
-        revalidate_setup_directory_authority(parent, &authority)?;
+        let result = operation(authority)?;
+        revalidate_setup_directory_authority(parent, authority)?;
         return Ok(result);
     };
     let secret_mutex = crate::GitRepoLocks::global().lock_for(&repo_root);
@@ -3833,11 +3932,11 @@ fn with_secret_config_git_protection<T>(
     }
 
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
-    let result = operation(&authority)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
+    let result = operation(authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     check_secret_config_git_exposure_locked(path, &repo_root, &relative, true)?;
-    revalidate_setup_directory_authority(parent, &authority)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     Ok(result)
 }
 
@@ -3985,21 +4084,27 @@ fn transform_config_atomic_inner(
         .map(|snapshot| snapshot.content.as_str());
     let new_content = transform(existing)?;
 
-    // Never widen an existing config's permissions. Conversely, when setup is
-    // adding a secret to a previously broad file, tighten it to the requested
-    // mode. Backups use the same effective mode so they cannot leak the
-    // pre-update contents.
-    let effective_permissions = existing_file.as_ref().map_or(permissions, |snapshot| {
-        #[cfg(unix)]
-        {
-            snapshot.permissions & permissions
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = snapshot;
-            permissions
-        }
+    let existing_may_contain_secret = existing.is_some_and(|content| {
+        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
     });
+    let output_contains_literal_secret = new_content.contains("Bearer ");
+    let secret_write =
+        contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
+
+    // Published configs and backups must remain readable and writable by
+    // their owner. Narrow non-owner access without intersecting away owner
+    // bits (e.g. 0040 & 0600 would publish an unusable mode-0000 file).
+    // Secret-bearing input or output always caps the requested mode at 0600.
+    let requested_permissions = if secret_write { 0o600 } else { permissions };
+    #[cfg(unix)]
+    let effective_permissions = existing_file
+        .as_ref()
+        .map_or(requested_permissions, |snapshot| {
+            snapshot.permissions & requested_permissions
+        })
+        | 0o600;
+    #[cfg(not(unix))]
+    let effective_permissions = requested_permissions;
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
@@ -4010,14 +4115,8 @@ fn transform_config_atomic_inner(
         .as_ref()
         .is_some_and(|snapshot| snapshot.link_count != 1);
 
-    let existing_may_contain_secret = existing.is_some_and(|content| {
-        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
-    });
-    let output_contains_literal_secret = new_content.contains("Bearer ");
-    let secret_write =
-        contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
     if secret_write && !secret_protected {
-        return with_secret_config_git_protection(path, |authority| {
+        return with_secret_config_git_protection_bound(path, Some(authority), |authority| {
             // Re-read and re-render after acquiring the repository authority.
             // Otherwise the caller could carry stale bytes across the lock
             // boundary and overwrite a concurrent, serialized config update.
@@ -6454,6 +6553,45 @@ fn expected_entry_for_action(action: &ConfigAction) -> Value {
     }
 }
 
+/// MCP config paths where `am setup` deliberately writes the Agent Mail entry
+/// **without** an `Authorization` header, for this setup configuration.
+///
+/// GH#307: `am doctor`'s bearer-token sub-check and `am setup` must share one
+/// notion of a correct config. Several user-level configs (Cursor's
+/// `~/.cursor/mcp.json`, Gemini's `~/.gemini/settings.json`, Factory Droid's
+/// `~/.factory/mcp.json`, …) are written mode `0644` and are therefore
+/// deliberately token-free: a shared, world-readable file is the wrong place
+/// for a bearer secret, so the project-local `0600` config is the one that
+/// carries it. Doctor asks this function which files setup intends to leave
+/// header-free instead of warning that every one of them "is missing a bearer
+/// token" and telling the operator to run `am setup` — which would rewrite the
+/// exact same header-free entry.
+///
+/// The answer is derived from the real [`ConfigAction`] list, so it cannot
+/// drift from what setup actually writes. Only the *absence* of a header is
+/// excused; a config carrying the WRONG token is still drift.
+#[must_use]
+pub fn config_paths_without_expected_bearer_token(params: &SetupParams) -> Vec<PathBuf> {
+    let platforms = params
+        .agents
+        .clone()
+        .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    let mut paths = Vec::new();
+    for platform in platforms {
+        for action in platform.config_actions(params) {
+            if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                continue;
+            }
+            if expected_authorization_for_action(&action, &params.token).is_none() {
+                paths.push(action.file_path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn expected_authorization_for_action(action: &ConfigAction, token: &str) -> Option<String> {
     if token.is_empty() {
         return None;
@@ -7989,6 +8127,83 @@ mod tests {
         assert_eq!(value["headers"]["Authorization"], "Bearer real-token");
     }
 
+    /// GH#307: `am doctor`'s bearer sub-check and `am setup` must agree on
+    /// which configs are supposed to carry an `Authorization` header.
+    /// User-level configs are written world-readable and are therefore
+    /// deliberately token-free; the `0600` project-local files carry the token.
+    #[test]
+    fn config_paths_without_expected_bearer_token_lists_the_header_free_user_configs() {
+        let home = PathBuf::from("/home/tester");
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(home.clone()),
+            agents: Some(vec![AgentPlatform::Cursor]),
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let header_free = config_paths_without_expected_bearer_token(&params);
+
+        assert!(
+            header_free.contains(&home.join(".cursor").join("mcp.json")),
+            "the Cursor user config is written without a bearer header: {header_free:?}"
+        );
+        assert!(
+            !header_free.contains(&PathBuf::from("/tmp/project").join("cursor.mcp.json")),
+            "the project-local Cursor config DOES carry the token: {header_free:?}"
+        );
+    }
+
+    /// The answer is derived from the real action list, so it tracks every
+    /// platform rather than a hand-maintained allowlist — and it is exactly
+    /// the complement of "the action has an expected Authorization header".
+    #[test]
+    fn config_paths_without_expected_bearer_token_is_the_complement_of_expected_auth() {
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(PathBuf::from("/home/tester")),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let header_free = config_paths_without_expected_bearer_token(&params);
+
+        for platform in AgentPlatform::ALL {
+            for action in platform.config_actions(&params) {
+                if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                    continue;
+                }
+                let expects_auth =
+                    expected_authorization_for_action(&action, &params.token).is_some();
+                assert_eq!(
+                    !expects_auth,
+                    header_free.contains(&action.file_path),
+                    "{} ({:?}) disagrees with its expected-auth verdict",
+                    action.file_path.display(),
+                    platform
+                );
+            }
+        }
+    }
+
+    /// With no token there is nothing to write anywhere, so every config is
+    /// header-free — the doctor sub-check that consumes this only runs when a
+    /// canonical token exists.
+    #[test]
+    fn config_paths_without_expected_bearer_token_covers_everything_when_unauthenticated() {
+        let params = SetupParams {
+            token: String::new(),
+            project_dir: PathBuf::from("/tmp/project"),
+            home_dir_override: Some(PathBuf::from("/home/tester")),
+            agents: Some(vec![AgentPlatform::Cursor]),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let header_free = config_paths_without_expected_bearer_token(&params);
+        assert!(header_free.contains(&PathBuf::from("/tmp/project").join("cursor.mcp.json")));
+    }
+
     #[test]
     fn config_actions_gemini_uses_http_url() {
         let params = SetupParams {
@@ -8770,6 +8985,78 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn transform_config_atomic_does_not_recreate_displaced_parent_for_secret_lock() {
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("live");
+        let displaced = tmp.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        std::fs::write(&path, "owner=original\n").unwrap();
+
+        transform_config_atomic(&path, 0o600, true, false, |existing| {
+            std::fs::rename(&parent, &displaced)?;
+            Ok(format!(
+                "{}Authorization=Bearer protected-secret\n",
+                existing.unwrap_or_default()
+            ))
+        })
+        .expect_err("a displaced parent must not be recreated while acquiring secret authority");
+
+        assert!(!parent.exists());
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("config.json")).unwrap(),
+            "owner=original\n"
+        );
+        assert_eq!(std::fs::read_dir(&displaced).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transform_config_atomic_refuses_parent_replacement_before_secret_lock() {
+        use std::cell::Cell;
+
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("live");
+        let displaced = tmp.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        std::fs::write(&path, "owner=original\n").unwrap();
+        let calls = Cell::new(0_u8);
+
+        let error = transform_config_atomic(&path, 0o600, true, false, |existing| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::fs::rename(&parent, &displaced)?;
+                std::fs::create_dir(&parent)?;
+                std::fs::write(&path, "owner=replacement\n")?;
+            }
+            Ok(format!(
+                "{}Authorization=Bearer protected-secret\n",
+                existing.unwrap_or_default()
+            ))
+        })
+        .expect_err("acquiring the secret lock must retain the original parent authority");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "must refuse before transforming a new parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "owner=replacement\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("config.json")).unwrap(),
+            "owner=original\n"
+        );
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&displaced).unwrap().count(), 1);
+        assert!(!error.to_string().contains("protected-secret"));
+    }
+
     #[test]
     fn write_config_atomic_refuses_to_overwrite_non_utf8_config() {
         let tmp = setup_real_tempdir();
@@ -9221,7 +9508,7 @@ mod tests {
         let repo_root = std::fs::canonicalize(tmp.path()).unwrap();
         let path = tmp.path().join("secret.json");
 
-        with_secret_config_git_protection(&path, |authority| {
+        with_secret_config_git_protection_bound(&path, None, |authority| {
             let contender_repo = repo_root.clone();
             let competing_add = std::thread::spawn(move || -> std::io::Result<bool> {
                 match crate::RepoFlock::acquire_with_timeout(
@@ -9308,7 +9595,266 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_config_atomic_never_widens_existing_permissions() {
+    fn config_permission_normalization_native() {
+        for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+            assert_private_setup_mode(mode, "{}\n", write_native_permission_fixture);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_native_permission_fixture(path: &Path) -> bool {
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.to_path_buf(),
+            description: "permission regression".into(),
+            content: ConfigContent::JsonFull(json!({"token": "Bearer permission-fixture"})),
+            permissions: 0o644, // Literal secrets override an otherwise public requested mode.
+            backup: true,
+        };
+        write_config_atomic(&action, true).expect("native config publication")
+            != ActionOutcome::Unchanged
+    }
+
+    #[cfg(unix)]
+    fn assert_private_setup_mode(
+        mode: Option<u32>,
+        original: &str,
+        mut write: impl FnMut(&Path) -> bool,
+    ) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = setup_real_tempdir();
+        let is_toml = original.starts_with('#');
+        let path = tmp.path().join(if is_toml {
+            "config.toml"
+        } else {
+            "config.json"
+        });
+        if let Some(mode) = mode {
+            std::fs::write(&path, original).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            if mode == 0o040 {
+                // The privileged opt-in test prepares a foreign-owned file
+                // readable through our group. Publication itself is unprivileged.
+                let group = std::fs::metadata(&path).unwrap().gid();
+                let status = std::process::Command::new("sudo")
+                    .args(["-n", "chown", "--"])
+                    .arg(format!("65534:{group}"))
+                    .arg(&path)
+                    .status()
+                    .expect("sudo for the isolated group-readable fixture");
+                assert!(status.success(), "fixture ownership must be established");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            }
+        }
+        let backups = || {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with(".bak") || name.contains(".bak.mcp-agent-mail.")
+                })
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        };
+        assert!(write(&path));
+        assert_eq!(mode_of(&path), 0o600);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("permission-fixture"));
+        if is_toml {
+            toml::from_str::<toml::Value>(&content).expect("published TOML");
+        } else {
+            serde_json::from_str::<Value>(&content).expect("published JSON");
+        }
+        let first_backups = backups();
+        assert_eq!(first_backups.len(), usize::from(mode.is_some()));
+        for backup in &first_backups {
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+            assert_eq!(mode_of(backup), 0o600);
+        }
+        assert!(!write(&path), "second write must be a no-op");
+        assert_eq!(backups().len(), first_backups.len());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            write(&path),
+            "unchanged content still needs permission repair"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert_eq!(backups().len(), first_backups.len() + 1);
+        assert!(!write(&path));
+        for backup in backups() {
+            assert_eq!(mode_of(&backup), 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_installer_permission_fixture(path: &Path, writer: usize, mask: u32) -> bool {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let installer = include_str!("../../../install.sh");
+        let (function, block) = match writer {
+            0 => ("setup_single_standard_http_json_config() {", 0),
+            1 => ("setup_single_opencode_json_config() {", 0),
+            _ => ("setup_single_mcp_config() {", usize::from(path.exists())),
+        };
+        let body = installer.split_once(function).expect("installer writer").1;
+        let script = body
+            .split("<<'PY'\n")
+            .nth(block + 1)
+            .and_then(|block| block.split_once("\nPY\n"))
+            .expect("verbatim Python writer")
+            .0;
+        // Only process umask is controlled; execute the real installer body
+        // without replacing its IO, parsing, backup or publication routines.
+        let mut command = Command::new("python3");
+        command.arg("-");
+        if writer == 0 {
+            command.arg("omp");
+        }
+        command.arg(path);
+        if writer < 2 {
+            command.args(["http://127.0.0.1:8765/mcp/", "Bearer permission-fixture"]);
+        } else {
+            command.arg(r#"{"command":"am","env":{"HTTP_BEARER_TOKEN":"permission-fixture"}}"#);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("real installer Python");
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "import os; os.umask({mask})\n{script}").unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.starts_with("OK:") || stdout.starts_with("SKIP:"),
+            "{stdout}"
+        );
+        stdout.starts_with("OK:")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_permission_normalization_installer() {
+        for writer in 0..3 {
+            for mask in [0o022, 0o777] {
+                for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+                    assert_private_setup_mode(mode, "{}\n", |path| {
+                        write_installer_permission_fixture(path, writer, mask)
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires sudo -n chown for a foreign-owned group-readable fixture"]
+    fn config_permission_normalization_group_readable() {
+        assert_private_setup_mode(Some(0o040), "{}\n", write_native_permission_fixture);
+        for writer in 0..3 {
+            assert_private_setup_mode(Some(0o040), "{}\n", |path| {
+                write_installer_permission_fixture(path, writer, 0o022)
+            });
+        }
+        assert_private_setup_mode(Some(0o040), "# original\n", |path| {
+            write_toml_permission_fixture(path, 0o022)
+        });
+    }
+
+    #[cfg(unix)]
+    fn write_toml_permission_fixture(path: &Path, mask: u32) -> bool {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let installer = include_str!("../../../install.sh");
+        let mut script = String::from(
+            "set -euo pipefail\nwarn() { printf '%s\\n' \"$*\" >&2; }\n\
+             info() { :; }\nverbose() { :; }\n\
+             desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }\n\
+             resolve_setup_http_bearer_token() { printf '%s' 'permission-fixture'; }\n",
+        );
+        for name in [
+            "private_file_identity",
+            "private_file_link_count",
+            "private_file_security_identity",
+            "ensure_private_file_target_path",
+            "write_private_file_atomic",
+            "backup_envfile_if_present",
+            "ensure_real_directory_tree",
+            "ensure_real_file_target_path",
+            "setup_single_toml_config",
+        ] {
+            let marker = format!("{name}() {{");
+            let body = installer
+                .split_once(&marker)
+                .expect("real shell helper")
+                .1
+                .split_once("\n}\n")
+                .expect("shell helper boundary")
+                .0;
+            writeln!(script, "{marker}{body}\n}}").unwrap();
+        }
+        write!(
+            script,
+            "umask {mask:03o}\nif setup_single_toml_config codex \"$1\" am; then\n\
+             printf 'OK:\\n'\nelse\nrc=$?\n[ \"$rc\" = 1 ] || exit \"$rc\"\n\
+             printf 'SKIP:\\n'\nfi\n"
+        )
+        .unwrap();
+        let mut child = Command::new("bash")
+            .args(["-s", "--"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("real TOML shell writer");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(script.as_bytes()).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.starts_with("OK:") || stdout.starts_with("SKIP:"),
+            "{stdout}"
+        );
+        stdout.starts_with("OK:")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_permission_normalization_toml() {
+        for mask in [0o022, 0o777] {
+            for mode in [Some(0o400), Some(0o600), Some(0o644), None] {
+                assert_private_setup_mode(mode, "# original\n", |path| {
+                    write_toml_permission_fixture(path, mask)
+                });
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_never_widens_existing_nonowner_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = setup_real_tempdir();
@@ -9529,10 +10075,92 @@ mod tests {
     }
 
     #[test]
+    fn token_save_refuses_content_changed_since_resolution() {
+        for explicit in [None, Some("operator-token")] {
+            let tmp = setup_real_tempdir();
+            let path = tmp.path().join("config.env");
+            std::fs::write(&path, "HTTP_BEARER_TOKEN=old\nOTHER=old\n").unwrap();
+            let resolved = resolve_token_for_save(explicit, &path).unwrap();
+            let newer = "HTTP_BEARER_TOKEN=newer\nOTHER=newer\n";
+            std::fs::write(&path, newer).unwrap();
+            let error = save_token_to_env_file(&resolved).unwrap_err();
+            assert!(error.to_string().contains("retry setup"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        }
+    }
+
+    #[test]
+    fn token_save_refuses_absent_to_present_authority() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        assert!(!path.exists(), "resolution must be read-only");
+        let newer = "HTTP_BEARER_TOKEN=concurrent-writer\n";
+        std::fs::write(&path, newer).unwrap();
+        let error = save_token_to_env_file(&resolved).unwrap_err();
+        assert!(error.to_string().contains("retry setup"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn token_save_refuses_replaced_identity_with_identical_bytes() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        let retained = tmp.path().join("previous.env");
+        let original = "HTTP_BEARER_TOKEN=same-content\n";
+        std::fs::write(&path, original).unwrap();
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let error = save_token_to_env_file(&resolved).unwrap_err();
+        assert!(error.to_string().contains("retry setup"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&retained).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_save_refuses_replaced_parent_since_resolution() {
+        let tmp = setup_real_tempdir();
+        let parent = tmp.path().join("authority");
+        let retained = tmp.path().join("retained-authority");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.env");
+        let original = "HTTP_BEARER_TOKEN=original\n";
+        std::fs::write(&path, original).unwrap();
+        let resolved = resolve_token_for_save(None, &path).unwrap();
+        std::fs::rename(&parent, &retained).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let replacement = "HTTP_BEARER_TOKEN=replacement\n";
+        std::fs::write(&path, replacement).unwrap();
+        assert!(save_token_to_env_file(&resolved).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(
+            std::fs::read_to_string(retained.join("config.env")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn token_save_resolve_again_allows_idempotent_setup() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.env");
+        for _ in 0..2 {
+            let resolved = resolve_token_for_save(Some("operator-token"), &path).unwrap();
+            save_token_to_env_file(&resolved).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "HTTP_BEARER_TOKEN=operator-token\n"
+            );
+        }
+    }
+
+    #[test]
     fn save_token_to_env_file_creates() {
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
-        save_token_to_env_file(&env_path, "my-token-123").unwrap();
+        let resolved = resolve_token_for_save(Some("my-token-123"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("HTTP_BEARER_TOKEN=my-token-123"));
     }
@@ -9547,7 +10175,8 @@ mod tests {
         writeln!(f, "MORE=stuff").unwrap();
         drop(f);
 
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("HTTP_BEARER_TOKEN=new-token"));
         assert!(!content.contains("old-token"));
@@ -9566,7 +10195,8 @@ mod tests {
         std::fs::write(&env_path, "HTTP_BEARER_TOKEN=exact-token\n").unwrap();
         std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        save_token_to_env_file(&env_path, "exact-token").unwrap();
+        let resolved = resolve_token_for_save(Some("exact-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "idempotent setup must repair secret mode");
@@ -9601,7 +10231,8 @@ mod tests {
                 .success()
         );
 
-        let error = save_token_to_env_file(&env_path, "already-tracked")
+        let resolved = resolve_token_for_save(Some("already-tracked"), &env_path).unwrap();
+        let error = save_token_to_env_file(&resolved)
             .expect_err("idempotence must not bypass tracked-secret refusal");
         assert!(error.to_string().contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(env_path).unwrap(), original);
@@ -9616,7 +10247,8 @@ mod tests {
         std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
         std::fs::hard_link(&outside, &env_path).unwrap();
 
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
@@ -9645,7 +10277,8 @@ mod tests {
             "fixture must begin as one inode"
         );
 
-        save_token_to_env_file(&env_path, "exact-token").unwrap();
+        let resolved = resolve_token_for_save(Some("exact-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
 
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), original);
@@ -9667,7 +10300,9 @@ mod tests {
         std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
         symlink(&outside, &linked).unwrap();
 
-        let err = save_token_to_env_file(&linked, "new-token").unwrap_err();
+        let err = resolve_token_for_save(Some("new-token"), &linked)
+            .err()
+            .expect("symlinked credential must be refused during resolution");
 
         assert!(err.to_string().contains("must not be a symlink"), "{err}");
         assert_eq!(
@@ -9687,7 +10322,9 @@ mod tests {
         std::fs::create_dir(&outside_dir).unwrap();
         symlink(&outside_dir, &linked_dir).unwrap();
 
-        let err = save_token_to_env_file(&linked_dir.join(".env"), "new-token").unwrap_err();
+        let err = resolve_token_for_save(Some("new-token"), &linked_dir.join(".env"))
+            .err()
+            .expect("symlinked parent must be refused during resolution");
 
         assert!(
             err.to_string()
@@ -10154,7 +10791,8 @@ http_headers = { Authorization = "Bearer tok" }
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "OTHER=value\n").unwrap();
-        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let resolved = resolve_token_for_save(Some("new-token"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("OTHER=value"));
         assert!(content.contains("HTTP_BEARER_TOKEN=new-token"));
@@ -10165,7 +10803,8 @@ http_headers = { Authorization = "Bearer tok" }
     fn save_token_to_env_file_creates_parent_dirs() {
         let tmp = setup_real_tempdir();
         let env_path = tmp.path().join("deep").join("nested").join(".env");
-        save_token_to_env_file(&env_path, "tok").unwrap();
+        let resolved = resolve_token_for_save(Some("tok"), &env_path).unwrap();
+        save_token_to_env_file(&resolved).unwrap();
         assert!(env_path.exists());
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert_eq!(content, "HTTP_BEARER_TOKEN=tok\n");

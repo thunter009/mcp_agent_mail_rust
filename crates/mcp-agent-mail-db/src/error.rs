@@ -126,6 +126,10 @@ pub enum DbErrorClass {
     FtsIndexCorruption,
     /// Connection, path, permission, or configuration error.
     ConnectionOrConfigError,
+    /// The request itself was unsatisfiable — a lookup missed, a row already
+    /// existed, an argument was invalid. Storage is healthy; nothing here
+    /// says reads are unsafe or edits must stop (GH#313).
+    RequestSemanticError,
     /// Retryable busy/lock/MVCC contention.
     BusyRetryable,
     /// Process file-descriptor exhaustion.
@@ -150,6 +154,7 @@ impl DbErrorClass {
             Self::ForeignKeyInconsistency => "foreign_key_inconsistency",
             Self::FtsIndexCorruption => "fts_index_corruption",
             Self::ConnectionOrConfigError => "connection_or_config_error",
+            Self::RequestSemanticError => "request_semantic_error",
             Self::BusyRetryable => "busy_retryable",
             Self::FdExhaustion => "fd_exhaustion",
             Self::PoolExhaustion => "pool_exhaustion",
@@ -267,6 +272,19 @@ impl DbErrorClassification {
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
                 recommended_command: "am doctor health",
+            },
+            // A miss or an invalid argument is a fact about the request, not
+            // about storage: reads stay safe, edits stay allowed, and no
+            // doctor command is implied. Retrying the same request will miss
+            // again, so `safe_to_retry` stays false.
+            DbErrorClass::RequestSemanticError => Self {
+                class,
+                severity: DbErrorSeverity::P3,
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: false,
+                recommended_command: "correct the request arguments; no database remediation is needed",
             },
             DbErrorClass::BusyRetryable => Self {
                 class,
@@ -635,10 +653,14 @@ impl DbError {
             Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
             Self::Internal(message) => classify_db_error_message(message),
             Self::RetryBudgetExhausted { inner, .. } => inner.classification(),
-            Self::NotFound { .. }
-            | Self::Duplicate { .. }
-            | Self::InvalidArgument { .. }
-            | Self::Serialization(_) => {
+            // GH#313: a semantic miss carried the connection/config policy
+            // (reads unsafe, edits blocked, "run am doctor health"), so a
+            // wrong-tuple `respond_contact` on a healthy mailbox read like a
+            // storage incident.
+            Self::NotFound { .. } | Self::Duplicate { .. } | Self::InvalidArgument { .. } => {
+                DbErrorClassification::for_class(DbErrorClass::RequestSemanticError)
+            }
+            Self::Serialization(_) => {
                 DbErrorClassification::for_class(DbErrorClass::ConnectionOrConfigError)
             }
         }
@@ -1053,14 +1075,22 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_fts_index_corruption(msg) {
         return DbErrorClass::FtsIndexCorruption;
     }
+    // An explicit main-file corruption signature outranks the generic
+    // schema-drift strings. A multi-form integrity probe joins every form's
+    // error into one message, and on current SQLite the table-valued
+    // `pragma_integrity_check(N)` form always fails first with
+    // "no such table: N" (the argument is quoted and looked up as a table
+    // name); letting that noise classify a message that also carries
+    // "database disk image is malformed" as schema drift made recovery treat
+    // a proven-corrupt source as unclassifiable and refuse promotion (GH#312).
+    if contains_main_db_corruption(msg) {
+        return DbErrorClass::MainDbBtreeCorruption;
+    }
     if contains_schema_drift(msg) {
         return DbErrorClass::SchemaDriftOrMissingTables;
     }
     if contains_engine_probe_limitation(msg) {
         return DbErrorClass::EngineProbeLimitation;
-    }
-    if contains_main_db_corruption(msg) {
-        return DbErrorClass::MainDbBtreeCorruption;
     }
     if contains_foreign_key_inconsistency(msg) {
         return DbErrorClass::ForeignKeyInconsistency;
@@ -1092,23 +1122,70 @@ fn contains_mvcc_conflict(msg: &str) -> bool {
 
 fn contains_main_db_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    lower.contains("database disk image is malformed")
+    // GH#320: FrankenSQLite wraps this cursor-state diagnostic in the same
+    // generic prefix as real damage (see the GH#181 evidence in schema.rs).
+    // Exempt only a complete, recognized cause. Another malformed verdict or
+    // an appended diagnostic must retain its corruption classification.
+    lower
+        .split("database disk image is malformed")
+        .skip(1)
+        .any(|detail| !is_cursor_type_mismatch_detail(detail.trim()))
         || lower.contains("file is not a database")
         || lower.contains("database file too small for header")
+        // The strict canonical read-only precheck's phrasing for a main file
+        // shorter than the 100-byte header; the same evidence as "too small
+        // for header", so a salvage source in this state degrades to an
+        // archive-only rebuild instead of blocking recovery.
+        || lower.contains("truncated sqlite database header")
         || lower.contains("invalid database header")
         || lower.contains("invalid database header magic")
         || lower.contains("invalid page size")
         || lower.contains("malformed page")
         || lower.contains("page checksum mismatch")
         || lower.contains("header checksum mismatch")
+        || lower.contains("referenced multiple times")
+        || lower.contains("2nd reference to page")
+        || lower.contains("freelist mismatch")
+        || lower.contains("freelist header claims")
+        || lower.contains("freelist trunk page") && lower.contains("is malformed")
+        || lower.contains("invalid freelist")
+        || lower.contains("invalid page link")
+        || lower.contains("invalid page-link")
+}
+
+fn is_cursor_type_mismatch_detail(detail: &str) -> bool {
+    let (rest, page_types) =
+        if let Some(rest) = detail.strip_prefix(": table_seek called on index page (type ") {
+            (rest, ["leafindex", "interiorindex"])
+        } else if let Some(rest) = detail.strip_prefix(": index_seek called on table page (type ") {
+            (rest, ["leaftable", "interiortable"])
+        } else {
+            return false;
+        };
+    let Some((page_type, location)) = rest.split_once(", page ") else {
+        return false;
+    };
+    let Some(location) = location.strip_suffix("): cursor is_table flag likely incorrect") else {
+        return false;
+    };
+    let Some(location_parts) = location.split_once(", root ") else {
+        return false;
+    };
+    page_types.contains(&page_type)
+        && <[&str; 2]>::from(location_parts).into_iter().all(|number| {
+            number.bytes().all(|byte| byte.is_ascii_digit())
+                && number.parse::<u32>().is_ok_and(|value| value > 0)
+        })
 }
 
 fn contains_wal_sidecar_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    (lower.contains("wal")
-        || lower.contains("-wal")
-        || lower.contains("shm")
-        || lower.contains("-shm"))
+    // A freelist "walk" is main-file evidence, not a WAL diagnostic. Match
+    // complete words, including filename suffixes (-wal/-shm) and compound
+    // labels (WAL-index, wal_header), without matching unrelated substrings.
+    lower
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|word| matches!(word, "wal" | "shm"))
         && (lower.contains("too small")
             || lower.contains("malformed")
             || lower.contains("invalid")
@@ -1133,6 +1210,7 @@ fn contains_engine_probe_limitation(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("out of memory")
         || lower.contains("cursor stack is empty")
+        || lower.contains("cursor is_table flag likely incorrect")
         || lower.contains("called `option::unwrap()` on a `none` value")
         || lower.contains("cursor must be on a leaf")
         || (lower.contains("internal error") && !contains_main_db_corruption(msg))
@@ -1288,6 +1366,193 @@ mod tests {
             "unexpected classification for {message:?}: {classification:?}"
         );
         classification
+    }
+
+    /// GH#312: a multi-form integrity probe joins every form's error into one
+    /// message. On current SQLite the table-valued `pragma_integrity_check(N)`
+    /// form fails first with "no such table: N" (the argument is quoted and
+    /// resolved as a table name), so the joined message carries a generic
+    /// schema-drift string *and* the real "database disk image is malformed"
+    /// verdict from the forms that ran. The corruption evidence must win; the
+    /// old order classified this as schema drift, `is_corruption_error`
+    /// returned false, and recovery treated a proven-corrupt source as
+    /// unclassifiable.
+    #[test]
+    fn explicit_main_db_corruption_outranks_schema_drift_noise_in_joined_probe_errors() {
+        let joined = "integrity_check failed: every integrity_check probe form failed — \
+             `SELECT integrity_check FROM pragma_integrity_check(1000000)`: Query error: no such table: 1000000; \
+             `PRAGMA integrity_check(1000000)`: Query error: database disk image is malformed; \
+             `SELECT integrity_check FROM pragma_integrity_check()`: Query error: no such table: pragma_integrity_check; \
+             `PRAGMA integrity_check`: Query error: database disk image is malformed";
+        assert_class(joined, DbErrorClass::MainDbBtreeCorruption);
+        assert!(is_corruption_error(joined));
+
+        // The generic strings alone still classify as drift, and the typed
+        // classifier stays conservative about raw schema-corruption strings.
+        assert_class(
+            "no such table: 1000000",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert_class(
+            "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+    }
+
+    #[test]
+    fn cursor_type_mismatch_is_engine_limitation_without_corruption_policy() {
+        for detail in [
+            "table_seek called on index page (type LeafIndex, page 1560, root 22)",
+            "table_seek called on index page (type InteriorIndex, page 42, root 42)",
+            "index_seek called on table page (type LeafTable, page 1560, root 22)",
+            "index_seek called on table page (type InteriorTable, page 42, root 42)",
+        ] {
+            let message = format!(
+                "SQLite error: Query error: database disk image is malformed: {detail}: \
+                 cursor is_table flag likely incorrect"
+            );
+            for message in [message.clone(), message.to_uppercase()] {
+                let classification = assert_class(&message, DbErrorClass::EngineProbeLimitation);
+                assert!(!classification.blocks_edits, "{message}");
+                assert!(classification.safe_to_continue_read_only, "{message}");
+                assert!(!classification.repairable, "{message}");
+                assert!(!classification.safe_to_retry, "{message}");
+                for error in [
+                    DbError::Sqlite(message.clone()),
+                    DbError::Pool(message.clone()),
+                    DbError::Schema(message.clone()),
+                    wrap_exhausted(DbError::Sqlite(message.clone())),
+                ] {
+                    assert!(!error.is_corruption(), "{error}");
+                    assert_eq!(error.failure_envelope().class, "engine_probe_limitation");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_type_mismatch_does_not_mask_other_corruption_evidence() {
+        let cursor = "database disk image is malformed: table_seek called on index page \
+                      (type LeafIndex, page 1560, root 22): cursor is_table flag likely incorrect";
+        for damage in [
+            "database disk image is malformed",
+            "database disk image is malformed: freelist mismatch",
+            "file is not a database",
+            "invalid database header",
+            "malformed page 42 in btree",
+            "page 12: page checksum mismatch",
+            "page 7 is referenced multiple times (freelist trunk[1] leaf[0]; index root -> child[0])",
+            "2nd reference to page 7",
+            "freelist mismatch",
+            "freelist header claims 4 pages but the freelist walk found 3",
+            "freelist trunk page 42 is malformed: invalid leaf count",
+            "invalid freelist next-page pointer",
+            "invalid page link from page 42 to 99",
+        ] {
+            for message in [format!("{cursor}; {damage}"), format!("{damage}; {cursor}")] {
+                assert_class(&message, DbErrorClass::MainDbBtreeCorruption);
+                assert!(is_corruption_error(&message), "{message}");
+            }
+        }
+        let integrity = DbError::IntegrityCorruption {
+            message: cursor.into(),
+            details: Vec::new(),
+        };
+        assert!(integrity.is_corruption());
+        assert_eq!(
+            integrity.classification().class,
+            DbErrorClass::MainDbBtreeCorruption
+        );
+        assert!(integrity.classification().blocks_edits);
+    }
+
+    #[test]
+    fn wal_sidecar_classifier_requires_distinct_wal_or_shm_tokens() {
+        for message in [
+            "freelist header claims 4 pages but the freelist walk found 3",
+            "invalid page link encountered while walking the btree",
+            "database disk image is malformed: wall-clock diagnostic attached",
+            "database disk image is malformed in /tmp/walnut/storage.sqlite3",
+            "database disk image is malformed in /tmp/freshman/storage.sqlite3",
+        ] {
+            assert!(!contains_wal_sidecar_corruption(message), "{message}");
+            assert_class(message, DbErrorClass::MainDbBtreeCorruption);
+            assert!(is_corruption_error(message), "{message}");
+        }
+        for message in [
+            "invalid argument: walrus",
+            "invalid argument: freshwater marshmallow",
+            "invalid argument: walé",
+            "WAL read completed",
+        ] {
+            assert!(!contains_wal_sidecar_corruption(message), "{message}");
+            assert_class(message, DbErrorClass::ConnectionOrConfigError);
+        }
+        for message in [
+            "WAL file too small for header during rebuild: read 0, need 32",
+            "WAL (32 bytes) header invalid: ChecksumMismatch",
+            "WAL file is corrupt: invalid checksum",
+            "invalid checksum in /tmp/storage.sqlite3-wal",
+            "malformed sidecar /tmp/storage.sqlite3-shm",
+            "SHM header is invalid",
+            "WAL-index checksum mismatch",
+            "invalid wal_header checksum",
+        ] {
+            assert_class(message, DbErrorClass::WalSidecarCorruption);
+            assert!(!is_corruption_error(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn cursor_type_mismatch_exemption_requires_the_complete_known_diagnostic() {
+        for detail in [
+            "cursor is_table flag likely incorrect",
+            "cursor stack is empty",
+            "cursor must be on a leaf",
+            "table_seek called on index page (type LeafIndex, page 1560, root 22)",
+            "table_seek called on index page (type LeafTable, page 1560, root 22): cursor is_table flag likely incorrect",
+            "table_seek called on index page (type LeafIndex, page 0, root 22): cursor is_table flag likely incorrect",
+            "table_seek called on index page (type LeafIndex, page 1560, root unknown): cursor is_table flag likely incorrect",
+            "table_seek called on index page (type LeafIndex, page 1560, root 22): cursor is_table flag likely incorrect; additional unknown damage",
+        ] {
+            let message = format!("database disk image is malformed: {detail}");
+            assert_class(&message, DbErrorClass::MainDbBtreeCorruption);
+            assert!(is_corruption_error(&message), "{message}");
+        }
+    }
+
+    /// GH#313: a lookup miss, a duplicate, or an invalid argument is a fact
+    /// about the request, not about storage. It must not inherit the
+    /// connection/config policy that marks reads unsafe and blocks edits.
+    #[test]
+    fn semantic_request_errors_do_not_carry_storage_failure_policy() {
+        for error in [
+            DbError::not_found("AgentLink", "1:41->1:42"),
+            DbError::duplicate("Agent", "BlueLake"),
+            DbError::invalid("ttl_seconds", "must be positive"),
+        ] {
+            let classification = error.classification();
+            assert_eq!(
+                classification.class,
+                DbErrorClass::RequestSemanticError,
+                "{error}"
+            );
+            assert!(classification.safe_to_continue_read_only, "{error}");
+            assert!(!classification.blocks_edits, "{error}");
+            assert!(!classification.repairable, "{error}");
+            assert!(!classification.safe_to_retry, "{error}");
+            let envelope = error.failure_envelope();
+            assert_eq!(envelope.class, "request_semantic_error");
+            assert!(!envelope.policy.blocks_edits);
+            assert!(envelope.policy.safe_to_continue_read_only);
+        }
+        // A row that cannot be decoded is still a storage-side fault.
+        assert_eq!(
+            DbError::Serialization("bad json".into())
+                .classification()
+                .class,
+            DbErrorClass::ConnectionOrConfigError
+        );
     }
 
     #[test]
@@ -1753,6 +2018,11 @@ mod tests {
         assert!(is_corruption_error("file is not a database"));
         assert!(is_corruption_error(
             "database file too small for header: 14 bytes (< 100)"
+        ));
+        // The strict canonical read-only precheck's wording for the same
+        // evidence (a main file shorter than the 100-byte header).
+        assert!(is_corruption_error(
+            "strict query-only open refused: /tmp/x/storage.sqlite3 has a truncated SQLite database header"
         ));
         assert!(is_corruption_error("invalid database header: bad magic"));
         assert!(is_corruption_error("page 12: xxh3 page checksum mismatch"));

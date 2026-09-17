@@ -40,11 +40,11 @@ state is unavailable; native invariant tests are authoritative for those fields.
 
 ## Current coverage (as of 2026-08-27)
 
-- The live Rust router exposes 48 tools.
+- The live Rust router exposes 49 tools.
 - 37 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
 - 5 additional Python-compatible tools retain inventory/input-schema compatibility, Rust-owned non-empty descriptions, and focused coverage: `fetch_topic`, `list_window_identities`, `sweep_stale_agents`, `summarize_recent`, and `fetch_summary`.
-- 6 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, and `get_message_delivery_receipt`.
-- The 6 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
+- 7 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, `check_file_reservation_conflicts`, `fetch_inbox_events`, `get_message_delivery_receipt`, and `mark_all_read`.
+- The 7 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
@@ -105,13 +105,14 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `summarize_recent` - Persist a bounded recent-project summary for later retrieval.
 - `fetch_summary` - Fetch persisted project summaries newest first.
 
-### Rust-native extensions (6)
+### Rust-native extensions (7)
 - `resolve_pane_identity` - Resolve the canonical agent name for a tmux pane from Rust-side identity files; there is no Python pane-identity analogue.
 - `cleanup_pane_identities` - Remove stale per-pane identity files for dead tmux panes; this is Rust-only operational cleanup tied to the pane identity model.
 - `list_agents` - List all registered agents in a project; this Rust-native identity surface is now covered by the dedicated `rust_native/` golden fixtures.
 - `check_file_reservation_conflicts` - Read-only authoritative conflict check for pre-edit/pre-commit guards (added in `08b05c76`, GH#196); covered by the dedicated `rust_native/` golden fixtures.
 - `fetch_inbox_events` - Read durable, body-free recipient delivery events with a restart-safe cursor; covered by the dedicated `rust_native/` golden fixtures.
 - `get_message_delivery_receipt` - Read durable per-recipient delivery state for a message; covered by the dedicated `rust_native/` golden fixtures.
+- `mark_all_read` - Mark every unread inbox message for an agent as read in one call; covered by the dedicated `rust_native/` golden fixtures.
 
 Full inventory and the current blocker record live in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 

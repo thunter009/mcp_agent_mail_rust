@@ -4039,6 +4039,8 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// stale snapshot across retries causes `fcw_base_drift` rejection where
 /// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve
 /// this by placing `begin_concurrent_tx` inside the closure passed here.
+/// Acquire pooled connections inside that closure too: failed attempts must
+/// return their lease before backoff so readers and other writers can proceed.
 async fn run_with_mvcc_retry<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
@@ -4061,6 +4063,34 @@ async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
     max: u32,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_inner(cx, operation, max, true, op).await
+}
+
+/// Retry a read without applying the corruption breaker's write refusal.
+/// Corruption returned by the read still trips the breaker for later writes.
+async fn run_read_with_mvcc_retry<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_inner(cx, operation, *MVCC_MAX_RETRIES, false, op).await
+}
+
+async fn run_with_mvcc_retry_inner<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    max: u32,
+    refuse_when_breaker_open: bool,
     mut op: F,
 ) -> Outcome<T, DbError>
 where
@@ -4069,10 +4099,12 @@ where
 {
     // K3 (br-bvq1x.11.3): if the corruption circuit breaker is open, refuse the
     // write immediately — without touching the database again — so agents stop
-    // hammering a corrupt store. Reads do not go through this wrapper, and the
+    // hammering a corrupt store. Read retries skip this refusal, and the
     // CLI/doctor sync path runs in a separate process, so recovery is never
     // gated.
-    if let Some(refusal) = crate::corruption_circuit_breaker().refusal_error() {
+    if refuse_when_breaker_open
+        && let Some(refusal) = crate::corruption_circuit_breaker().refusal_error()
+    {
         return Outcome::Err(refusal);
     }
 
@@ -4136,8 +4168,8 @@ where
                 return Outcome::Err(exhausted(e));
             }
             other => {
-                // K3: a hard, edit-blocking corruption surfaced on the write
-                // path — trip the breaker so subsequent writes are refused
+                // K3: a hard, edit-blocking corruption surfaced on a database
+                // operation — trip the breaker so subsequent writes are refused
                 // until the database is verified healthy again.
                 if let Outcome::Err(ref e) = other {
                     crate::corruption_circuit_breaker().observe_error(e);
@@ -4333,9 +4365,18 @@ pub async fn ensure_project(
         ));
     }
 
+    drop(conn);
+
     // Use an explicit write transaction and conflict-safe insert so project creation
     // participates in concurrent writer mode.
     let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = self::tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let row = ProjectRow::new(slug.clone(), resolved_human_key.clone());
@@ -4464,8 +4505,15 @@ pub async fn get_project_by_slug(
     }
 }
 
-/// Get project by `human_key` (cache-first)
-pub async fn get_project_by_human_key(
+/// Look up a project by its exact `human_key`, then by the filesystem alias
+/// inventory (a different spelling of the same on-disk object).
+///
+/// This never falls back to the slug. A caller that must not attach a
+/// distinct path to a slug-colliding project (the CLI's explicit project
+/// lookups behind destructive or linking verbs) uses this;
+/// [`get_project_by_human_key`] layers the stable-slug fallback on top so
+/// ordinary reads stay consistent with what [`ensure_project`] would reuse.
+pub async fn get_project_by_human_key_exact(
     cx: &Cx,
     pool: &DbPool,
     human_key: &str,
@@ -4522,6 +4570,39 @@ pub async fn get_project_by_human_key(
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Look up a project by `human_key`, with the stable-slug fallback.
+///
+/// GH-mined fix (PR #267 idea): `ensure_project` keys a project's identity
+/// on the *stable slug* derived by `resolve_project_identity` (which
+/// canonicalizes e.g. GitHub owner case), while `human_key` records one
+/// historical spelling. Reads apply the same identity fallback: otherwise a
+/// canonical key whose path does not exist on disk (so no filesystem alias
+/// matches) finds nothing by exact `human_key` even though a write through
+/// `ensure_project` would reuse the existing row via its slug. Only absolute
+/// keys are eligible; a relative identifier is a slug and its caller resolves
+/// it with [`get_project_by_slug`] first.
+pub async fn get_project_by_human_key(
+    cx: &Cx,
+    pool: &DbPool,
+    human_key: &str,
+) -> Outcome<ProjectRow, DbError> {
+    match get_project_by_human_key_exact(cx, pool, human_key).await {
+        Outcome::Err(DbError::NotFound { .. }) if Path::new(human_key).is_absolute() => {
+            // The exact lookup has released its connection, so this retry
+            // cannot deadlock a single-connection pool.
+            let slug = mcp_agent_mail_core::resolve_project_identity(human_key).slug;
+            match get_project_by_slug(cx, pool, &slug).await {
+                Outcome::Ok(row) => Outcome::Ok(row),
+                Outcome::Err(DbError::NotFound { .. }) => {
+                    Outcome::Err(DbError::not_found("Project", human_key))
+                }
+                other => other,
+            }
+        }
+        other => other,
     }
 }
 
@@ -5226,15 +5307,15 @@ pub async fn refresh_project_sibling_suggestions(
     cx: &Cx,
     pool: &DbPool,
 ) -> Outcome<ProjectSiblingRefreshSummary, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
-
     run_with_mvcc_retry(cx, "refresh_project_sibling_suggestions", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         if cx.checkpoint().is_err() {
             rollback_tx(cx, &tracked).await;
@@ -5467,15 +5548,15 @@ pub async fn update_project_sibling_status(
     } else {
         (other_id, project_id)
     };
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
-
     run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Timestamp each whole-transaction attempt once it owns the write
@@ -5605,7 +5686,8 @@ pub async fn update_project_sibling_status(
 // Database generation identity (br-n8qh6)
 // =============================================================================
 
-const SELECT_DB_GENERATION_SQL: &str = "SELECT generation_id FROM db_identity WHERE singleton = 0";
+pub(crate) const SELECT_DB_GENERATION_SQL: &str =
+    "SELECT generation_id FROM db_identity WHERE singleton = 0";
 
 /// Read this database's generation identity token, seeding it on first access.
 ///
@@ -5729,16 +5811,15 @@ pub async fn register_agent(
     }
     let now = now_micros();
     let (provisional, durable) = {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
         let (provisional, inserted_new) = {
-            let tracked = tracked(&*conn);
             match run_with_mvcc_retry(cx, "register_agent", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = tracked(&*conn);
                 try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
                 let program_s = program.to_string();
@@ -5859,7 +5940,6 @@ pub async fn register_agent(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
-        drop(conn);
         let durable = match finalize_register_agent_post_commit_probe(
             cx,
             pool,
@@ -6601,25 +6681,14 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         return Outcome::Ok(());
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return Outcome::Panicked(p);
-        }
-    };
-
-    let tracked = tracked(&*conn);
-
     let flush_outcome = run_with_mvcc_retry(cx, "flush_deferred_touches", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Batch UPDATE using VALUES CTE without UPDATE ... FROM so it remains
@@ -6741,15 +6810,15 @@ pub async fn consume_proof_nonce(
     retain_until: i64,
     now: i64,
 ) -> Outcome<NonceOutcome, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-
     run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
+
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Prune expired nonces (housekeeping; keeps the table bounded).
@@ -6823,6 +6892,7 @@ pub async fn set_agent_contact_policy(
     agent_id: i64,
     policy: &str,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -6831,7 +6901,6 @@ pub async fn set_agent_contact_policy(
     };
 
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         if try_in_tx!(
@@ -6966,6 +7035,7 @@ pub async fn set_agent_retired_at(
     agent_id: i64,
     retired_at: Option<i64>,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -6973,7 +7043,6 @@ pub async fn set_agent_retired_at(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         if try_in_tx!(
@@ -7165,6 +7234,7 @@ pub async fn deregister_agent(
     agent_id: i64,
     deregistered_at: i64,
 ) -> Outcome<AgentRow, DbError> {
+    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -7172,7 +7242,6 @@ pub async fn deregister_agent(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let tracked = tracked(&*conn);
-    let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let rows = try_in_tx!(
@@ -7292,15 +7361,14 @@ pub async fn set_agent_contact_policy_by_name(
         ));
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
     let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy_by_name", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let now = now_micros();
 
@@ -8002,39 +8070,39 @@ pub async fn create_message(
 ) -> Outcome<MessageRow, DbError> {
     let now = now_micros();
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    // mcp_agent_mail#176: allocate the canonical id from the process-wide
-    // monotonic allocator (see `create_message_with_recipients` for the full
-    // rationale) and insert it explicitly, so it can never be re-issued even
-    // when the live SQLite's durable AUTOINCREMENT fails to advance.
+    // mcp_agent_mail#176 / br-sa58k: the canonical id is elected durably
+    // inside the insert transaction below (see `create_message_with_recipients`
+    // for the full rationale), so it can never be re-issued — by this process,
+    // by another OS process attached to the same mailbox, or by a recovery
+    // generation racing an older pool. The archive seed is the allocator's
+    // once-per-process scan; it only matters before pool warmup has repaired
+    // the durable floor in this process.
     let id_allocator = pool.message_id_allocator();
-    let db_floor = match read_messages_id_floor(cx, &tracked).await {
-        Outcome::Ok(floor) => floor,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
     let storage_root = match pool.validated_storage_root("message creation archive allocator") {
         Ok(storage_root) => storage_root,
         Err(error) => return Outcome::Err(error),
     };
-    let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
-        Outcome::Ok(id) => id,
+    let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
+        Outcome::Ok(seed) => seed,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let message_id = try_in_tx!(
+            cx,
+            &tracked,
+            elect_message_id_in_tx(cx, &tracked, archive_seed).await
+        );
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
@@ -8086,7 +8154,7 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+    if let Err(error) = index_created_message_best_effort(pool, &row) {
         tracing::warn!(
             message_id = row.id.unwrap_or_default(),
             error = %error,
@@ -8097,102 +8165,144 @@ pub async fn create_message(
 }
 
 fn index_created_message_best_effort(
-    conn: &crate::DbConn,
+    pool: &DbPool,
     row: &MessageRow,
 ) -> std::result::Result<bool, String> {
     let Some(message_id) = row.id else {
         return Ok(false);
     };
-    let project_slug = conn
-        .query_sync(
-            "SELECT slug FROM projects WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.project_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_default();
-    let sender_name = conn
-        .query_sync(
-            "SELECT name FROM agents WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.sender_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-
-    let message = crate::search_v3::IndexableMessage {
-        id: message_id,
-        project_id: row.project_id,
-        project_slug,
-        sender_name,
-        subject: row.subject.clone(),
-        body_md: row.body_md.clone(),
-        thread_id: row.thread_id.clone(),
-        importance: row.importance.clone(),
-        created_ts: row.created_ts,
-    };
-    crate::search_v3::index_message(&message)
+    crate::search_v3::index_message(pool.sqlite_path(), message_id)
 }
 
-/// Read the messages-table allocator floor: the larger of `MAX(id)` and the
-/// maximum `sqlite_sequence` row for `messages`.
+/// Elect the next canonical message id durably inside the caller's write
+/// transaction (br-sa58k).
 ///
-/// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
-/// (mcp_agent_mail#176). A missing `sqlite_sequence` row is represented by the
-/// aggregate as `0`; a missing table, query failure, cancellation, panic, or
-/// malformed aggregate result is propagated rather than silently publishing a
-/// lower allocator floor.
-async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
-    // This read runs OUTSIDE the caller's retried write transaction, and the
-    // fsqlite 0.3.4 registry engine can answer a bare read with
-    // "database is busy" while concurrent writers hold the store (the
-    // pre-registry engine never surfaced busy on this path). Give it the same
-    // bounded contention retry the write body gets, so a transient busy here
-    // cannot fail message creation before the transaction even begins.
-    let outcome = run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
+/// The durable allocator state is `sqlite_sequence['messages']` — the same row
+/// pool warmup repairs against the archive floor
+/// ([`crate::id_floor::advance_messages_id_floor`]). Advancing it inside the
+/// transaction that inserts the message puts the read-modify-write under the
+/// transaction's writer reservation: independent OS processes serialize on
+/// the same write lock, so two installers attached to one mailbox can never
+/// elect the same id, and a crash or cancellation between election and insert
+/// rolls the reservation back instead of burning or duplicating an id. Every
+/// election also re-bases on the live `MAX(messages.id)`, which keeps the
+/// #176 degraded-engine failure mode (a live engine that stops advancing
+/// `sqlite_sequence` per write) reuse-proof without per-process memory.
+///
+/// `archive_seed` is the caller's once-per-process canonical archive scan
+/// ([`crate::id_floor::MessageIdAllocator::archive_seed`]); it is consulted
+/// only while the elected floor would otherwise start below what the archive
+/// already considers canonical — the window before pool warmup has run in
+/// this process.
+///
+/// Returns an id strictly greater than the durable sequence, the live
+/// `MAX(messages.id)`, and the archive seed. Exhausting the positive i64
+/// row-id range fails closed with the whole transaction rolled back.
+async fn elect_message_id_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    archive_seed: i64,
+) -> Outcome<i64, DbError> {
+    let max_id_rows = try_in_tx!(
+        cx,
+        tracked,
         map_sql_outcome(
             traw_query(
                 cx,
                 tracked,
-                "SELECT MAX(v) AS v FROM (\
-                    SELECT COALESCE(MAX(id), 0) AS v FROM messages \
-                    UNION ALL \
-                    SELECT COALESCE(MAX(seq), 0) AS v \
-                      FROM sqlite_sequence WHERE name = 'messages'\
-                 )",
+                "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages",
                 &[],
             )
-            .await,
+            .await
         )
-    })
-    .await;
-    decode_messages_id_floor_outcome(outcome)
-}
-
-fn decode_messages_id_floor_outcome(
-    outcome: Outcome<Vec<SqlRow>, DbError>,
-) -> Outcome<i64, DbError> {
-    let rows = match outcome {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    );
+    let Some(max_id) = max_id_rows.first().and_then(row_first_i64) else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election: MAX(id) aggregate returned no decodable row".to_string(),
+        ));
     };
-    if rows.len() != 1 {
+
+    // Ensure the durable allocator row exists, seeded once per database
+    // lifetime from the live MAX(id) and the archive scan. The statement is
+    // idempotent under the writer reservation.
+    let seed_floor = max_id.max(archive_seed).max(0);
+    let inserted = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "INSERT INTO sqlite_sequence (name, seq) \
+                 SELECT 'messages', ?1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'messages')",
+                &[Value::BigInt(seed_floor)],
+            )
+            .await
+        )
+    );
+    if inserted > 1 {
+        rollback_tx(cx, tracked).await;
         return Outcome::Err(DbError::Internal(format!(
-            "read_messages_id_floor: aggregate returned {} rows instead of exactly one",
-            rows.len()
+            "message id election: allocator seed matched {inserted} rows"
         )));
     }
-    match rows.first().and_then(row_first_i64) {
-        Some(floor) if floor >= 0 => Outcome::Ok(floor),
-        Some(floor) => Outcome::Err(DbError::Internal(format!(
-            "read_messages_id_floor: aggregate returned negative floor {floor}"
-        ))),
-        None => Outcome::Err(DbError::Internal(
-            "read_messages_id_floor: aggregate row did not contain an i64 floor".to_string(),
-        )),
+
+    let seq_rows = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                "SELECT COALESCE(MAX(seq), 0) AS seq \
+                 FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await
+        )
+    );
+    let Some(durable_seq) = seq_rows.first().and_then(row_first_i64) else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election: allocator sequence aggregate returned no decodable row"
+                .to_string(),
+        ));
+    };
+
+    let Some(elected) = durable_seq
+        .max(max_id)
+        .max(archive_seed)
+        .max(0)
+        .checked_add(1)
+    else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "message id election exhausted the positive i64 row-id range".to_string(),
+        ));
+    };
+
+    let updated = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                tracked,
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'messages'",
+                &[Value::BigInt(elected)],
+            )
+            .await
+        )
+    );
+    if updated != 1 {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::Internal(format!(
+            "message id election: allocator row update matched {updated} rows"
+        )));
     }
+    Outcome::Ok(elected)
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -8508,49 +8618,53 @@ async fn create_message_with_recipients_impl(
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
     let (row, writer_post_commit_counts) = {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
-        let tracked = tracked(&*conn);
-
-        // mcp_agent_mail#176: allocate the canonical message id from the
-        // process-wide monotonic allocator rather than relying on the live
-        // SQLite's AUTOINCREMENT. While the database is held suspect
+        // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
+        // durably inside the insert transaction (see
+        // `create_message_with_recipients_tx`) rather than relying on the
+        // live SQLite's AUTOINCREMENT. While the database is held suspect
         // (canonical-fallback mode, the #151 NOCASE family), the durable
         // allocator can fail to advance per-write and re-issue an id the
         // archive already considers canonical — the duplicate-canonical-file
         // reject (#130) then trips a non-clearable durability latch. The
-        // allocator derives the next id as
-        // `max(in_memory_high_water, db_floor, archive_max) + 1` atomically,
-        // so consecutive creations can never collide regardless of which
-        // surface is authoritative. We compute it once here (under the global
-        // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
-        // stable id.
+        // in-transaction election re-bases on the durable
+        // `sqlite_sequence` row, the live `MAX(messages.id)`, and this
+        // process's once-per-lifetime archive scan, so consecutive creations
+        // can never collide across processes or recovery generations
+        // regardless of which surface is authoritative. MVCC retries re-elect
+        // inside the retried transaction, so a rolled-back attempt never
+        // burns an id.
         let id_allocator = pool.message_id_allocator();
-        let db_floor = match read_messages_id_floor(cx, &tracked).await {
-            Outcome::Ok(floor) => floor,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        let mut archive_seed = if idempotency.is_some() {
+            // Warm keyed sends need only the authoritative insert transaction;
+            // this lookup performs no archive validation or filesystem work.
+            match id_allocator.cached_archive_seed() {
+                Ok(seed) => seed,
+                Err(error) => return Outcome::Err(error),
+            }
+        } else {
+            // No key can replay, so preserve the ordinary one-transaction path.
+            let storage_root =
+                match pool.validated_storage_root("message creation archive allocator") {
+                    Ok(root) => root,
+                    Err(error) => return Outcome::Err(error),
+                };
+            Some(match id_allocator.archive_seed(cx, storage_root).await {
+                Outcome::Ok(seed) => seed,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            })
         };
-        let storage_root = match pool.validated_storage_root("message creation archive allocator") {
-            Ok(storage_root) => storage_root,
-            Err(error) => return Outcome::Err(error),
-        };
-        let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
-            Outcome::Ok(id) => id,
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
-
-        let created_outcome =
-            match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
-                create_message_with_recipients_tx(
+        let (created_outcome, conn) = loop {
+            match run_with_mvcc_retry(cx, "create_message_with_recipients", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = tracked(&*conn);
+                match create_message_with_recipients_tx(
                     cx,
                     &tracked,
                     project_id,
@@ -8565,18 +8679,52 @@ async fn create_message_with_recipients_impl(
                     attachments,
                     recipients,
                     now,
-                    message_id,
+                    archive_seed,
                     idempotency,
                     idempotency_expires_ts,
                 )
+                .await
+                {
+                    // Retain only the successful writer for its post-commit
+                    // sample. Failed attempts release their lease before sleep.
+                    Outcome::Ok(created) => Outcome::Ok((created, conn)),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
             })
             .await
             {
-                Outcome::Ok(created) => created,
+                Outcome::Ok((Some(created), conn)) => break (created, conn),
+                Outcome::Ok((None, conn)) => {
+                    drop(conn);
+                    // The key check found a fresh request and rolled back.
+                    // Scan without holding transaction/page authority, then
+                    // repeat the authoritative check in the insert transaction.
+                    let storage_root =
+                        match pool.validated_storage_root("message creation archive allocator") {
+                            Ok(root) => root,
+                            Err(error) => return Outcome::Err(error),
+                        };
+                    archive_seed = Some(
+                        match pool
+                            .message_id_allocator()
+                            .archive_seed(cx, storage_root)
+                            .await
+                        {
+                            Outcome::Ok(seed) => seed,
+                            Outcome::Err(error) => return Outcome::Err(error),
+                            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                        },
+                    );
+                }
                 Outcome::Err(e) => return Outcome::Err(e),
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
+            }
+        };
+        let tracked = tracked(&*conn);
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -8822,10 +8970,10 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     now: i64,
-    message_id: i64,
+    archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
     idempotency_expires_ts: i64,
-) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+) -> Outcome<Option<IdempotentOutcome<MessageRow>>, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
@@ -8844,13 +8992,13 @@ async fn create_message_with_recipients_tx(
                     &result_json,
                     "create_message_with_recipients",
                 ) {
-                    Ok(row) => Outcome::Ok(IdempotentOutcome::Replayed(row)),
+                    Ok(row) => Outcome::Ok(Some(IdempotentOutcome::Replayed(row))),
                     Err(e) => Outcome::Err(e),
                 };
             }
             Outcome::Ok(IdempotencyCheck::Conflict(info)) => {
                 rollback_tx(cx, tracked).await;
-                return Outcome::Ok(IdempotentOutcome::Conflict(info));
+                return Outcome::Ok(Some(IdempotentOutcome::Conflict(info)));
             }
             Outcome::Err(e) => {
                 rollback_tx(cx, tracked).await;
@@ -8867,10 +9015,35 @@ async fn create_message_with_recipients_tx(
         }
     }
 
+    // None requests archive seeding from the caller outside this transaction.
+    // The caller must repeat this same authoritative key check with the seed.
+    let Some(archive_seed) = archive_seed else {
+        // Unlike best-effort error cleanup, this rollback is a required phase
+        // boundary: never start filesystem work while transaction release is
+        // unproven. The existing retry wrapper can retry a refused rollback.
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(tracked.execute(cx, "ROLLBACK", &[]).await)
+        );
+        return Outcome::Ok(None);
+    };
     try_in_tx!(
         cx,
         tracked,
         ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
+    );
+
+    // Elect the canonical id durably inside this transaction, AFTER the
+    // idempotency gate so a replayed key never burns a fresh id, and BEFORE
+    // any write that references it. br-sa58k: this is what makes the election
+    // atomic across independent OS processes — the transaction's writer
+    // reservation serializes every attach process on the same durable
+    // `sqlite_sequence` row.
+    let message_id = try_in_tx!(
+        cx,
+        tracked,
+        elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
 
     // Fetch recipient names to build recipients_json
@@ -9054,7 +9227,7 @@ async fn create_message_with_recipients_tx(
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
 
-    Outcome::Ok(IdempotentOutcome::Fresh(row))
+    Outcome::Ok(Some(IdempotentOutcome::Fresh(row)))
 }
 
 // ── Idempotency key helpers (br-idempotency-keys-mutating-tools-h0x9k) ───────
@@ -10138,7 +10311,9 @@ pub async fn fetch_inbox_delivery_events(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    match crate::sync::inbox_delivery_events_from_conn(&conn, project_id, agent_id, after, limit) {
+    let db_conn: &crate::DbConn = &conn;
+    match crate::sync::inbox_delivery_events_from_conn(db_conn, project_id, agent_id, after, limit)
+    {
         Ok(page) => Outcome::Ok(page),
         Err(crate::sync::InboxDeliveryEventError::Database(error)) => Outcome::Err(error),
         Err(crate::sync::InboxDeliveryEventError::CursorExpired {
@@ -10170,17 +10345,17 @@ pub async fn append_message_delivery_signal_receipt(
     signal_path_digest: &str,
     observed_ts: i64,
 ) -> Outcome<(), DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
     let delivery_route = delivery_route.to_string();
     let signal_path_digest = signal_path_digest.to_string();
 
     run_with_mvcc_retry(cx, "append_message_delivery_signal_receipt", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
         let insert_params = [
             Value::BigInt(message_id),
@@ -11782,17 +11957,17 @@ pub async fn add_recipients(
     message_id: i64,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<(), DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
     // Batch all recipient inserts in a single transaction (1 fsync instead of N).
     run_with_mvcc_retry(cx, "add_recipients", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
+
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         for (agent_id, kind) in recipients {
@@ -11825,6 +12000,7 @@ pub async fn mark_message_read(
 ) -> Outcome<i64, DbError> {
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_message_read", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11833,7 +12009,6 @@ pub async fn mark_message_read(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "mark_message_read", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Idempotent: set read_ts if NULL. Acknowledgements are intentionally
@@ -11864,7 +12039,7 @@ pub async fn mark_message_read(
         //
         // We intentionally do not trust `rows_affected` from the UPDATE above:
         // under some backend/runtime combinations, updates that clearly match
-        // a row can report 0. Existence is determined by this read-back query.
+        // a row can report 0. Require the actual stored receipt instead.
         let read_sql =
             "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
@@ -11877,14 +12052,21 @@ pub async fn mark_message_read(
                         format!("{agent_id}:{message_id}"),
                     ));
                 }
-                rows.first()
+                let Some(ts) = rows
+                    .first()
                     .and_then(|r| r.get(0))
-                    .and_then(|v| match v {
+                    .and_then(|value| match value {
                         Value::BigInt(n) => Some(*n),
                         Value::Int(n) => Some(i64::from(*n)),
                         _ => None,
                     })
-                    .unwrap_or(now)
+                else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "mark_message_read did not store an integer read_ts for {agent_id}:{message_id}"
+                    )));
+                };
+                ts
             }
             Outcome::Err(e) => {
                 rollback_tx(cx, &tracked).await;
@@ -11931,15 +12113,15 @@ pub async fn mark_messages_read_batch(
 
     let now = now_micros();
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
     run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Batch UPDATE: mark all messages read in one pass per chunk.
@@ -11989,6 +12171,7 @@ pub async fn mark_all_messages_read_in_project(
 ) -> Outcome<i64, DbError> {
     let now = now_micros();
 
+    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -11997,7 +12180,6 @@ pub async fn mark_all_messages_read_in_project(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Identify which messages are actually unread for this agent in this project.
@@ -12087,6 +12269,389 @@ pub async fn mark_all_messages_read_in_project(
     .await
 }
 
+/// Result of a capped bulk mark-read pass (GH#273).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkMarkReadOutcome {
+    /// Number of messages newly marked read for the agent in this call.
+    pub marked: u64,
+    /// True when more unread messages matching the filters remain (the caller
+    /// should call again to continue draining the backlog).
+    pub more: bool,
+}
+
+/// Mark up to `limit` unread messages read for one agent in one project.
+///
+/// GH#273: the bulk mark-read primitive behind the `mark_all_read` MCP tool
+/// and the `am mark-all-read` CLI verb.
+///
+/// Differences from [`mark_all_messages_read_in_project`] (the uncapped web
+/// dashboard path):
+/// - `older_than_us`: when `Some`, only messages with `created_ts <=
+///   older_than_us` are marked (lets operators drain aged backlog while
+///   keeping fresh mail unread).
+/// - `limit`: hard cap on messages transitioned per call; oldest messages
+///   (lowest id) are marked first, and the returned `more` flag reports
+///   whether eligible unread rows remain past the cap.
+///
+/// Read receipts only: acknowledgement state (`ack_ts`) is never touched.
+pub async fn mark_messages_read_bulk(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    older_than_us: Option<i64>,
+    limit: usize,
+) -> Outcome<BulkMarkReadOutcome, DbError> {
+    if limit == 0 {
+        return Outcome::Ok(BulkMarkReadOutcome {
+            marked: 0,
+            more: false,
+        });
+    }
+    let now = now_micros();
+
+    run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Select the exact unread rows this call will transition (oldest-first
+        // by id, over-fetch by one to detect remaining backlog) so the count
+        // and the `more` flag are truthful even with unreliable rows_affected.
+        let mut find_sql = String::from(
+            "SELECT m.id FROM message_recipients r \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE r.agent_id = ? AND r.read_ts IS NULL \
+             AND m.project_id = ?",
+        );
+        let mut find_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+        if let Some(cutoff) = older_than_us {
+            find_sql.push_str(" AND m.created_ts <= ?");
+            find_params.push(Value::BigInt(cutoff));
+        }
+        find_sql.push_str(" ORDER BY m.id LIMIT ?");
+        let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        find_params.push(Value::BigInt(overfetch));
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &find_sql, &find_params).await)
+        );
+
+        let mut message_ids = Vec::with_capacity(rows.len().min(limit));
+        for row in &rows {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "bulk mark-read query returned a message without an integer id".to_string(),
+                ));
+            };
+            if message_ids.len() < limit {
+                message_ids.push(message_id);
+            }
+        }
+        let more = rows.len() > limit;
+
+        if !message_ids.is_empty() {
+            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "UPDATE message_recipients \
+                     SET read_ts = ? \
+                     WHERE agent_id = ? AND read_ts IS NULL \
+                     AND message_id IN ({ph})"
+                );
+                let mut params = Vec::with_capacity(2 + chunk.len());
+                params.push(Value::BigInt(now));
+                params.push(Value::BigInt(agent_id));
+                params.extend(chunk.iter().copied().map(Value::BigInt));
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                );
+
+                // Do not report success unless every selected row in this
+                // chunk is now read (see mark_all_messages_read_in_project).
+                let verify_sql = format!(
+                    "SELECT COUNT(*) FROM message_recipients \
+                     WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
+                );
+                let mut verify_params = Vec::with_capacity(1 + chunk.len());
+                verify_params.push(Value::BigInt(agent_id));
+                verify_params.extend(chunk.iter().copied().map(Value::BigInt));
+                let verify_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &verify_params).await)
+                );
+                let remaining = verify_rows.first().and_then(row_first_i64).unwrap_or(0);
+                if remaining > 0 {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
+                    )));
+                }
+            }
+
+            // Rebuild inbox_stats from ground truth.
+            try_in_tx!(
+                cx,
+                &tracked,
+                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+            );
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+
+        Outcome::Ok(BulkMarkReadOutcome {
+            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            more,
+        })
+    })
+    .await
+}
+
+/// SQL predicate selecting "settled" messages eligible for retention pruning
+/// (GH#273): every recipient has read the message, and — when the message
+/// requires acknowledgement — every recipient has acknowledged it. A message
+/// with no recipient rows left (e.g. repaired FK orphans) is vacuously
+/// settled. The caller adds the age horizon (`m.created_ts <= ?`).
+const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+     SELECT 1 FROM message_recipients r \
+     WHERE r.message_id = m.id \
+       AND (r.read_ts IS NULL \
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+
+/// Count settled messages older than `older_than_us` (GH#273).
+///
+/// "Settled" means read by every recipient and acked where the message
+/// requires it — i.e. exactly what a retention prune at that horizon WOULD
+/// delete. Used by the retention worker's report-only mode when
+/// `MESSAGES_RETENTION_DAYS` is off.
+pub async fn count_prunable_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+) -> Outcome<u64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!(
+        "SELECT COUNT(*) FROM messages m WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE}"
+    );
+    let params = [Value::BigInt(older_than_us)];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let count = rows.first().and_then(row_first_i64).unwrap_or(0);
+            Outcome::Ok(u64::try_from(count).unwrap_or(0))
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Result of one retention prune sweep over the `messages` table (GH#273).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagePruneReport {
+    /// `messages` rows deleted.
+    pub deleted_messages: u64,
+    /// `message_recipients` rows deleted alongside their messages.
+    pub deleted_recipients: u64,
+    /// True when eligible messages remain past the per-sweep cap (the next
+    /// sweep will continue).
+    pub more: bool,
+}
+
+/// Retention sweep: hard-`DELETE` settled messages older than `older_than_us`
+/// (GH#273, the demand-side twin of [`prune_released_file_reservations`]).
+///
+/// A message is eligible when BOTH:
+///   1. it is settled — every recipient has `read_ts`, and every recipient
+///      has `ack_ts` when the message has `ack_required` — so unread or
+///      unacknowledged mail is NEVER pruned, AND
+///   2. `created_ts <= older_than_us`.
+///
+/// The per-project git archive (`projects/<slug>/messages/YYYY/MM/*.md` plus
+/// mailbox copies) retains the full message history independently, so the DB
+/// delete is non-destructive to the durable record — the same precedent as
+/// the file-reservation retention prune (GH#154).
+///
+/// Deletes are executed oldest-first in bounded batches of `batch_size`
+/// messages, each in its own transaction (fsqlite-friendly: bounded write
+/// sets, never one giant transaction), with at most `max_messages` messages
+/// removed per sweep. Rows referencing each pruned message are removed in
+/// FK-safe order inside the same transaction: signal receipts and delivery
+/// events first, then recipient rows, then the message itself (the
+/// `messages_ad` trigger clears `fts_messages`). Affected agents'
+/// `inbox_stats` are rebuilt in-transaction and their cached counts
+/// invalidated post-commit.
+pub async fn prune_settled_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+    batch_size: usize,
+    max_messages: usize,
+) -> Outcome<MessagePruneReport, DbError> {
+    let mut report = MessagePruneReport::default();
+    if max_messages == 0 {
+        return Outcome::Ok(report);
+    }
+    let batch_size = batch_size.clamp(1, MAX_IN_CLAUSE_ITEMS);
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Select eligible ids first (mirrors prune_released_file_reservations —
+    // never trust a correlated DELETE), over-fetching by one so the report
+    // can state whether backlog remains past the per-sweep cap.
+    let select_sql = format!(
+        "SELECT m.id FROM messages m \
+         WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} \
+         ORDER BY m.id LIMIT ?"
+    );
+    let overfetch = i64::try_from(max_messages.saturating_add(1)).unwrap_or(i64::MAX);
+    let params = [Value::BigInt(older_than_us), Value::BigInt(overfetch)];
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len().min(max_messages));
+    for row in &rows {
+        if let Some(id) = row_first_i64(row)
+            && ids.len() < max_messages
+        {
+            ids.push(id);
+        }
+    }
+    report.more = rows.len() > max_messages;
+    if ids.is_empty() {
+        return Outcome::Ok(report);
+    }
+    drop(conn);
+
+    for chunk in ids.chunks(batch_size) {
+        let ph = placeholders(chunk.len());
+        let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+
+        let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let tracked = self::tracked(&*conn);
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+            // Capture affected recipients before their rows are removed so
+            // inbox_stats can be rebuilt from ground truth in this
+            // transaction.
+            let agents_sql = format!(
+                "SELECT DISTINCT agent_id FROM message_recipients WHERE message_id IN ({ph})"
+            );
+            let agent_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &agents_sql, &chunk_params).await)
+            );
+            let mut agent_ids: Vec<i64> = Vec::with_capacity(agent_rows.len());
+            for row in &agent_rows {
+                if let Some(agent_id) = row_first_i64(row) {
+                    agent_ids.push(agent_id);
+                }
+            }
+
+            // FK-safe cascade order: children first, message row last.
+            let del_receipts =
+                format!("DELETE FROM message_delivery_signal_receipts WHERE message_id IN ({ph})");
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_receipts, &chunk_params).await)
+            );
+
+            let del_events =
+                format!("DELETE FROM inbox_delivery_events WHERE message_id IN ({ph})");
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
+            );
+
+            let del_recipients =
+                format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
+            let recipients_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_recipients, &chunk_params).await)
+            );
+
+            let del_messages = format!("DELETE FROM messages WHERE id IN ({ph})");
+            let messages_deleted = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &del_messages, &chunk_params).await)
+            );
+
+            if !agent_ids.is_empty() {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
+                );
+            }
+
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids))
+        })
+        .await;
+
+        let chunk_agents = match batch_outcome {
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids)) => {
+                report.deleted_messages = report.deleted_messages.saturating_add(messages_deleted);
+                report.deleted_recipients =
+                    report.deleted_recipients.saturating_add(recipients_deleted);
+                agent_ids
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Post-commit invalidation so concurrent readers repopulate fresh
+        // counts (see mark_message_read).
+        let scope = cache_scope_for_pool(pool);
+        for agent_id in chunk_agents {
+            crate::cache::read_cache().invalidate_inbox_stats_scoped(&scope, agent_id);
+        }
+    }
+
+    Outcome::Ok(report)
+}
+
 /// Acknowledge message
 pub async fn acknowledge_message(
     cx: &Cx,
@@ -12140,6 +12705,7 @@ async fn acknowledge_message_impl(
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
+    run_with_mvcc_retry(cx, "acknowledge_message", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -12148,7 +12714,6 @@ async fn acknowledge_message_impl(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "acknowledge_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
@@ -12214,7 +12779,7 @@ async fn acknowledge_message_impl(
         //
         // We intentionally do not trust `rows_affected` from the UPDATE above:
         // under some backend/runtime combinations, updates that clearly match
-        // a row can report 0. Existence is determined by this read-back query.
+        // a row can report 0. Require both actual stored receipts instead.
         let read_sql =
             "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
@@ -12229,22 +12794,22 @@ async fn acknowledge_message_impl(
                         ));
                     }
                     let row = rows.first();
-                    let read_ts = row
-                        .and_then(|r| r.get(0))
-                        .and_then(|v| match v {
-                            Value::BigInt(n) => Some(*n),
-                            Value::Int(n) => Some(i64::from(*n)),
-                            _ => None,
-                        })
-                        .unwrap_or(now);
-                    let ack_ts = row
-                        .and_then(|r| r.get(1))
-                        .and_then(|v| match v {
-                            Value::BigInt(n) => Some(*n),
-                            Value::Int(n) => Some(i64::from(*n)),
-                            _ => None,
-                        })
-                        .unwrap_or(now);
+                    let read_ts = row.and_then(|r| r.get(0)).and_then(|value| match value {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    });
+                    let ack_ts = row.and_then(|r| r.get(1)).and_then(|value| match value {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    });
+                    let (Some(read_ts), Some(ack_ts)) = (read_ts, ack_ts) else {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::Internal(format!(
+                            "acknowledge_message did not store integer read_ts and ack_ts for {agent_id}:{message_id}"
+                        )));
+                    };
                     (read_ts, ack_ts)
                 }
                 Outcome::Err(e) => {
@@ -12338,15 +12903,15 @@ pub async fn acknowledge_messages_batch(
 
     let now = now_micros();
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
     run_with_mvcc_retry(cx, "acknowledge_messages_batch", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
@@ -12956,7 +13521,7 @@ pub async fn get_reservation_conflict_snapshot(
         ));
     }
 
-    run_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
+    run_read_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(conn) => conn,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -13539,7 +14104,7 @@ pub async fn get_active_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "get_active_reservations", || {
+    run_read_with_mvcc_retry(cx, "get_active_reservations", || {
         get_active_reservations_once(cx, pool, project_id)
     })
     .await
@@ -13659,7 +14224,7 @@ pub async fn list_released_unexpired_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
         list_released_unexpired_reservations_once(cx, pool, project_id)
     })
     .await
@@ -14207,6 +14772,8 @@ pub async fn renew_reservations(
     let now = now_micros();
     let extend = extend_seconds.saturating_mul(1_000_000);
 
+    // Retry the whole read-modify-write with an attempt-local connection.
+    run_with_mvcc_retry(cx, "renew_reservations", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -14216,9 +14783,7 @@ pub async fn renew_reservations(
 
     let tracked = tracked(&*conn);
 
-    // Wrap entire read-modify-write in a transaction so partial renewals
-    // cannot occur if the process crashes or is cancelled mid-loop.
-    run_with_mvcc_retry(cx, "renew_reservations", || async {
+    // Partial renewals cannot occur if the process crashes or is cancelled.
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
@@ -14330,7 +14895,7 @@ pub async fn list_file_reservations(
     project_id: i64,
     active_only: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_file_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_file_reservations", || {
         list_file_reservations_once(cx, pool, project_id, active_only, None, 0, false)
     })
     .await
@@ -14350,7 +14915,7 @@ pub async fn list_file_reservations_page(
     limit: usize,
     offset: usize,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_file_reservations_page", || {
+    run_read_with_mvcc_retry(cx, "list_file_reservations_page", || {
         list_file_reservations_once(cx, pool, project_id, active_only, Some(limit), offset, true)
     })
     .await
@@ -14614,7 +15179,7 @@ pub async fn list_unreleased_file_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    run_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
+    run_read_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
         list_unreleased_file_reservations_once(cx, pool, project_id)
     })
     .await
@@ -14776,6 +15341,7 @@ pub async fn request_contact(
         None
     };
 
+    run_with_mvcc_retry(cx, "request_contact", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -14784,7 +15350,6 @@ pub async fn request_contact(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "request_contact", || async {
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
         // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
@@ -14911,15 +15476,15 @@ pub async fn respond_contact(
         None
     };
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
     run_with_mvcc_retry(cx, "respond_contact", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let existing_sql = format!(
@@ -15335,7 +15900,15 @@ pub async fn ensure_product(
             }
 
             // Product doesn't exist, create it.
+            drop(conn);
             run_with_mvcc_retry(cx, "ensure_product", || async {
+                let conn = match acquire_conn(cx, pool).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let tracked = self::tracked(&*conn);
                 try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
                 let insert_sql = "INSERT INTO products (product_uid, name, created_at) \
                                   VALUES (?, ?, ?) ON CONFLICT(product_uid) DO NOTHING";
@@ -15388,6 +15961,7 @@ pub async fn link_product_to_projects(
     product_id: i64,
     project_ids: &[i64],
 ) -> Outcome<usize, DbError> {
+    run_with_mvcc_retry(cx, "link_product_to_projects", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -15397,7 +15971,6 @@ pub async fn link_product_to_projects(
 
     let tracked = tracked(&*conn);
 
-    run_with_mvcc_retry(cx, "link_product_to_projects", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let mut linked = 0usize;
@@ -16259,6 +16832,7 @@ pub async fn insert_system_agent(
 ) -> Outcome<AgentRow, DbError> {
     let now = now_micros();
 
+    let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -16267,42 +16841,67 @@ pub async fn insert_system_agent(
     };
 
     let tracked = tracked(&*conn);
-    let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        let insert_sql = "INSERT INTO agents \
-            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(project_id, name) DO NOTHING";
-        let insert_params = [
-            Value::BigInt(project_id),
-            Value::Text(name.to_string()),
-            Value::Text(program.to_string()),
-            Value::Text(model.to_string()),
-            Value::Text(task_description.to_string()),
-            Value::BigInt(now),
-            Value::BigInt(now),
-            Value::Text("auto".to_string()),
-            Value::Text("auto".to_string()),
-            Value::BigInt(0),
-        ];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-        );
-
+        // Agent names are unique per project case-insensitively through the
+        // v10b index `agents(project_id, name COLLATE NOCASE)`. An upsert with
+        // `ON CONFLICT(project_id, name)` names a different conflict target
+        // (binary collation), so a case-variant of an existing name is not
+        // routed to DO NOTHING and the index raises a UNIQUE failure instead.
+        // Select first under the index's collation, insert only when absent,
+        // and treat a UNIQUE failure from a concurrent insert as "exists".
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                           registration_token, retired_at \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-        let rows = try_in_tx!(
+        let mut rows = try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
         );
+        if rows.is_empty() {
+            let insert_sql = "INSERT INTO agents \
+                (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            let insert_params = [
+                Value::BigInt(project_id),
+                Value::Text(name.to_string()),
+                Value::Text(program.to_string()),
+                Value::Text(model.to_string()),
+                Value::Text(task_description.to_string()),
+                Value::BigInt(now),
+                Value::BigInt(now),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+                Value::BigInt(0),
+            ];
+            match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+                Outcome::Ok(_) => {}
+                Outcome::Err(error)
+                    if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("unique constraint failed") => {}
+                Outcome::Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+            rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
+            );
+        }
         let Some(found) = rows.first().map(decode_agent_row_indexed) else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::Internal(format!(
@@ -16488,6 +17087,7 @@ pub async fn append_atc_experience(
     };
 
     {
+        match run_with_mvcc_retry(cx, "append_atc_experience", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -16496,7 +17096,6 @@ pub async fn append_atc_experience(
         };
 
         let tracked = tracked(&*conn);
-        match run_with_mvcc_retry(cx, "append_atc_experience", || async {
             try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
             let insert_sql = "INSERT INTO atc_experiences \
@@ -16824,15 +17423,15 @@ pub async fn transition_atc_experience(
     };
 
     let pooled_outcome = {
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
-        let tracked = tracked(&*conn);
         run_with_mvcc_retry(cx, "transition_atc_experience", || async {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+
+            let tracked = tracked(&*conn);
             transition_atc_experience_tx(
                 cx,
                 &tracked,
@@ -17186,6 +17785,7 @@ pub async fn overwrite_resolved_atc_experience_outcome(
         Err(error) => return Outcome::Err(error),
     };
 
+    run_with_mvcc_retry(cx, "overwrite_resolved_atc_experience_outcome", || async {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -17194,7 +17794,6 @@ pub async fn overwrite_resolved_atc_experience_outcome(
     };
 
     let tracked = tracked(&*conn);
-    run_with_mvcc_retry(cx, "overwrite_resolved_atc_experience_outcome", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let rows = try_in_tx!(
@@ -18201,6 +18800,7 @@ mod tests {
     struct EventCapture {
         events: Arc<Mutex<Vec<CapturedEvent>>>,
         next_id: Arc<AtomicU64>,
+        retry_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl EventCapture {
@@ -18266,6 +18866,12 @@ mod tests {
         fn event(&self, event: &Event<'_>) {
             let mut fields = EventFieldCapture::default();
             event.record(&mut fields);
+            if fields.fields.iter().any(|(name, value)| {
+                name == "message" && value.contains("retrying whole transaction")
+            }) && let Some(observer) = &self.retry_observer
+            {
+                observer();
+            }
             self.events
                 .lock()
                 .expect("event capture lock poisoned")
@@ -18281,6 +18887,75 @@ mod tests {
     }
 
     // ── D3 (br-bvq1x.4.3): retry budget exhaustion wrapping ──────────
+
+    #[test]
+    fn write_retry_returns_single_pool_connection_before_backoff() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (_dir, pool) =
+            create_file_pool_with_schema_for_test_with_max("retry-releases-lease", 1);
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build retry regression runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("warm pool");
+            conn.execute_raw("PRAGMA busy_timeout = 0")
+                .expect("disable writer lock wait for deterministic conflict");
+        });
+        let blocker = crate::DbConn::open_file(pool.sqlite_path()).expect("open competing writer");
+        blocker
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        let blocker = Arc::new(Mutex::new(blocker));
+        let observed = Arc::new(AtomicU64::new(0));
+        let observer_pool = pool.clone();
+        let observer_count = Arc::clone(&observed);
+        let observer_blocker = Arc::clone(&blocker);
+        let capture = EventCapture {
+            retry_observer: Some(Arc::new(move || {
+                // The retry warning occurs after the failed attempt is dropped
+                // and before sleep. A warmed one-slot pool must already admit
+                // an unrelated read; no timing or scheduler luck is involved.
+                let cx = Cx::for_testing();
+                let mut acquire = std::pin::pin!(acquire_conn(&cx, &observer_pool));
+                let mut context = Context::from_waker(Waker::noop());
+                let Poll::Ready(Outcome::Ok(conn)) = acquire.as_mut().poll(&mut context) else {
+                    panic!("failed writer retained the only pool connection during backoff");
+                };
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) FROM projects", &[])
+                    .expect("unrelated reader proceeds while writer is blocked");
+                assert_eq!(rows.first().and_then(row_first_i64), Some(0));
+                drop(conn);
+                observer_count.fetch_add(1, Ordering::Relaxed);
+                observer_blocker
+                    .lock()
+                    .expect("blocker lock")
+                    .execute_raw("ROLLBACK")
+                    .expect("release competing writer");
+            })),
+            ..EventCapture::default()
+        };
+        let outcome = tracing::subscriber::with_default(capture, || {
+            rt.block_on(ensure_product(
+                &cx,
+                &pool,
+                Some("retry-lease-product"),
+                None,
+            ))
+        });
+        assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            1,
+            "must exercise a real write conflict"
+        );
+    }
 
     #[test]
     fn mvcc_retry_exhaustion_wraps_error_with_budget_context() {
@@ -19820,67 +20495,186 @@ mod tests {
     }
 
     #[test]
-    fn messages_id_floor_uses_maximum_across_duplicate_sequence_rows() {
+    fn message_id_election_starts_above_sequence_and_live_max() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("message-id-floor-duplicate-sequence.db");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-first.db");
         rt.block_on(async {
             let conn = acquire_conn(&cx, &pool)
                 .await
                 .into_result()
                 .expect("acquire connection");
-            conn.execute_raw(
-                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 7); \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 42); \
-                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 19);",
-            )
-            .expect("seed duplicate sequence rows");
             let tracked = tracked(&*conn);
 
-            let outcome = read_messages_id_floor(&cx, &tracked).await;
-            assert!(
-                matches!(&outcome, Outcome::Ok(42)),
-                "the aggregate must use MAX(seq) across every duplicate row; got {outcome:?}"
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let first = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
             );
+            let second = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            try_in_tx!(&cx, &tracked, commit_tx(&cx, &tracked).await);
+
+            assert_eq!(first, 1, "an empty mailbox elects id 1");
+            assert_eq!(second, 2, "each election advances the durable row by one");
+            Outcome::Ok(())
         });
     }
 
     #[test]
-    fn messages_id_floor_never_coerces_failure_outcomes_or_empty_rows_to_zero() {
-        let error = decode_messages_id_floor_outcome(Outcome::Err(DbError::Sqlite(
-            "injected floor query failure".to_string(),
-        )));
-        assert!(matches!(
-            error,
-            Outcome::Err(DbError::Sqlite(message))
-                if message == "injected floor query failure"
-        ));
+    fn message_id_election_rebases_on_live_max_id_and_archive_seed() {
+        use asupersync::runtime::RuntimeBuilder;
 
-        let expected_cancel = CancelReason::user("injected floor cancellation");
-        let cancelled =
-            decode_messages_id_floor_outcome(Outcome::Cancelled(expected_cancel.clone()));
-        assert!(matches!(
-            cancelled,
-            Outcome::Cancelled(reason) if reason == expected_cancel
-        ));
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-rebase.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Model the #176 degraded engine with foreign keys disabled: the
+            // fixture rows reference projects/senders that were never seeded.
+            conn.execute_raw("PRAGMA foreign_keys = OFF;")
+                .expect("disable foreign keys for fixture");
+            // Model the #176 degraded engine: an explicit-id row is durable
+            // but the engine failed to advance sqlite_sequence for it.
+            conn.execute_raw(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
+                     importance, ack_required, created_ts, attachments) \
+                 VALUES (100, 1, 1, 'degraded', 'body', 'normal', 0, 1, '[]');",
+            )
+            .expect("seed explicit-id row");
+            let tracked = tracked(&*conn);
 
-        let expected_panic = asupersync::PanicPayload::new("injected floor panic");
-        let panicked = decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
-        assert!(matches!(
-            panicked,
-            Outcome::Panicked(payload) if payload == expected_panic
-        ));
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let with_lagging_sequence = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            // A fresh connection in the same process has not scanned any
+            // archive: the seed input must still lift the floor above 250.
+            let with_archive_seed = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 250).await
+            );
+            try_in_tx!(&cx, &tracked, commit_tx(&cx, &tracked).await);
 
-        let empty = decode_messages_id_floor_outcome(Outcome::Ok(Vec::new()));
-        assert!(
-            matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
-                "exactly one"
-            ))
-        );
+            assert_eq!(
+                with_lagging_sequence, 101,
+                "the election must re-base on the live MAX(id), not the stale sequence"
+            );
+            assert_eq!(
+                with_archive_seed, 251,
+                "the archive seed must lift the floor while the archive is ahead"
+            );
+            Outcome::Ok(())
+        });
+    }
+
+    #[test]
+    fn message_id_election_fails_closed_at_row_id_exhaustion() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-exhaustion.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // The allocator row must already exist: an absent row would be
+            // (re)seeded from MAX(id)=0 and the election would succeed.
+            conn.execute_raw(
+                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
+                 INSERT INTO sqlite_sequence (name, seq) \
+                 VALUES ('messages', 9223372036854775807);",
+            )
+            .expect("seed exhausted allocator row");
+            conn.execute_raw(
+                "UPDATE sqlite_sequence SET seq = 9223372036854775807 \
+                 WHERE name = 'messages';",
+            )
+            .expect("advance seeded allocator row to exhaustion");
+            let tracked = tracked(&*conn);
+
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let outcome = elect_message_id_in_tx(&cx, &tracked, 0).await;
+            assert!(matches!(
+                &outcome,
+                Outcome::Err(error)
+                    if error.to_string().contains("exhausted the positive i64 row-id range")
+            ));
+            // The failure must have rolled the transaction back: the durable
+            // row stays untouched and no partial election commits.
+            let seq_rows = traw_query(
+                &cx,
+                &tracked,
+                "SELECT COALESCE(MAX(seq), 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await;
+            let Outcome::Ok(rows) = seq_rows else {
+                panic!("post-rollback sequence read must succeed")
+            };
+            assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), i64::MAX);
+            Outcome::Ok(())
+        });
+    }
+
+    #[test]
+    fn message_id_election_rolls_back_with_its_transaction() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-election-rollback.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let tracked = tracked(&*conn);
+
+            try_in_tx!(&cx, &tracked, begin_concurrent_tx(&cx, &tracked).await);
+            let elected = try_in_tx!(
+                &cx,
+                &tracked,
+                elect_message_id_in_tx(&cx, &tracked, 0).await
+            );
+            assert_eq!(elected, 1);
+            rollback_tx(&cx, &tracked).await;
+
+            let seq_rows = traw_query(
+                &cx,
+                &tracked,
+                "SELECT COUNT(*) AS row_count FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .await;
+            let Outcome::Ok(rows) = seq_rows else {
+                panic!("post-rollback sequence read must succeed")
+            };
+            assert_eq!(
+                rows[0].get_named::<i64>("row_count").unwrap(),
+                0,
+                "a rolled-back election must not persist the allocator row"
+            );
+            Outcome::Ok(())
+        });
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
@@ -23822,6 +24616,349 @@ mod tests {
         });
     }
 
+    /// GH#273: capped bulk mark-read honors the older-than filter, the per-call
+    /// cap (with a truthful `more` flag), never touches ack state, and leaves
+    /// other agents' unread rows alone.
+    #[test]
+    fn mark_messages_read_bulk_respects_filters_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_messages_read_bulk.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/bulk-mark-read")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+            let bystander = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register bystander");
+            let bystander_id = bystander.id.expect("bystander id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let old_ts = now - 30 * day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Messages 1-3 old, 4-5 fresh; all unread for the recipient. The
+            // bystander also receives message 1 (must stay unread for them).
+            for (id, created_ts) in [
+                (1, old_ts),
+                (2, old_ts + 1),
+                (3, old_ts + 2),
+                (4, now),
+                (5, now + 1),
+            ] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'bulk', 's{id}', 'b', 'normal', 0, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({id}, {recipient_id}, 'to', NULL, NULL)"
+                ))
+                .expect("insert recipient row");
+            }
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (1, {bystander_id}, 'cc', NULL, NULL)"
+            ))
+            .expect("insert bystander row");
+            drop(conn);
+
+            // Older-than filter: only the three aged messages transition.
+            let outcome = mark_messages_read_bulk(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                Some(old_ts + 2),
+                500,
+            )
+            .await
+            .into_result()
+            .expect("bulk mark aged");
+            assert_eq!(outcome.marked, 3, "exactly the aged messages are marked");
+            assert!(!outcome.more, "no aged backlog remains");
+
+            // Cap: one of the two remaining unread messages, more=true.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 1)
+                    .await
+                    .into_result()
+                    .expect("bulk mark capped");
+            assert_eq!(outcome.marked, 1);
+            assert!(outcome.more, "one unread message remains past the cap");
+
+            // Drain the rest.
+            let outcome =
+                mark_messages_read_bulk(&cx, &pool, project_id, recipient_id, None, 500)
+                    .await
+                    .into_result()
+                    .expect("bulk mark drain");
+            assert_eq!(outcome.marked, 1);
+            assert!(!outcome.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread[0].get_named::<i64>("c").unwrap(), 0);
+            // Ack state untouched; bystander unaffected.
+            let acked = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {recipient_id} AND ack_ts IS NOT NULL"
+                    ),
+                    &[],
+                )
+                .expect("count acked");
+            assert_eq!(acked[0].get_named::<i64>("c").unwrap(), 0, "read-only: never acks");
+            let bystander_unread = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {bystander_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count bystander unread");
+            assert_eq!(
+                bystander_unread[0].get_named::<i64>("c").unwrap(),
+                1,
+                "another agent's unread state is untouched"
+            );
+        });
+    }
+
+    /// GH#273: the message retention prune deletes only settled (fully read,
+    /// fully acked where required) messages past the horizon — inclusive at
+    /// the boundary — cascades FK-safely through recipient/delivery/receipt
+    /// rows, respects the per-sweep cap, and reports would-prune counts.
+    #[test]
+    fn prune_settled_messages_eligibility_cascade_and_cap() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_settled_messages.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/prune-messages")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let reader_a = register_agent(
+                &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader A");
+            let a_id = reader_a.id.expect("reader A id");
+            let reader_b = register_agent(
+                &cx, &pool, project_id, "AmberHill", "codex-cli", "gpt-5", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register reader B");
+            let b_id = reader_b.id.expect("reader B id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let horizon = now - 30 * day_us;
+            let old_ts = horizon - day_us;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // m1: read by both, no ack required, created EXACTLY at the
+            //     horizon (inclusive boundary) → prunable.
+            // m2: read by A only → NOT prunable (unread mail is never pruned).
+            // m3: ack required, read+acked by both → prunable.
+            // m4: ack required, read by both, acked by A only → NOT prunable.
+            // m5: read by both but fresh → NOT prunable (horizon).
+            // m6: zero recipient rows, old → vacuously settled, prunable.
+            let seed: &[(i64, i64, i64)] = &[
+                (1, 0, horizon),
+                (2, 0, old_ts),
+                (3, 1, old_ts),
+                (4, 1, old_ts),
+                (5, 0, now),
+                (6, 0, old_ts),
+            ];
+            for (id, ack_required, created_ts) in seed {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', {ack_required}, {created_ts}, '[]')"
+                ))
+                .expect("insert message");
+            }
+            let read = now - day_us;
+            let read_s = read.to_string();
+            let recipient_rows: Vec<(i64, i64, &str, &str)> = vec![
+                (1, a_id, read_s.as_str(), "NULL"),
+                (1, b_id, read_s.as_str(), "NULL"),
+                (2, a_id, read_s.as_str(), "NULL"),
+                (2, b_id, "NULL", "NULL"),
+                (3, a_id, read_s.as_str(), read_s.as_str()),
+                (3, b_id, read_s.as_str(), read_s.as_str()),
+                (4, a_id, read_s.as_str(), read_s.as_str()),
+                (4, b_id, read_s.as_str(), "NULL"),
+                (5, a_id, read_s.as_str(), "NULL"),
+            ];
+            for (message_id, agent_id, read_ts, ack_ts) in &recipient_rows {
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({message_id}, {agent_id}, 'to', {read_ts}, {ack_ts})"
+                ))
+                .expect("insert recipient row");
+            }
+            // Message-bound signal receipt for a prunable message (the v26
+            // ledger has no delete path of its own).
+            conn.execute_raw(&format!(
+                "INSERT INTO message_delivery_signal_receipts \
+                 (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) \
+                 VALUES (1, {a_id}, 'signal_file', 'digest', {read})"
+            ))
+            .expect("insert signal receipt");
+            drop(conn);
+
+            // Report-only counter: three messages WOULD be pruned.
+            let would_prune = count_prunable_messages(&cx, &pool, horizon)
+                .await
+                .into_result()
+                .expect("count prunable");
+            assert_eq!(would_prune, 3, "m1, m3, m6 are settled and past the horizon");
+
+            // Per-sweep cap: only the oldest eligible message goes, more=true.
+            let capped = prune_settled_messages(&cx, &pool, horizon, 500, 1)
+                .await
+                .into_result()
+                .expect("capped prune");
+            assert_eq!(capped.deleted_messages, 1);
+            assert!(capped.more, "eligible backlog remains past the cap");
+
+            // Drain with a small batch size to exercise multi-batch commits.
+            let report = prune_settled_messages(&cx, &pool, horizon, 1, 500)
+                .await
+                .into_result()
+                .expect("full prune");
+            assert_eq!(report.deleted_messages, 2);
+            assert!(!report.more);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let remaining = conn
+                .query_sync("SELECT id FROM messages ORDER BY id", &[])
+                .expect("select remaining messages");
+            let ids: Vec<i64> = remaining
+                .iter()
+                .filter_map(|r| r.get_named::<i64>("id").ok())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![2, 4, 5],
+                "unread (m2), unacked (m4), and fresh (m5) messages survive"
+            );
+
+            // FK integrity: no child table may reference a pruned message.
+            // (fts_messages is only checked when the FTS table exists in this
+            // pool — the messages_ad trigger clears it wherever it does.)
+            let fts_exists = !conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'fts_messages'",
+                    &[],
+                )
+                .expect("probe fts_messages")
+                .is_empty();
+            let mut orphan_checks: Vec<(&str, &str)> = vec![
+                ("message_recipients", "message_id"),
+                ("inbox_delivery_events", "message_id"),
+                ("message_delivery_signal_receipts", "message_id"),
+            ];
+            if fts_exists {
+                orphan_checks.push(("fts_messages", "message_id"));
+            }
+            for (table, column) in orphan_checks {
+                let orphans = conn
+                    .query_sync(
+                        &format!(
+                            "SELECT COUNT(*) AS c FROM {table} t \
+                             LEFT JOIN messages m ON m.id = t.{column} \
+                             WHERE m.id IS NULL"
+                        ),
+                        &[],
+                    )
+                    .expect("count orphans");
+                assert_eq!(
+                    orphans[0].get_named::<i64>("c").unwrap(),
+                    0,
+                    "{table} must hold no rows for pruned messages"
+                );
+            }
+            // Unread state for survivors is intact.
+            let unread_b = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE agent_id = {b_id} AND read_ts IS NULL"
+                    ),
+                    &[],
+                )
+                .expect("count unread");
+            assert_eq!(unread_b[0].get_named::<i64>("c").unwrap(), 1, "m2 stays unread for B");
+        });
+    }
+
     #[test]
     fn register_agent_without_task_description_clears_existing_description() {
         use asupersync::runtime::RuntimeBuilder;
@@ -24148,6 +25285,98 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// A canonical GitHub-style key that differs from the stored row's
+    /// spelling only in owner case (and whose path does not exist on disk, so
+    /// no filesystem alias can rescue it) must resolve to the existing row via
+    /// the stable slug — the same identity `ensure_project` would reuse —
+    /// instead of reporting the project missing.
+    #[test]
+    fn get_project_by_human_key_falls_back_to_stable_slug_for_case_alias() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("slug-fallback-case-alias");
+        let historical_key = "/repos/github.com/Dicklesworthstone/some_nonexistent_repo";
+        let canonical_key = "/repos/github.com/dicklesworthstone/some_nonexistent_repo";
+
+        rt.block_on(async {
+            let seeded = ensure_project(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("seed project under historical spelling");
+
+            let resolved = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("canonical case alias must resolve via the stable slug");
+
+            assert_eq!(resolved.id, seeded.id);
+            assert_eq!(resolved.slug, seeded.slug);
+            assert_eq!(resolved.human_key, historical_key);
+            assert_eq!(
+                count_projects_for_test(&cx, &pool).await,
+                1,
+                "slug fallback must reuse the existing row, not imply a second one"
+            );
+
+            // A key for a genuinely different project must still miss.
+            let unrelated = get_project_by_human_key(
+                &cx,
+                &pool,
+                "/repos/github.com/dicklesworthstone/entirely_other_repo",
+            )
+            .await
+            .into_result();
+            assert!(unrelated.is_err(), "unrelated key must stay NotFound");
+        });
+    }
+
+    #[test]
+    fn get_project_by_human_key_exact_never_falls_back_to_the_slug() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("slug-fallback-exact");
+        let historical_key = "/repos/github.com/Dicklesworthstone/some_nonexistent_repo";
+        let canonical_key = "/repos/github.com/dicklesworthstone/some_nonexistent_repo";
+
+        rt.block_on(async {
+            let seeded = ensure_project(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("seed project under historical spelling");
+
+            let exact = get_project_by_human_key_exact(&cx, &pool, canonical_key)
+                .await
+                .into_result();
+            assert!(
+                matches!(
+                    exact,
+                    Err(asupersync::OutcomeError::Err(DbError::NotFound { .. }))
+                ),
+                "exact lookup must not attach a case alias through the slug: {exact:?}"
+            );
+
+            let same = get_project_by_human_key_exact(&cx, &pool, historical_key)
+                .await
+                .into_result()
+                .expect("exact spelling resolves");
+            assert_eq!(same.id, seeded.id);
+
+            let lenient = get_project_by_human_key(&cx, &pool, canonical_key)
+                .await
+                .into_result()
+                .expect("lenient lookup keeps the stable-slug fallback");
+            assert_eq!(lenient.id, seeded.id);
+        });
     }
 
     #[test]
@@ -25215,6 +26444,178 @@ mod tests {
             .expect("read released_ts");
             assert_eq!(rows.len(), 1);
             assert!(rows[0].get(0).and_then(value_as_i64).is_some());
+        });
+    }
+
+    #[test]
+    fn reservation_reads_survive_corruption_write_breaker() {
+        // Isolate the process-global breaker from concurrently running tests.
+        const CHILD: &str = "AM_TEST_RESERVATION_READ_BREAKER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "queries::tests::reservation_reads_survive_corruption_write_breaker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated breaker regression failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("reservation-read-breaker.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-read-breaker")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "test",
+                None,
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = agent.id.unwrap();
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/**"],
+                3600,
+                true,
+                "active",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let released = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["docs/**"],
+                3600,
+                true,
+                "released",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            release_reservations_by_ids(&cx, &pool, &[released[0].id.unwrap()])
+                .await
+                .into_result()
+                .unwrap();
+
+            crate::corruption_circuit_breaker().observe_error(&DbError::Sqlite(
+                "database disk image is malformed".to_string(),
+            ));
+            assert!(crate::corruption_circuit_breaker().is_tripped());
+            let snapshot = get_reservation_conflict_snapshot(
+                &cx,
+                &pool,
+                "/tmp/reservation-read-breaker",
+                "BlueLake",
+                100,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(snapshot.reservations.len(), 1);
+            assert_eq!(
+                get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_released_unexpired_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            assert_eq!(
+                list_file_reservations_page(&cx, &pool, project_id, true, 10, 0)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert_eq!(
+                list_unreleased_file_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            let refusal = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["new/**"],
+                3600,
+                true,
+                "blocked",
+            )
+            .await
+            .into_result()
+            .unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("corruption circuit breaker open")
+            );
+            assert_eq!(
+                list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            crate::reset_corruption_circuit_breaker();
+            let observed: Outcome<(), DbError> =
+                run_read_with_mvcc_retry(&cx, "read_corruption_observation", || async {
+                    Outcome::Err(DbError::Sqlite(
+                        "database disk image is malformed".to_string(),
+                    ))
+                })
+                .await;
+            assert!(matches!(observed, Outcome::Err(_)));
+            assert!(crate::corruption_circuit_breaker().is_tripped());
         });
     }
 
@@ -32681,6 +34082,175 @@ mod tests {
             assert_eq!(other_read_ts, None);
             assert_eq!(other_ack_ts, None);
         });
+    }
+
+    #[test]
+    fn receipt_operations_reject_suppressed_updates_without_fabricating_timestamps() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for (label, acknowledge, already_read) in [
+            ("read", false, false),
+            ("ack", true, false),
+            ("partial_ack", true, true),
+        ] {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            let dir = tempfile::tempdir().expect("receipt fixture");
+            let db_path = dir.path().join(format!("suppressed_{label}.db"));
+            let seed = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open receipt fixture");
+            seed.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+                .expect("initialize receipt pragmas");
+            seed.execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("initialize receipt schema");
+            rt.block_on(async {
+                let cx = Cx::current().expect("migration context");
+                crate::schema::migrate_to_latest_base(&cx, &seed)
+                    .await
+                    .into_result()
+                    .expect("migrate receipt schema");
+            });
+            // Install DDL before pooled transactions begin. The partial-ack
+            // fixture permits its initial read and suppresses only the ack.
+            let trigger = if already_read {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 WHEN NEW.ack_ts IS NOT NULL BEGIN SELECT RAISE(IGNORE); END;"
+            } else {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 BEGIN SELECT RAISE(IGNORE); END;"
+            };
+            seed.execute_raw(trigger)
+                .expect("install update suppressor");
+            drop(seed);
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("receipt pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project = ensure_project(&cx, &pool, "/tmp/am-suppressed-receipt")
+                    .await
+                    .into_result()
+                    .expect("project");
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    "BlueLake",
+                    "codex-cli",
+                    "gpt-5",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("agent");
+                let agent_id = agent.id.expect("agent id");
+                let message = create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    "Receipt truth",
+                    "Body",
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &[(agent_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("message");
+                let message_id = message.id.expect("message id");
+                let original_read = if already_read {
+                    Some(
+                        mark_message_read(&cx, &pool, agent_id, message_id)
+                            .await
+                            .into_result()
+                            .expect("initial read receipt"),
+                    )
+                } else {
+                    None
+                };
+                {
+                    let conn = acquire_conn(&cx, &pool)
+                        .await
+                        .into_result()
+                        .expect("seed connection");
+                    conn.execute_raw("UPDATE inbox_stats SET total_count = 99")
+                        .expect("seed rollback witness");
+                }
+                let outcome = if already_read {
+                    acknowledge_message_idempotent(
+                        &cx,
+                        &pool,
+                        agent_id,
+                        message_id,
+                        IdempotencyClaim {
+                            project_id,
+                            tool: "acknowledge_message",
+                            key: "suppressed-ack",
+                            fingerprint: "suppressed-ack-fixture",
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                } else if acknowledge {
+                    acknowledge_message(&cx, &pool, agent_id, message_id)
+                        .await
+                        .map(|_| ())
+                } else {
+                    mark_message_read(&cx, &pool, agent_id, message_id)
+                        .await
+                        .map(|_| ())
+                };
+                let conn = acquire_conn(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("verification connection");
+                let rows = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?",
+                    &[Value::BigInt(agent_id), Value::BigInt(message_id)],
+                )
+                .expect("read actual stored receipts");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("read_ts").unwrap(),
+                    original_read,
+                    "{label}: the real trigger must suppress the update"
+                );
+                assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::Internal(ref message))
+                        if message.contains("did not store")),
+                    "{label}: {outcome:?}"
+                );
+                let rows = conn
+                    .query_sync("SELECT total_count FROM inbox_stats", &[])
+                    .expect("read rollback witness");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<i64>("total_count").unwrap(),
+                    99,
+                    "{label}: receipt failure must roll back the stats rebuild"
+                );
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS count FROM idempotency_keys", &[])
+                    .expect("read idempotency records");
+                assert_eq!(
+                    rows[0].get_named::<i64>("count").unwrap(),
+                    0,
+                    "{label}: a failed receipt must not leave a replayable success"
+                );
+            });
+        }
     }
 
     #[test]

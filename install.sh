@@ -53,6 +53,22 @@ SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY=""
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 COSIGN_BIN=""
+# Trust-model boundary. Releases at or above this core version are built and
+# published by the maintainer's own release infrastructure (dsr), not GitHub
+# Actions, so the Actions-workflow Sigstore identity used by older releases can
+# no longer be minted. Those releases are instead authenticated fail-closed by
+# a minisign signature over the SHA256SUMS manifest, made with a key the
+# maintainer controls (the same signing key used by the frankensqlite/dsr
+# release line). Older releases keep the original Sigstore/cosign path.
+MINISIGN_TRUST_MIN_VERSION='0.3.31'
+# Minisign signing epoch 2 public key.
+#   key id:  1BBD79B28BF718D0
+#   SHA-256: b72b704e17a786308623d43471a046c52d663ce5d5c58c512790952455bdfb78
+MINISIGN_PUBLIC_KEY='RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
+MINISIGN_BIN=""
+# "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
+# releases. Set by establish_release_contract.
+RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
@@ -337,9 +353,10 @@ resolve_version() {
 
 # Canonicalize the requested release into the exact tag/version contract used
 # by dist.yml. Build metadata is intentionally rejected because published tags
-# do not admit it. The Sigstore certificate identity is a literal, not a
-# cross-tag regular expression, so a valid bundle from another release cannot
-# authenticate the requested archive.
+# do not admit it. For legacy releases the Sigstore certificate identity is a
+# literal, not a cross-tag regular expression, so a valid bundle from another
+# release cannot authenticate the requested archive. The trust model for the
+# requested release (minisign vs legacy Sigstore) is also fixed here.
 establish_release_contract() {
   local requested="$VERSION"
   local release_pattern='^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'
@@ -354,7 +371,26 @@ establish_release_contract() {
   EXPECTED_RELEASE_VERSION="${BASH_REMATCH[1]}"
   VERSION="v${EXPECTED_RELEASE_VERSION}"
   COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"
-  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} identity=${COSIGN_IDENTITY}"
+  establish_release_trust_model
+  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} trust=${RELEASE_TRUST_MODEL} identity=${COSIGN_IDENTITY}"
+}
+
+# Decide which authenticity witness this release must present. The version
+# match in establish_release_contract guarantees a numeric X.Y.Z core, so the
+# arithmetic comparison below is well-defined. Pre-releases share the trust
+# model of their core version.
+establish_release_trust_model() {
+  local core="${EXPECTED_RELEASE_VERSION%%-*}"
+  local maj=0 min=0 pat=0 fmaj=0 fmin=0 fpat=0
+  IFS=. read -r maj min pat <<< "$core"
+  IFS=. read -r fmaj fmin fpat <<< "$MINISIGN_TRUST_MIN_VERSION"
+  if [ "$maj" -gt "$fmaj" ] || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -gt "$fmin" ]; } || \
+     { [ "$maj" -eq "$fmaj" ] && [ "$min" -eq "$fmin" ] && [ "$pat" -ge "$fpat" ]; }; then
+    RELEASE_TRUST_MODEL="minisign"
+  else
+    RELEASE_TRUST_MODEL="sigstore"
+  fi
 }
 
 detect_platform() {
@@ -2409,7 +2445,18 @@ private_file_identity() {
 
 private_file_link_count() {
   local path="$1"
-  stat -f '%l' "$path" 2>/dev/null || stat -c '%h' "$path" 2>/dev/null
+  local links
+  # Branch, never concatenate: on GNU coreutils the BSD probe prints a
+  # filesystem-status block to stdout and still exits nonzero (its format
+  # word is parsed as a missing operand), so an `A || B` capture would yield
+  # a multi-line value that can never equal a single link count.
+  if links=$(stat -f '%l' "$path" 2>/dev/null); then
+    printf '%s' "$links"
+  elif links=$(stat -c '%h' "$path" 2>/dev/null); then
+    printf '%s' "$links"
+  else
+    return 1
+  fi
 }
 
 # Return one no-follow stat identity only for a mode-0600 regular file with a
@@ -2922,17 +2969,22 @@ validate_installer_owned_regular_file() {
 
 validate_binary_transaction_directory() {
   local path="$1"
-  local owner="" current_uid="" links="" mode=""
+  local owner="" current_uid="" mode=""
   [ -d "$path" ] && [ ! -L "$path" ] || {
     err "Binary transaction authority is not a non-symlink directory: $path"
     return 1
   }
   current_uid=$(id -u 2>/dev/null) || return 1
   owner=$(installer_path_owner_uid "$path") || return 1
-  links=$(installer_path_link_count "$path") || return 1
   mode=$(installer_path_mode "$path") || return 1
-  if [ "$owner" != "$current_uid" ] || [ "$links" != "2" ] || [ "$mode" != "700" ]; then
-    err "Binary transaction authority has unsafe owner, mode, or link count: $path"
+  # No link-count constraint for directories: directories cannot be
+  # hardlinked, and st_nlink semantics for them are filesystem-defined
+  # (ext4/XFS report 2 + subdirectories, btrfs always reports 1, APFS
+  # reports 2 + every child entry), so any fixed expectation rejects valid
+  # transaction directories on some supported filesystem. Ownership, private
+  # mode, and the non-symlink check above carry the actual guarantees.
+  if [ "$owner" != "$current_uid" ] || [ "$mode" != "700" ]; then
+    err "Binary transaction authority has unsafe owner or mode: $path"
     return 1
   fi
 }
@@ -5026,31 +5078,181 @@ setup_single_toml_config() {
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
   local desired_auth_header=""
-  local tmp_file="${config_path}.tmp.mcp-agent-mail.$$"
+  local tmp_file=""
   local backup=""
+  local source_identity=""
+
+  ensure_private_file_target_path "$config_path" "TOML config" || return 2
 
   if [ -n "$bearer_token" ]; then
     desired_auth_header="Bearer ${bearer_token}"
   fi
 
   if [ ! -f "$config_path" ]; then
-    # File doesn't exist — create it with just the MCP section
-    local parent_dir
-    parent_dir=$(dirname "$config_path")
-    mkdir -p "$parent_dir" 2>/dev/null || true
-
-    cat > "$config_path" <<TOMLEOF
-${section_header}
-url = "${desired_url}"
-startup_timeout_sec = ${desired_startup_timeout_sec}
-TOMLEOF
-    if [ -n "$desired_auth_header" ]; then
-      cat >> "$config_path" <<TOMLEOF
-http_headers = { Authorization = "${desired_auth_header}" }
-TOMLEOF
+    # File doesn't exist — create it with just the MCP section. Never open
+    # the destination through its pathname: a pre-existing leaf symlink or
+    # a hard link aliasing a tracked project file would receive the bearer
+    # token. Create through no-follow, component-verified, atomic
+    # replacement instead; without python3 that authority cannot be
+    # established, so fail closed.
+    if ! command -v python3 >/dev/null 2>&1; then
+      verbose "setup_toml_config:skip_no_python3 tool=${tool} path=${config_path}"
+      return 2
     fi
-    verbose "setup_toml_config:created tool=${tool} path=${config_path}"
-    return 0
+    local create_result
+    create_result=$(python3 - "$config_path" "$section_header" "$desired_url" "$desired_startup_timeout_sec" "$desired_auth_header" <<'PY'
+import os
+import stat
+import sys
+import time
+
+config_path, section_header, desired_url, desired_startup_timeout_sec, desired_auth_header = sys.argv[1:6]
+
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+lines = [
+    section_header,
+    f'url = "{desired_url}"',
+    f"startup_timeout_sec = {desired_startup_timeout_sec}",
+]
+if desired_auth_header:
+    lines.append(f'http_headers = {{ Authorization = "{desired_auth_header}" }}')
+try:
+    ensure_real_directory_tree(os.path.dirname(config_path) or ".")
+except OSError:
+    print("ERROR:unsafe_parent")
+    raise SystemExit(0)
+write_config_atomic(config_path, "\n".join(lines) + "\n", 0o600)
+print("OK:created")
+PY
+) || true
+    case "$create_result" in
+      OK:created)
+        verbose "setup_toml_config:created tool=${tool} path=${config_path}"
+        return 0
+        ;;
+      ERROR:*)
+        verbose "setup_toml_config:create_refused tool=${tool} path=${config_path} ${create_result}"
+        return 2
+        ;;
+      *)
+        verbose "setup_toml_config:unknown_create_result tool=${tool} result=${create_result}"
+        return 2
+        ;;
+    esac
+  fi
+
+  # The awk rewrite lands on a private, O_EXCL-created temporary in the
+  # destination directory; a predictable name could be pre-created as a
+  # symlink so the credential-bearing rewrite flows into someone else's
+  # inode. Publish with the same private backup/replace helpers as config.env.
+  source_identity=$(private_file_identity "$config_path") || return 2
+  if ! tmp_file=$(umask 077; mktemp "${config_path}.tmp.mcp-agent-mail.XXXXXX"); then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=tmp_create_failed"
+    return 2
   fi
 
   if ! awk \
@@ -5223,16 +5425,24 @@ TOMLEOF
     return 2
   fi
 
-  if cmp -s "$config_path" "$tmp_file"; then
+  if cmp -s "$config_path" "$tmp_file" \
+    && private_file_security_identity "$config_path" >/dev/null; then
     rm -f "$tmp_file"
     verbose "setup_toml_config:unchanged tool=${tool} path=${config_path}"
     return 1
   fi
 
-  backup="${config_path}.$(date -u +%Y%m%d_%H%M%S).bak"
-  cp -p "$config_path" "$backup"
-  chmod --reference="$config_path" "$tmp_file" 2>/dev/null || true
-  mv "$tmp_file" "$config_path"
+  if [ "$(private_file_identity "$config_path")" != "$source_identity" ]; then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=source_changed"
+    return 2
+  fi
+  backup_envfile_if_present "$config_path" "TOML config" || return 2
+  backup="$PRIVATE_BACKUP_PATH"
+  if [ "$(private_file_identity "$config_path")" != "$source_identity" ]; then
+    verbose "setup_toml_config:error tool=${tool} path=${config_path} reason=source_changed_after_backup"
+    return 2
+  fi
+  write_private_file_atomic "$config_path" "TOML config" < "$tmp_file" || return 2
   verbose "setup_toml_config:updated tool=${tool} path=${config_path} backup=${backup}"
   return 0
 }
@@ -5359,6 +5569,8 @@ def write_backup(path: str, raw: bytes, mode: int) -> str:
         except FileExistsError:
             continue
         with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5388,6 +5600,8 @@ def write_config_atomic(path: str, text: str, mode: int) -> None:
             continue
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5582,7 +5796,9 @@ if tool == "omp":
             if name == entry_key or name not in entry_names
         ]
 new_text = dump_json(doc)
-effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+# Secret-capable configs and backups are owner-readable/writable, never
+# group/other-accessible. Intersecting old mode 0040 with 0600 yields 0000.
+effective_mode = 0o600
 permissions_need_tightening = (
     existing_mode is not None and effective_mode != existing_mode
 )
@@ -5662,8 +5878,9 @@ setup_single_opencode_json_config() {
 import json
 import os
 import re
-import shutil
+import stat
 import sys
+import time
 from datetime import datetime, timezone
 
 config_path, desired_url, desired_auth_header = sys.argv[1:4]
@@ -5671,16 +5888,155 @@ config_path, desired_url, desired_auth_header = sys.argv[1:4]
 ENTRY_NAMES = ("mcp-agent-mail", "mcp_agent_mail")
 
 
-def load_text(path: str) -> str:
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def load_config_bytes(path: str):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
+        # O_NONBLOCK prevents a hostile or accidental FIFO target from
+        # hanging the installer before we can reject its file type.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
     except FileNotFoundError:
-        return ""
+        return b"", None
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ValueError("config target is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+    return raw, stat.S_IMODE(metadata.st_mode)
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_backup(path: str, raw: bytes, mode: int) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1024):
+        suffix = time.time_ns()
+        backup = f"{path}.{stamp}.{suffix}.{attempt}.bak"
+        try:
+            fd = os.open(
+                backup,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sync_parent_directory(backup)
+        return backup
+    raise OSError(f"could not create a unique backup for {path}")
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched while the credential-bearing payload lands on a
+    # fresh inode that no tracked project file can alias.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
 
 
 def parse_json(text: str):
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     if not text.strip():
         return {}
@@ -5697,8 +6053,28 @@ def dump_json(doc) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-text = load_text(config_path)
-doc = parse_json(text)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+
+try:
+    raw, existing_mode = load_config_bytes(config_path)
+except ValueError:
+    print("ERROR:non_regular_target")
+    raise SystemExit(0)
+except OSError as error:
+    print(f"ERROR:read_failed_{error.errno}")
+    raise SystemExit(0)
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    print("ERROR:not_utf8")
+    raise SystemExit(0)
+try:
+    doc = parse_json(text)
+except json.JSONDecodeError:
+    print("ERROR:invalid_json")
+    raise SystemExit(0)
 if not isinstance(doc, dict):
     print("ERROR:not_object")
     raise SystemExit(0)
@@ -5755,21 +6131,29 @@ if isinstance(legacy, dict):
         doc.pop("mcpServers", None)
 
 new_text = dump_json(doc)
-if new_text == dump_json(parse_json(text)):
+effective_mode = 0o600
+permissions_need_tightening = (
+    existing_mode is not None and existing_mode != effective_mode
+)
+if new_text == dump_json(parse_json(text)) and not permissions_need_tightening:
     print("SKIP:unchanged")
     raise SystemExit(0)
 
 parent_dir = os.path.dirname(config_path)
 if parent_dir:
-    os.makedirs(parent_dir, exist_ok=True)
-if os.path.exists(config_path):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup = f"{config_path}.{stamp}.bak"
-    shutil.copy2(config_path, backup)
+    try:
+        ensure_real_directory_tree(parent_dir)
+    except OSError:
+        print("ERROR:unsafe_parent")
+        raise SystemExit(0)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+if existing_mode is not None:
+    backup = write_backup(config_path, raw, effective_mode)
 else:
     backup = ""
-with open(config_path, "w", encoding="utf-8") as handle:
-    handle.write(new_text)
+write_config_atomic(config_path, new_text, effective_mode)
 
 if backup:
     print(f"OK:updated backup={backup}")
@@ -5849,99 +6233,405 @@ setup_single_mcp_config() {
   fi
 
   if [ ! -f "$config_path" ]; then
-    # Create a new config file
-    local parent_dir
-    parent_dir=$(dirname "$config_path")
-    mkdir -p "$parent_dir" 2>/dev/null || true
-
-    if command -v python3 >/dev/null 2>&1; then
-      python3 -c "
-import json, sys
-entry = json.loads(sys.argv[1])
-doc = {'mcpServers': {'mcp-agent-mail': entry}}
-print(json.dumps(doc, indent=2))
-" "$entry_json" > "$config_path"
-    else
-      cat > "$config_path" <<MCPEOF
-{
-  "mcpServers": {
-    "mcp-agent-mail": ${entry_json}
-  }
-}
-MCPEOF
+    # Create a new config file. Never open the destination through its
+    # pathname: a pre-existing leaf symlink, or a hard link aliasing a
+    # tracked project file, would receive the credential-bearing bytes
+    # despite an "outside" project-containment verdict. Create through
+    # no-follow, component-verified, atomic replacement instead; without
+    # python3 that authority cannot be established, so fail closed.
+    if ! command -v python3 >/dev/null 2>&1; then
+      verbose "setup_mcp_config:skip_no_python3 tool=${tool} path=${config_path}"
+      return 2
     fi
-    verbose "setup_mcp_config:created tool=${tool} path=${config_path}"
-    return 0
+    local create_result
+    create_result=$(python3 - "$config_path" "$entry_json" <<'PY'
+import json
+import os
+import stat
+import sys
+import time
+
+config_path, entry_json = sys.argv[1:3]
+
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+try:
+    entry = json.loads(entry_json)
+except json.JSONDecodeError:
+    print("ERROR:bad_entry")
+    raise SystemExit(0)
+try:
+    ensure_real_directory_tree(os.path.dirname(config_path) or ".")
+except OSError:
+    print("ERROR:unsafe_parent")
+    raise SystemExit(0)
+doc = {"mcpServers": {"mcp-agent-mail": entry}}
+write_config_atomic(config_path, json.dumps(doc, indent=2) + "\n", 0o600)
+print("OK:created")
+PY
+) || true
+    case "$create_result" in
+      OK:created)
+        verbose "setup_mcp_config:created tool=${tool} path=${config_path}"
+        return 0
+        ;;
+      ERROR:*)
+        verbose "setup_mcp_config:create_refused tool=${tool} path=${config_path} ${create_result}"
+        return 2
+        ;;
+      *)
+        verbose "setup_mcp_config:unknown_create_result tool=${tool} result=${create_result}"
+        return 2
+        ;;
+    esac
   fi
 
   # File exists — check if mcp-agent-mail entry already present
   if command -v python3 >/dev/null 2>&1; then
     local result
-    result=$(python3 -c "
-import json, sys, os
+    result=$(python3 - "$config_path" "$entry_json" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime, timezone
 
-config_path = sys.argv[1]
-entry_json = sys.argv[2]
+config_path, entry_json = sys.argv[1:3]
 
-with open(config_path, 'r') as f:
-    text = f.read()
+
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def load_config_bytes(path: str):
+    try:
+        # O_NONBLOCK prevents a hostile or accidental FIFO target from
+        # hanging the installer before we can reject its file type.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return b"", None
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ValueError("config target is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+    return raw, stat.S_IMODE(metadata.st_mode)
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_backup(path: str, raw: bytes, mode: int) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1024):
+        suffix = time.time_ns()
+        backup = f"{path}.{stamp}.{suffix}.{attempt}.bak"
+        try:
+            fd = os.open(
+                backup,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sync_parent_directory(backup)
+        return backup
+    raise OSError(f"could not create a unique backup for {path}")
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    # Renaming onto the target replaces the directory entry itself, so a
+    # hard link aliasing the previous inode keeps its original bytes and
+    # metadata untouched.
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
+
+
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+try:
+    raw, existing_mode = load_config_bytes(config_path)
+except ValueError:
+    print("ERROR:non_regular_target")
+    raise SystemExit(0)
+except OSError as error:
+    print(f"ERROR:read_failed_{error.errno}")
+    raise SystemExit(0)
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    print("ERROR:not_utf8")
+    raise SystemExit(0)
 
 # Strip BOM
-if text.startswith('\ufeff'):
+if text.startswith("\ufeff"):
     text = text[1:]
 
 try:
     doc = json.loads(text)
 except json.JSONDecodeError:
     # Try stripping comments and trailing commas (basic JSON5 compat)
-    import re
-    cleaned = re.sub(r'//.*?\n', '\n', text)
-    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    cleaned = re.sub(r"//.*?\n", "\n", text)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
     doc = json.loads(cleaned)
 
 if not isinstance(doc, dict):
-    print('ERROR:not_object')
-    sys.exit(0)
+    print("ERROR:not_object")
+    raise SystemExit(0)
 
 # Find existing server container
 container_key = None
-for key in ['mcpServers', 'servers', 'mcp', 'mcp_servers']:
+for key in ["mcpServers", "servers", "mcp", "mcp_servers"]:
     if key in doc and isinstance(doc[key], dict):
         container_key = key
         break
 
-if container_key and 'mcp-agent-mail' in doc[container_key]:
-    print('SKIP:already_present')
-    sys.exit(0)
+entry_already_present = bool(container_key and "mcp-agent-mail" in doc[container_key])
+if entry_already_present and existing_mode == 0o600:
+    print("SKIP:already_present")
+    raise SystemExit(0)
 
-# Backup
-import shutil
-from datetime import datetime
-stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-backup = config_path + '.' + stamp + '.bak'
-shutil.copy2(config_path, backup)
+# Insert only when absent; a permission-only repair preserves the existing entry.
+if not entry_already_present:
+    try:
+        entry = json.loads(entry_json)
+    except json.JSONDecodeError:
+        print("ERROR:bad_entry")
+        raise SystemExit(0)
+    if container_key is None:
+        container_key = "mcpServers"
+        doc[container_key] = {}
+    doc[container_key]["mcp-agent-mail"] = entry
 
-# Insert entry
-entry = json.loads(entry_json)
-if container_key is None:
-    container_key = 'mcpServers'
-    doc[container_key] = {}
-doc[container_key]['mcp-agent-mail'] = entry
+parent_dir = os.path.dirname(config_path)
+if parent_dir:
+    try:
+        ensure_real_directory_tree(parent_dir)
+    except OSError:
+        print("ERROR:unsafe_parent")
+        raise SystemExit(0)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+effective_mode = 0o600
+backup = write_backup(config_path, raw, effective_mode)
+write_config_atomic(config_path, json.dumps(doc, indent=2) + "\n", effective_mode)
 
-with open(config_path, 'w') as f:
-    json.dump(doc, f, indent=2)
-    f.write('\n')
-
-print('OK:inserted backup=' + backup)
-" "$config_path" "$entry_json" 2>&1) || true
+print(("OK:updated backup=" if entry_already_present else "OK:inserted backup=") + backup)
+PY
+) || true
 
     case "$result" in
       SKIP:already_present)
         verbose "setup_mcp_config:skip_existing tool=${tool} path=${config_path}"
         return 1
         ;;
-      OK:inserted*)
+      OK:inserted*|OK:updated*)
         verbose "setup_mcp_config:inserted tool=${tool} path=${config_path} ${result}"
         return 0
         ;;
@@ -6080,6 +6770,40 @@ PY
   return 2
 }
 
+# The external `claude` CLI rewrites ~/.claude.json through its own write
+# seam, which this installer cannot make no-follow or atomic. A hard link
+# from that path into a tracked project file would let the CLI's bearer
+# token flow through the aliased inode into Git despite an "outside"
+# containment verdict, and a non-regular target cannot be given any write
+# authority at all. Fail closed: defer to native setup whenever the target
+# exists with more than one link, is not a regular file, or link authority
+# cannot be established.
+config_target_is_hardlink_aliased() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  if [ ! -e "$path" ]; then
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || return 0
+  if python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    metadata = os.lstat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    return 0
+  fi
+  return 1
+}
+
 # The shell writers embed bearer credentials but cannot establish the native
 # setup command's Git tracked/ignore protections. Never let them write a config
 # inside the current project. OMP needs extra handling because user-path
@@ -6182,6 +6906,8 @@ setup_mcp_configs() {
   fi
   if mcp_config_must_skip_shell_write "claude" "$claude_code_config_path" "$PWD"; then
     verbose "setup_claude_code_mcp:defer reason=project_containment_requires_native_setup"
+  elif config_target_is_hardlink_aliased "$claude_code_config_path"; then
+    verbose "setup_claude_code_mcp:defer reason=aliased_or_nonregular_target_requires_native_setup"
   elif setup_claude_code_mcp_via_cli "$bearer_token"; then
     configured=$((configured + 1))
   fi
@@ -7186,16 +7912,18 @@ resolve_and_verify_archive_checksum() {
   verify_checksum "$archive_file" "$expected_checksum"
 }
 
-# Verify the standardized Sigstore bundle for a file. cosign is the parser and
-# verifier for the bundle, certificate identity, issuer, and transparency proof;
-# any missing dependency or invalid evidence is fatal before extraction.
+# LEGACY PATH (releases < MINISIGN_TRUST_MIN_VERSION only): verify the
+# standardized Sigstore bundle for a file. cosign is the parser and verifier
+# for the bundle, certificate identity, issuer, and transparency proof; any
+# missing dependency or invalid evidence is fatal before extraction. Releases
+# >= v0.3.31 never enter this path — see verify_minisign_signed_checksum.
 require_safe_cosign() {
   local version_output="" parsed_versions="" version_count=0 version=""
   local major=0 minor=0 patch=0
 
   COSIGN_BIN=$(type -P cosign 2>/dev/null || true)
   if [ -z "$COSIGN_BIN" ] || [ ! -x "$COSIGN_BIN" ]; then
-    err "cosign is required to verify release archive authenticity but was not found."
+    err "cosign is required to verify legacy (< v${MINISIGN_TRUST_MIN_VERSION}) release archives but was not found."
     err "Install cosign v3.1.3 or newer in the v3 line, or use --no-verify only for a trusted local artifact."
     return 1
   fi
@@ -7294,10 +8022,100 @@ verify_sigstore_bundle() {
   return 0
 }
 
+# Minisign is the verifier for releases >= MINISIGN_TRUST_MIN_VERSION. The
+# authenticity witness is a detached minisign signature over the SHA256SUMS
+# manifest, checked against the public key pinned in this script. A missing
+# minisign binary is fatal: verification never silently degrades to
+# checksum-only.
+require_minisign() {
+  MINISIGN_BIN=$(type -P minisign 2>/dev/null || true)
+  if [ -z "$MINISIGN_BIN" ] || [ ! -x "$MINISIGN_BIN" ]; then
+    err "minisign is required to verify release authenticity but was not found."
+    err "Install it (Debian/Ubuntu: apt install minisign; macOS: brew install minisign;"
+    err "other: https://jedisct1.github.io/minisign/), or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+  verbose "require_minisign:bin=${MINISIGN_BIN}"
+  return 0
+}
+
+# Fetch the release SHA256SUMS manifest plus its .minisig, verify the
+# signature over the exact manifest bytes with the pinned public key, then
+# verify the archive against the checksum recorded in the now-authenticated
+# manifest. Fail-closed at every step.
+verify_minisign_signed_checksum() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local release_base sha256sums_url sha256sums_file sig_url sig_file
+  local expected_checksum
+
+  require_minisign || return 1
+
+  release_base="$(dirname "$artifact_url")"
+  sha256sums_url="${release_base}/SHA256SUMS"
+  sha256sums_file="$TMP/SHA256SUMS"
+  sig_url="${release_base}/SHA256SUMS.minisig"
+  sig_file="$TMP/SHA256SUMS.minisig"
+
+  info "Fetching checksum manifest from ${sha256sums_url}"
+  if ! download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" || [ ! -s "$sha256sums_file" ]; then
+    err "Release checksum manifest not found at ${sha256sums_url}."
+    err "Release archives are not extracted without an authenticated checksum unless --no-verify is explicit."
+    return 1
+  fi
+
+  info "Fetching manifest signature from ${sig_url}"
+  if ! download_to_file "$sig_url" "$sig_file" "minisig-download" || [ ! -s "$sig_file" ]; then
+    err "Release manifest signature not found at ${sig_url}."
+    err "Releases v${MINISIGN_TRUST_MIN_VERSION} and later must publish SHA256SUMS.minisig."
+    err "Release archives are not extracted without a signature unless --no-verify is explicit."
+    return 1
+  fi
+
+  if ! "$MINISIGN_BIN" -Vm "$sha256sums_file" -x "$sig_file" -P "$MINISIGN_PUBLIC_KEY" >/dev/null; then
+    verbose "verify_minisign:failed manifest=${sha256sums_file} sig=${sig_file}"
+    err "Minisign verification FAILED for the release checksum manifest."
+    err "The manifest must be signed by the maintainer release key (id 1BBD79B28BF718D0)."
+    err "The release may be corrupted or tampered with; do not install it."
+    error_support_hint
+    return 1
+  fi
+  ok "Release manifest signature verified (minisign)"
+  verbose "verify_minisign:ok manifest=${sha256sums_file}"
+
+  expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+  if [ -z "$expected_checksum" ]; then
+    err "The authenticated SHA256SUMS manifest has no entry for ${artifact_name}."
+    err "The release asset inventory is incomplete; do not install it."
+    error_support_hint
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
 verify_release_archive() {
   local archive_file="$1"
   local artifact_url="$2"
   local artifact_name="$3"
+
+  if [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+    # Releases >= MINISIGN_TRUST_MIN_VERSION: the SHA256 witness and the
+    # authenticity witness are one artifact — a minisign-signed SHA256SUMS.
+    # The Sigstore/cosign path is not consulted for these releases (GitHub
+    # Actions no longer builds them, so its workflow identity cannot exist).
+    verify_minisign_signed_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    if [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ]; then
+      # An explicitly supplied checksum witness is honored in addition to,
+      # never instead of, the signed manifest.
+      resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    fi
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      warn "SIGSTORE_BUNDLE_URL is ignored for releases >= v${MINISIGN_TRUST_MIN_VERSION} (minisign trust model)."
+    fi
+    return 0
+  fi
 
   resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
   verify_sigstore_bundle "$archive_file" "$artifact_url" || return 1
@@ -7305,7 +8123,8 @@ verify_release_archive() {
 }
 
 # Verify the archive inventory without extracting it. Release archives are
-# deliberately flat and contain exactly two non-empty regular files. This gate
+# deliberately flat and contain the two binaries plus optional README/LICENSE
+# regular files emitted by DSR. This gate
 # remains mandatory under --no-verify: that flag bypasses cryptographic witness
 # verification, not archive-shape safety or release-version identity.
 verify_archive_members_exact() {
@@ -7319,12 +8138,14 @@ verify_archive_members_exact() {
     return 1
   fi
 
-  actual_members=$(LC_ALL=C sort "$members_file")
+  actual_members=$(awk '$0 != "README.md" && $0 != "LICENSE"' "$members_file" | LC_ALL=C sort)
   expected_members=$(printf '%s\n' "$BIN_CLI" "$BIN_SERVER" | LC_ALL=C sort)
   member_count=$(wc -l <"$members_file" | tr -d '[:space:]')
-  if [ "$member_count" != "2" ] || [ "$actual_members" != "$expected_members" ]; then
+  if [ "$member_count" -lt 2 ] || [ "$member_count" -gt 4 ] || \
+    [ "$actual_members" != "$expected_members" ] || \
+    [ "$(LC_ALL=C sort -u "$members_file" | wc -l | tr -d '[:space:]')" != "$member_count" ]; then
     err "Release archive members are invalid."
-    err "Expected exactly the flat files: $BIN_CLI and $BIN_SERVER"
+    err "Expected flat $BIN_CLI and $BIN_SERVER, with optional README.md and LICENSE (no duplicates)."
     return 1
   fi
 
@@ -7333,8 +8154,8 @@ verify_archive_members_exact() {
     return 1
   fi
   regular_count=$(awk 'substr($0, 1, 1) == "-" { count++ } END { print count + 0 }' "$details_file")
-  if [ "$regular_count" != "2" ]; then
-    err "Release archive must contain exactly two regular files (no links or directories)."
+  if [ "$regular_count" != "$member_count" ]; then
+    err "Release archive members must all be regular files (no links or directories)."
     return 1
   fi
 
@@ -7609,10 +8430,12 @@ Options:
   --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-verify        UNSAFE: skip checksum + Sigstore checks; archive shape and
-                     exact staged/installed version checks remain mandatory
-                     Downloaded binaries execute during those version probes;
-                     malicious bytes can run arbitrary code (trusted artifacts only)
+  --no-verify        UNSAFE: skip checksum + signature checks (minisign for
+                     releases >= v0.3.31, Sigstore/cosign for older releases);
+                     archive shape and exact staged/installed version checks
+                     remain mandatory. Downloaded binaries execute during those
+                     version probes; malicious bytes can run arbitrary code
+                     (trusted artifacts only)
   --force            Reinstall without probing the already-installed version
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
@@ -7801,6 +8624,8 @@ print_install_plan() {
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
     if [ "$NO_VERIFY" -eq 1 ]; then
       echo "  Integrity:  UNSAFE cryptographic verification bypass (--no-verify)"
+    elif [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
+      echo "  Integrity:  required SHA256 + minisign-signed manifest before extraction"
     else
       echo "  Integrity:  required SHA256 + Sigstore/cosign before extraction"
     fi
@@ -8221,7 +9046,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
 
   if ! checkout_pinned_dependency \
       "https://github.com/Dicklesworthstone/frankensearch.git" \
-      "$TMP/frankensearch" "$frankensearch_commit" || \
+      "$TMP/frankensearch-rel-0332" "$frankensearch_commit" || \
      ! checkout_pinned_dependency \
       "https://github.com/Dicklesworthstone/fast_cmaes.git" \
       "$TMP/fast_cmaes" "$fast_cmaes_commit" || \
@@ -8265,7 +9090,7 @@ else
   # Release archive verification is mandatory unless the caller explicitly
   # accepts the risk with --no-verify. This gate always runs before extraction.
   if [ "$NO_VERIFY" -eq 1 ]; then
-    warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
+    warn "UNSAFE: archive checksum and signature verification skipped (--no-verify)"
     warn "The archive's binaries will execute for version checks before installation."
     warn "Archive-member and exact-version checks remain mandatory."
   elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then

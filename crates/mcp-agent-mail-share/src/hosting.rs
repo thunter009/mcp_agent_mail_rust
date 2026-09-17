@@ -277,7 +277,7 @@ mod tests {
         let hints = detect_hosting_hints(dir.path());
         // May find nothing or env-based hints
         for hint in &hints {
-            assert!(!hint.signals.is_empty());
+            assert_ne!(hint.signals, [] as [std::string::String; 0]);
         }
     }
 
@@ -527,7 +527,7 @@ mod tests {
     fn symlinked_workflow_file_is_ignored() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::isolated_test_tempdir();
         let workflows = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&workflows).unwrap();
         let outside = tempfile::tempdir().unwrap();

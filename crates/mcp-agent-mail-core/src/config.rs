@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -90,6 +90,139 @@ impl std::fmt::Display for AtcWriteMode {
             Self::Live => f.write_str("live"),
         }
     }
+}
+
+/// ATC effect executor mode (`AM_ATC_EXECUTOR_MODE`).
+///
+/// Controls whether the ATC operator loop turns its decisions into durable
+/// side effects (advisory/probe mail, reservation releases). Independent of
+/// [`AtcWriteMode`], which only gates the experience ledger.
+///
+/// - `shadow` (default): observe and decide, but emit no mail and release
+///   nothing; effects are counted as `atc.shadow.would_insert` events.
+/// - `dry_run`: like shadow, but effects are reported as suppressed
+///   dry-run executions in the operator snapshot instead of trace events.
+/// - `canary`: send advisories and liveness probes as real messages, but never
+///   force-release reservations.
+/// - `live`: execute every effect, including reservation releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AtcExecutorMode {
+    #[default]
+    Shadow,
+    DryRun,
+    Canary,
+    Live,
+}
+
+impl AtcExecutorMode {
+    /// Environment variable that selects the executor mode.
+    pub const ENV_VAR: &str = "AM_ATC_EXECUTOR_MODE";
+    /// Accepted spellings, one per mode (aliases `dry-run`/`dryrun` also parse).
+    pub const VALUES: &[&str] = &["shadow", "dry_run", "canary", "live"];
+
+    /// Resolve the executor mode from the layered environment
+    /// (process env, then user env file, then project `.env`).
+    #[must_use]
+    pub fn from_env() -> Self {
+        full_env_value(Self::ENV_VAR).map_or(Self::Shadow, |value| Self::from_str_lossy(&value))
+    }
+
+    /// Parse a mode name. Unknown or empty values fall back to `Shadow`:
+    /// ATC observation stays active, but no durable messages or reservation
+    /// releases are emitted. Requiring an explicit Live/Canary opt-in prevents
+    /// a fresh install with the default write mode Off from turning passive
+    /// liveness sampling into an unbounded mailbox-writing workload.
+    #[must_use]
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dry-run" | "dry_run" | "dryrun" => Self::DryRun,
+            "canary" => Self::Canary,
+            "live" => Self::Live,
+            _ => Self::Shadow,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::DryRun => "dry_run",
+            Self::Canary => "canary",
+            Self::Live => "live",
+        }
+    }
+
+    /// Whether the operator needs an async runtime to execute real effects.
+    #[must_use]
+    pub const fn requires_runtime(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether advisory messages are actually sent.
+    #[must_use]
+    pub const fn executes_advisories(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether liveness probe messages are actually sent.
+    #[must_use]
+    pub const fn executes_probes(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    /// Whether file reservations may be force-released.
+    #[must_use]
+    pub const fn executes_releases(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl std::fmt::Display for AtcExecutorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Default ATC population hydration recency window (`AM_ATC_POPULATION_RECENCY_SECS`): 7 days.
+pub const ATC_POPULATION_RECENCY_SECS_DEFAULT: u64 = 7 * 24 * 3600;
+/// Default cap on agents materialized per ATC population sync (`AM_ATC_POPULATION_LIMIT`).
+pub const ATC_POPULATION_LIMIT_DEFAULT: usize = 4096;
+/// Hard ceiling for `AM_ATC_POPULATION_LIMIT`; larger values are clamped.
+pub const ATC_POPULATION_LIMIT_MAX: usize = 65_536;
+
+/// Recency window (seconds) for ATC population hydration from the durable DB.
+///
+/// Agents whose `last_active_ts` is older than this are not seeded into the
+/// ATC engine on cold start or periodic sync; they would immediately evaluate
+/// as Dead and only generate an O(agents) burst of effects. Negative or
+/// unparsable values fall back to the default. `0` hydrates nobody.
+#[must_use]
+pub fn atc_population_recency_secs() -> u64 {
+    full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(ATC_POPULATION_RECENCY_SECS_DEFAULT)
+}
+
+/// Maximum agents materialized by one ATC population sync, clamped to the
+/// range `1..=ATC_POPULATION_LIMIT_MAX` (see [`ATC_POPULATION_LIMIT_MAX`]).
+/// Zero or unparsable values fall back to the default.
+#[must_use]
+pub fn atc_population_limit() -> usize {
+    full_env_value("AM_ATC_POPULATION_LIMIT")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(ATC_POPULATION_LIMIT_DEFAULT)
+        .min(ATC_POPULATION_LIMIT_MAX)
+}
+
+/// Optional path to an ATC liveness policy bundle JSON
+/// (`AM_ATC_POLICY_BUNDLE_PATH`). Empty/whitespace values are treated as unset,
+/// in which case the compiled-in baseline policy is used.
+#[must_use]
+pub fn atc_policy_bundle_path() -> Option<String> {
+    full_env_value("AM_ATC_POLICY_BUNDLE_PATH")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Tool filtering configuration for context reduction.
@@ -475,6 +608,17 @@ pub struct Config {
     pub retention_report_enabled: bool,
     pub retention_report_interval_seconds: u64,
     pub retention_max_age_days: u64,
+    /// Retention horizon (days) for hard-pruning settled mail messages from the
+    /// live DB (GH#273, mirroring `file_reservations_retention_days` / GH#154).
+    /// When > 0, the retention worker `DELETE`s messages that are (a) read by
+    /// every recipient, (b) acknowledged by every recipient when the message
+    /// requires acknowledgement, and (c) older than this many days. Recipient
+    /// rows, delivery-event rows, and signal-receipt rows for the pruned
+    /// messages are removed in the same pass, and the per-project git archive
+    /// retains the full message history, so the delete is non-destructive to
+    /// the durable record. `0` (the default) disables pruning — messages are
+    /// only ever counted/reported, the historical behavior.
+    pub messages_retention_days: u64,
     pub retention_ignore_project_patterns: Vec<String>,
     pub quota_enabled: bool,
     pub quota_attachments_limit_bytes: u64,
@@ -1170,45 +1314,61 @@ fn current_exe_is_cargo_test_artifact() -> bool {
 /// to the `am` binary and the binary silently starts writing to the real
 /// user archive.
 ///
-/// ## Mode
+/// ## Behavior
 ///
-/// - **Default (warn mode)**: logs a WARN with guidance and returns. This
-///   avoids breaking the many existing tests that call `Config::from_env`
-///   purely to inspect config defaults without ever touching storage.
-/// - **Strict mode** (`AM_STRICT_HOME_STORAGE_GUARD=1`): panics instead
-///   of warning. Useful in CI to force test suites to set `STORAGE_ROOT`
-///   explicitly, and in production if operators want to ensure no stray
-///   test invocation can write to the real archive.
+/// This is the *diagnostic* layer. Resolving a `Config` is not what pollutes
+/// the operator's archive; writing through it is, and that write is refused
+/// fail-closed by the storage crate's single archive funnel
+/// (`ensure_archive_root`, br-99aih), which shares this exact predicate
+/// ([`default_storage_root_refused_under_test_harness`]). Hundreds of unit
+/// tests across the workspace construct a `Config` from the ambient env
+/// merely to read sizes and flags and never touch the archive; under
+/// cargo-nextest (the release gate, whose `NEXTEST_RUN_ID` marker makes the
+/// harness predicate true in every crate) a panic here fails all of them
+/// for a leak they cannot cause. So, by default, this logs a WARN with the
+/// actionable guidance and returns.
 ///
-/// Override (both modes) with `AM_ALLOW_HOME_STORAGE_ROOT=1` for the rare
-/// case where a test intentionally exercises the home-archive path.
+/// `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades the warning to a panic, for a
+/// suite that wants to force every test to set `STORAGE_ROOT` up front.
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1` silences the guard entirely for a test
+/// that intentionally exercises the home-archive path — normally because it
+/// first redirected `HOME`/`XDG_DATA_HOME` into a tempdir (see
+/// [`with_isolated_default_storage_root_for_test`]).
+///
+/// Production binaries are unaffected: the harness predicate
+/// ([`is_running_under_cargo_test_harness`]) never fires for a shipped `am`
+/// binary that is not running under a test harness.
 fn guard_against_default_storage_root_in_test_mode(storage_root: &Path) {
-    if !is_running_under_cargo_test_harness() {
+    if !default_storage_root_refused_under_test_harness(storage_root) {
         return;
     }
-    if !matches_default_storage_root(storage_root) {
-        return;
-    }
-    if env_truthy("AM_ALLOW_HOME_STORAGE_ROOT") {
-        return;
-    }
-
     let message = format!(
         "Config::from_env resolved storage_root to the default user archive ({}) while \
-         running under a cargo/nextest/insta test harness. This is almost always a bug — \
-         a subprocess-spawning test likely forgot to pass STORAGE_ROOT=<tempdir> through \
-         to the `am` binary, or an integration test forgot to set an isolated STORAGE_ROOT \
-         before constructing Config. Fixes: set STORAGE_ROOT explicitly, or export \
-         AM_ALLOW_HOME_STORAGE_ROOT=1 to bypass this guard for an intentional test.",
+         running under a cargo/nextest/insta test harness. Archive writes through this root \
+         are refused by the storage funnel; if this test writes to the archive it must set \
+         STORAGE_ROOT explicitly, redirect HOME and XDG_DATA_HOME into a tempdir \
+         (`with_isolated_default_storage_root_for_test`), or export \
+         AM_ALLOW_HOME_STORAGE_ROOT=1 for an intentional home-archive test.",
         storage_root.display()
     );
+    assert!(!env_truthy("AM_STRICT_HOME_STORAGE_GUARD"), "{message}");
+    tracing::warn!("{message}");
+}
 
-    assert!(!env_truthy("AM_STRICT_HOME_STORAGE_GUARD"), "{}", message);
-    tracing::warn!(
-        storage_root = %storage_root.display(),
-        "{}",
-        message
-    );
+/// True when a test harness must be refused the real default archive root.
+///
+/// All three conditions must hold: this process is a cargo/nextest/insta test
+/// harness (or a child of one), `storage_root` is the real user default
+/// archive, and `AM_ALLOW_HOME_STORAGE_ROOT` is not set.
+///
+/// Shared by the `Config::from_env` guard and the storage crate's
+/// archive-root funnel (`ensure_archive_root`) so both layers refuse under
+/// exactly the same conditions (br-99aih).
+#[must_use]
+pub fn default_storage_root_refused_under_test_harness(storage_root: &Path) -> bool {
+    is_running_under_cargo_test_harness()
+        && matches_default_storage_root(storage_root)
+        && !env_truthy("AM_ALLOW_HOME_STORAGE_ROOT")
 }
 
 /// Returns `true` when the given env var is set to a truthy value through
@@ -1645,6 +1805,8 @@ impl Default for Config {
             retention_report_enabled: false,
             retention_report_interval_seconds: 3600,
             retention_max_age_days: 180,
+            // Message pruning is opt-in (GH#273): 0 = report-only, never delete.
+            messages_retention_days: 0,
             // Override via RETENTION_IGNORE_PROJECT_PATTERNS env var.
             retention_ignore_project_patterns: vec![
                 "demo".to_string(),
@@ -1757,8 +1919,50 @@ impl Default for Config {
     }
 }
 
-/// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
-static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
+/// Parsed settings and their user-file authority always belong to one generation.
+#[derive(Default)]
+struct ConfigGeneration {
+    config: std::sync::RwLock<Option<Config>>,
+    user_env: OnceLock<std::sync::Arc<UserEnvLoad>>,
+}
+
+static CONFIG_CACHE: std::sync::LazyLock<std::sync::RwLock<std::sync::Arc<ConfigGeneration>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::sync::Arc::default()));
+
+thread_local! {
+    // Config construction is synchronous. Pin the generation for all nested
+    // environment lookups, including the final authority-error field.
+    static CONFIG_GENERATION_SCOPE: std::cell::RefCell<Option<std::sync::Arc<ConfigGeneration>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_config_generation() -> std::sync::Arc<ConfigGeneration> {
+    CONFIG_GENERATION_SCOPE
+        .with(|scope| scope.borrow().clone())
+        .unwrap_or_else(|| {
+            CONFIG_CACHE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+}
+
+struct ConfigGenerationGuard {
+    previous: Option<std::sync::Arc<ConfigGeneration>>,
+}
+
+impl ConfigGenerationGuard {
+    fn enter(generation: std::sync::Arc<ConfigGeneration>) -> Self {
+        let previous = CONFIG_GENERATION_SCOPE.with(|scope| scope.replace(Some(generation)));
+        Self { previous }
+    }
+}
+
+impl Drop for ConfigGenerationGuard {
+    fn drop(&mut self) {
+        CONFIG_GENERATION_SCOPE.with(|scope| scope.replace(self.previous.take()));
+    }
+}
 
 fn test_config_env_overrides_active() -> bool {
     let process_overrides_empty = process_env_overrides()
@@ -1769,13 +1973,19 @@ fn test_config_env_overrides_active() -> bool {
 }
 
 fn global_config_cache_get() -> Config {
+    global_config_cache_get_with_hook(|| {})
+}
+
+fn global_config_cache_get_with_hook(after_snapshot: impl FnOnce()) -> Config {
     if test_config_env_overrides_active() {
-        return Config::from_env();
+        return Config::from_env_with_generation_hook(after_snapshot);
     }
 
+    let generation = current_config_generation();
     // Fast path: read lock, return clone if present
     {
-        let guard = CONFIG_CACHE
+        let guard = generation
+            .config
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref c) = *guard {
@@ -1784,8 +1994,14 @@ fn global_config_cache_get() -> Config {
     }
     // Slow path: build outside the write lock so recursive `Config::get()`
     // calls during `from_env()` cannot deadlock on this cache.
-    let fresh = Config::from_env();
-    let mut guard = CONFIG_CACHE
+    let fresh = {
+        let _scope = ConfigGenerationGuard::enter(std::sync::Arc::clone(&generation));
+        Config::from_env_with_generation_hook(after_snapshot)
+    };
+    // A reset can replace the global generation while this build is in flight.
+    // Publish only to the captured generation, never into its successor.
+    let mut guard = generation
+        .config
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(ref cached) = *guard {
@@ -1799,7 +2015,7 @@ fn global_config_cache_reset() {
     let mut guard = CONFIG_CACHE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = None;
+    *guard = std::sync::Arc::default();
 }
 
 impl std::fmt::Debug for Config {
@@ -1853,10 +2069,23 @@ impl Config {
         self.http_cors_enabled = is_dev;
     }
 
-    /// Load configuration from environment variables
+    /// Parse process environment variables using the current user-file generation.
+    ///
+    /// User-file values and authority errors stay pinned for the whole parse.
+    /// Call [`Config::reset_cached`] after replacing or repairing `config.env`
+    /// to reload that file; calling `from_env` alone retains its cached authority.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Self {
+        Self::from_env_with_generation_hook(|| {})
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn from_env_with_generation_hook(after_snapshot: impl FnOnce()) -> Self {
+        let _scope = ConfigGenerationGuard::enter(current_config_generation());
+        // Load before the hook so tests can pause a real in-flight snapshot.
+        // Production uses a no-op; every field still follows this same path.
+        let _user_env = user_env_load();
+        after_snapshot();
         let mut config = Self::default();
 
         // Interface mode is stamped by the binary at startup (ADR-001).
@@ -2443,6 +2672,8 @@ impl Config {
         );
         config.retention_max_age_days =
             env_u64("RETENTION_MAX_AGE_DAYS", config.retention_max_age_days);
+        config.messages_retention_days =
+            env_u64("MESSAGES_RETENTION_DAYS", config.messages_retention_days);
         if let Some(v) = env_value("RETENTION_IGNORE_PROJECT_PATTERNS") {
             config.retention_ignore_project_patterns = parse_csv(&v);
         }
@@ -2492,7 +2723,7 @@ impl Config {
         );
 
         // TOON output format
-        // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "tru")
+        // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "toon")
         config.toon_bin = env_value("TOON_TRU_BIN")
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -2859,13 +3090,13 @@ impl Config {
         }
 
         // ────────────────────────────────────────────────────────────
-        // Test-mode guard (C2): if this process looks like it's running
-        // under a cargo integration-test / nextest / insta harness and is
-        // about to fall back to the DEFAULT user storage_root, flag it.
-        // Default mode is WARN (so existing test suites that call
-        // `Config::from_env` purely to inspect defaults aren't broken);
-        // `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades to panic for CI gating.
-        // `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
+        // Test-mode guard (C2, br-99aih): if this process looks like it's
+        // running under a cargo integration-test / nextest / insta harness
+        // and just resolved the DEFAULT user storage_root, warn with
+        // guidance (`AM_STRICT_HOME_STORAGE_GUARD=1` upgrades to a panic).
+        // The fail-closed protection lives in the storage crate's archive
+        // funnel, which refuses to initialize this root under the same
+        // predicate; `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
         // ────────────────────────────────────────────────────────────
         config.user_env_authority_error = user_env_authority_error();
         guard_against_default_storage_root_in_test_mode(&config.storage_root);
@@ -2880,8 +3111,8 @@ impl Config {
     /// clone of the cached value, avoiding repeated env-var parsing.
     ///
     /// Use this in hot paths (tool handlers) instead of `Config::from_env()`.
-    /// For tests or CLI commands that need a fresh or mutated config, continue
-    /// using `Config::from_env()` directly.
+    /// `Config::from_env()` reparses process variables. To reload a replaced or
+    /// repaired user config file as well, first call [`Config::reset_cached`].
     ///
     /// Cloning a ~60-field struct is ~2-3 KB and takes <1 microsecond — far
     /// cheaper than parsing 40+ environment variables with string conversions.
@@ -2890,9 +3121,16 @@ impl Config {
         global_config_cache_get()
     }
 
-    /// Reset the global config cache, forcing the next [`Config::get`] call to
-    /// re-parse environment variables. Intended for tests that modify env vars
-    /// between test cases.
+    /// Start a new generation for parsed settings and the user env-file authority.
+    ///
+    /// After an atomic `config.env` replacement or repair, call this before
+    /// [`Config::get`] or [`Config::from_env`] to reload both values and rejection
+    /// state. Reads already in flight may finish with their complete old
+    /// generation; they cannot repopulate the new cache with old settings.
+    /// Reads begun after this call returns use the new generation. Existing
+    /// `Config` clones remain snapshots; separate `env_value` calls are separate
+    /// reads. Process env is still read normally and project `.env` caching is
+    /// unchanged. This does not mutate files or the process environment.
     pub fn reset_cached() {
         global_config_cache_reset();
     }
@@ -3216,10 +3454,11 @@ pub fn detect_source(key: &str) -> ConfigSource {
     if env::var(key).is_ok() {
         return ConfigSource::ProcessEnv;
     }
-    if user_env_value(key).is_some() {
+    let user_env = user_env_load();
+    if user_env.values.contains_key(key) {
         return ConfigSource::UserEnvFile;
     }
-    if user_env_load().authority_error.is_some() {
+    if user_env.authority_error.is_some() {
         return ConfigSource::Default;
     }
     if dotenv_value(key).is_some() {
@@ -3231,7 +3470,6 @@ pub fn detect_source(key: &str) -> ConfigSource {
 // Helper functions for environment variable parsing
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
-static USER_ENV_LOAD: OnceLock<UserEnvLoad> = OnceLock::new();
 static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
 /// Maximum accepted size for one environment-file authority.
@@ -3349,6 +3587,89 @@ pub fn with_process_env_overrides_for_test<R>(
     result
 }
 
+/// Run `f` with the *default* storage root redirected into a private tempdir,
+/// for tests that must exercise the "storage root is the default mailbox"
+/// code paths (`is_default_storage_root(..) == true`) without ever touching
+/// the operator's real archive.
+///
+/// `default_storage_root_path()` prefers `$HOME/.mcp_agent_mail_git_mailbox_repo`
+/// whenever that legacy archive holds a `projects/` dir, so overriding only
+/// `XDG_DATA_HOME` still resolves to the live archive on any host that has
+/// run the daemon (br-99aih). This helper overrides `HOME`, `USERPROFILE`,
+/// and `XDG_DATA_HOME` together, pins `STORAGE_ROOT` to the resolved root
+/// (a user-global `config.env` that sets `STORAGE_ROOT` is loaded once per
+/// process and would otherwise win over the redirected default), and sets
+/// `AM_ALLOW_HOME_STORAGE_ROOT=1` because the redirected default root is, by
+/// construction, private to the test. The closure receives the resolved
+/// default root; it does not exist yet, and the whole tempdir is removed when
+/// `f` returns.
+///
+/// The env-override lock is not reentrant: use
+/// [`with_isolated_default_storage_root_and_env_overrides_for_test`] when the
+/// test also needs other overrides (`DATABASE_URL`, ...).
+#[doc(hidden)]
+pub fn with_isolated_default_storage_root_for_test<R>(f: impl FnOnce(&Path) -> R) -> R {
+    with_isolated_default_storage_root_and_env_overrides_for_test(&[], f)
+}
+
+/// [`with_isolated_default_storage_root_for_test`] with additional process-env
+/// overrides applied in the same (non-reentrant) override scope. The isolation
+/// keys (`HOME`, `USERPROFILE`, `XDG_DATA_HOME`, `STORAGE_ROOT`,
+/// `AM_ALLOW_HOME_STORAGE_ROOT`) are applied after `extra_overrides`, so they
+/// cannot be undone by it.
+#[doc(hidden)]
+pub fn with_isolated_default_storage_root_and_env_overrides_for_test<R>(
+    extra_overrides: &[(&str, &str)],
+    f: impl FnOnce(&Path) -> R,
+) -> R {
+    let tmp = tempfile::tempdir().expect("isolated default storage root tempdir");
+    // Canonicalize so `Config::from_env`'s canonicalized `storage_root` compares
+    // equal to the raw `default_storage_root_path()`; a symlinked TMPDIR would
+    // otherwise make `is_default_storage_root` false for the resolved config.
+    let base = fs::canonicalize(tmp.path()).expect("canonicalize isolated tempdir");
+    let home = base.join("home");
+    let xdg_data = base.join("xdg-data");
+    fs::create_dir_all(&home).expect("create isolated home");
+    fs::create_dir_all(&xdg_data).expect("create isolated xdg data dir");
+    // No legacy `<home>/.mcp_agent_mail_git_mailbox_repo/projects/` exists in
+    // the fresh home, so the XDG branch of `default_storage_root_path()` wins.
+    let expected_root = xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo");
+    let home_text = home.to_string_lossy().into_owned();
+    let xdg_data_text = xdg_data.to_string_lossy().into_owned();
+    let expected_root_text = expected_root.to_string_lossy().into_owned();
+
+    let mut overrides = extra_overrides.to_vec();
+    overrides.extend([
+        ("HOME", home_text.as_str()),
+        ("USERPROFILE", home_text.as_str()),
+        ("XDG_DATA_HOME", xdg_data_text.as_str()),
+        ("STORAGE_ROOT", expected_root_text.as_str()),
+        ("AM_ALLOW_HOME_STORAGE_ROOT", "1"),
+    ]);
+
+    let result = with_process_env_overrides_for_test(&overrides, || {
+        let root = default_storage_root_path();
+        assert!(
+            root.starts_with(&base),
+            "isolated default storage root {} escaped the tempdir {}",
+            root.display(),
+            base.display()
+        );
+        assert_eq!(
+            root, expected_root,
+            "isolated default storage root must resolve through the XDG branch"
+        );
+        assert!(
+            is_default_storage_root(&root),
+            "resolved root {} must be the default storage root",
+            root.display()
+        );
+        f(&root)
+    });
+    drop(tmp);
+    result
+}
+
 #[cfg(test)]
 fn test_env_override_value(key: &str) -> Option<String> {
     TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned())
@@ -3394,7 +3715,12 @@ fn user_env_file_candidates(home: Option<&Path>, xdg_config_dir: Option<&Path>) 
     candidates
 }
 
-fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io::Result<Vec<u8>> {
+fn read_open_user_env_file_bounded(
+    file: &mut std::fs::File,
+    path: &Path,
+    after_metadata: impl FnOnce(),
+    after_read: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -3414,6 +3740,7 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
         ));
     }
 
+    after_metadata();
     let allocation =
         usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES)).unwrap_or(1024 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
@@ -3427,6 +3754,40 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
                 "{} grew beyond the {}-byte user configuration limit",
                 path.display(),
                 USER_ENV_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    after_read();
+
+    // A retained inode alone does not bind content: an in-place writer can
+    // rewrite it while we read. Require two bounded observations to agree,
+    // as well as stable handle metadata around both reads. This is bounded
+    // race detection, not a lock or an atomic snapshot against a writer that
+    // deliberately changes and restores bytes between observations.
+    file.rewind()?;
+    let mut confirmed = Vec::with_capacity(bytes.len());
+    file.by_ref()
+        .take(USER_ENV_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut confirmed)?;
+    let after = file.metadata()?;
+    let unchanged = metadata.len() == after.len()
+        && metadata.modified()? == after.modified()?
+        && u64::try_from(bytes.len()).ok() == Some(metadata.len());
+    #[cfg(unix)]
+    let unchanged = {
+        use std::os::unix::fs::MetadataExt as _;
+        unchanged
+            && metadata.ctime() == after.ctime()
+            && metadata.ctime_nsec() == after.ctime_nsec()
+    };
+    // Platforms without Unix ctime rely on size, mtime and repeated bytes.
+    // In particular, restored/coarse mtime is never sufficient by itself.
+    if !unchanged || bytes != confirmed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} changed file identity or content generation during read",
+                path.display()
             ),
         ));
     }
@@ -3505,6 +3866,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
@@ -3541,9 +3903,8 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
     };
-    after_file_open();
     let mut file = std::fs::File::from(file_fd);
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     let opened_file = fstat(&file).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3659,6 +4020,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     let parent = env_authority_parent(path);
     let parent_before = match bind_user_env_parent(parent) {
@@ -3680,15 +4042,14 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(error),
     };
-    after_file_open();
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     revalidate_open_user_env_leaf(path, file)?;
     revalidate_user_env_parent(parent, &parent_before)?;
     Ok(Some(bytes))
 }
 
 fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    read_user_env_candidate_with_hooks(path, || {}, || {})
+    read_user_env_candidate_with_hooks(path, || {}, || {}, || {})
 }
 
 fn env_authority_parent(path: &Path) -> &Path {
@@ -3701,13 +4062,14 @@ fn env_authority_parent(path: &Path) -> &Path {
 ///
 /// Setup and legacy import use this fresh (uncached) seam. Keeping it beside
 /// runtime discovery ensures every caller gets the same regular-file,
-/// no-follow, parent-binding, size-bound, and identity-revalidation guarantees
-/// as normal user configuration loading.
+/// no-follow, parent-binding, size-bound, identity-revalidation, and repeated
+/// content/metadata checks as normal user configuration loading. These checks
+/// detect observed races; they do not lock out arbitrary in-place writers.
 ///
 /// # Errors
 ///
 /// Returns an error when an existing authority is unsafe, unreadable,
-/// oversized, invalid UTF-8, or changes identity during the read.
+/// oversized, invalid UTF-8, or changes identity/content generation during the read.
 pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
     let Some(bytes) = read_user_env_candidate(path)? else {
         return Ok(None);
@@ -3784,16 +4146,15 @@ fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>)
     load_user_env_values_from_with_reader(home, xdg_config_dir, read_user_env_candidate)
 }
 
-fn user_env_load() -> &'static UserEnvLoad {
-    USER_ENV_LOAD.get_or_init(|| {
-        let home = configured_home_dir().filter(|path| path.is_absolute());
-        let xdg = xdg_config_dir();
-        load_user_env_values_from(home.as_deref(), xdg.as_deref())
-    })
-}
-
-fn user_env_values() -> &'static HashMap<String, String> {
-    &user_env_load().values
+fn user_env_load() -> std::sync::Arc<UserEnvLoad> {
+    current_config_generation()
+        .user_env
+        .get_or_init(|| {
+            let home = configured_home_dir().filter(|path| path.is_absolute());
+            let xdg = xdg_config_dir();
+            std::sync::Arc::new(load_user_env_values_from(home.as_deref(), xdg.as_deref()))
+        })
+        .clone()
 }
 
 /// Return the reason the user-global env-file authority was rejected.
@@ -3809,7 +4170,7 @@ pub fn user_env_authority_error() -> Option<String> {
 /// Read a value from the user-global env file (`~/.mcp_agent_mail/.env`).
 #[must_use]
 pub fn user_env_value(key: &str) -> Option<String> {
-    user_env_values().get(key).cloned()
+    user_env_load().values.get(key).cloned()
 }
 
 /// Read a value with full precedence: process env → user env file → project `.env`.
@@ -4668,7 +5029,9 @@ mod tests {
                 atc_write_mode: AtcWriteMode::Off,
                 ..Config::default()
             };
-            let mut guard = CONFIG_CACHE
+            let generation = current_config_generation();
+            let mut guard = generation
+                .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(stale);
@@ -6000,6 +6363,7 @@ mod tests {
                 std::fs::rename(&replacement, &parent).unwrap();
             },
             || {},
+            || {},
         )
         .expect_err("parent replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
@@ -6023,6 +6387,7 @@ mod tests {
                 std::fs::rename(&parent, &detached).unwrap();
                 std::fs::rename(&replacement, &parent).unwrap();
             },
+            || {},
             || {},
         )
         .expect_err("an absent leaf in a detached authority must not permit fallback");
@@ -6064,9 +6429,298 @@ mod tests {
                 std::fs::rename(&candidate, &displaced).unwrap();
                 std::fs::write(&candidate, "FOO=swapped\n").unwrap();
             },
+            || {},
         )
         .expect_err("leaf replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
+    }
+
+    #[test]
+    fn user_env_in_place_mutation_rejects_without_legacy_fallback() {
+        for (after_first_read, replacement) in [
+            (false, "FOO=grown-after-metadata\n"),
+            (false, "FOO=x\n"),
+            (true, "FOO=after!\n"), // Same length; restored mtime cannot hide changed bytes.
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let xdg = tmp.path().join("authority");
+            let legacy = tmp.path().join(".mcp_agent_mail");
+            fs::create_dir(&xdg).unwrap();
+            fs::create_dir(&legacy).unwrap();
+            let candidate = xdg.join("config.env");
+            fs::write(&candidate, "FOO=before\n").unwrap();
+            fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+            let identity = same_file::Handle::from_path(&candidate).unwrap();
+            let modified = fs::metadata(&candidate).unwrap().modified().unwrap();
+            let mutate = || {
+                use std::io::Write as _;
+                let mut writer = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&candidate)
+                    .unwrap();
+                writer.write_all(replacement.as_bytes()).unwrap();
+                writer.sync_all().unwrap();
+                writer.set_modified(modified).unwrap();
+                assert_eq!(identity, same_file::Handle::from_path(&candidate).unwrap());
+                assert_eq!(
+                    fs::metadata(&candidate).unwrap().modified().unwrap(),
+                    modified
+                );
+                if after_first_read {
+                    assert_eq!(fs::metadata(&candidate).unwrap().len(), 11);
+                }
+            };
+            let mut consulted = Vec::new();
+            let load =
+                load_user_env_values_from_with_reader(Some(tmp.path()), Some(&xdg), |path| {
+                    consulted.push(path.to_path_buf());
+                    read_user_env_candidate_with_hooks(
+                        path,
+                        || {},
+                        || {
+                            if !after_first_read {
+                                mutate();
+                            }
+                        },
+                        || {
+                            if after_first_read {
+                                mutate();
+                            }
+                        },
+                    )
+                });
+            assert!(
+                load.values.is_empty(),
+                "mutation phase after_read={after_first_read}"
+            );
+            assert!(
+                load.authority_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("changed"))
+            );
+            assert_eq!(
+                consulted,
+                [candidate],
+                "rejected authority must suppress fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn user_env_read_accepts_stable_generation_at_size_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidate = tmp.path().join("config.env");
+        for size in [0, 1, USER_ENV_FILE_MAX_BYTES] {
+            let contents = "x".repeat(usize::try_from(size).unwrap());
+            fs::write(&candidate, &contents).unwrap();
+            assert_eq!(read_env_authority_text(&candidate).unwrap(), Some(contents));
+        }
+        fs::write(
+            &candidate,
+            vec![b'x'; usize::try_from(USER_ENV_FILE_MAX_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(read_env_authority_text(&candidate).is_err());
+    }
+
+    #[test]
+    fn fresh_process_config_reload_replaces_cached_token() {
+        run_config_reload_case("token");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_repairs_cached_rejection() {
+        run_config_reload_case("rejection");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_isolates_concurrent_readers() {
+        run_config_reload_case("concurrent");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_restores_scope_after_panic() {
+        run_config_reload_case("panic");
+    }
+
+    fn replace_reload_fixture(path: &Path, token: &str, port: u16) {
+        use std::io::Write as _;
+
+        let mut staged = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        writeln!(staged, "HTTP_BEARER_TOKEN={token}\nHTTP_PORT={port}").unwrap();
+        staged.as_file().sync_all().unwrap();
+        staged
+            .persist(path)
+            .expect("atomic configuration replacement");
+    }
+
+    fn assert_reload_config(config: &Config, token: &str, port: u16) {
+        assert_eq!(config.http_bearer_token.as_deref(), Some(token));
+        assert_eq!(config.http_port, port);
+        config.validate_user_env_authority().unwrap();
+    }
+
+    fn exercise_concurrent_reload(path: &Path) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Repeat with an accepted and a rejected old authority. The hook pauses
+        // actual Config construction after its real file snapshot is loaded.
+        for rejected in [false, true] {
+            if rejected {
+                fs::write(path, [0xff]).unwrap();
+            } else {
+                replace_reload_fixture(path, "reload-old", 8761);
+            }
+            Config::reset_cached();
+            let old = user_env_load();
+            assert_eq!(old.authority_error.is_some(), rejected);
+            std::thread::scope(|scope| {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let mut releases = Vec::new();
+                let mut readers = Vec::new();
+                for index in 0..8 {
+                    let (release_tx, release_rx) = mpsc::channel();
+                    releases.push(release_tx);
+                    let ready_tx = ready_tx.clone();
+                    readers.push(scope.spawn(move || {
+                        let pause = || {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        };
+                        if index % 2 == 0 {
+                            global_config_cache_get_with_hook(pause)
+                        } else {
+                            Config::from_env_with_generation_hook(pause)
+                        }
+                    }));
+                }
+                for _ in 0..8 {
+                    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                replace_reload_fixture(path, "reload-new", 8762);
+                Config::reset_cached();
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                assert_reload_config(&Config::from_env(), "reload-new", 8762);
+                for release in releases {
+                    release.send(()).unwrap();
+                }
+                for reader in readers {
+                    let config = reader.join().unwrap();
+                    if rejected {
+                        assert!(config.http_bearer_token.is_none());
+                        assert_eq!(config.http_port, Config::default().http_port);
+                        assert!(config.validate_user_env_authority().is_err());
+                    } else {
+                        assert_reload_config(&config, "reload-old", 8761);
+                    }
+                }
+            });
+            // Old in-flight builders must not repopulate the replacement cache.
+            assert_reload_config(&Config::get(), "reload-new", 8762);
+            assert!(user_env_authority_error().is_none());
+        }
+    }
+
+    fn run_config_reload_case(case: &str) {
+        const CHILD_MARKER: &str = "AM_TEST_CONFIG_RELOAD_CHILD";
+        if std::env::var(CHILD_MARKER).as_deref() == Ok(case) {
+            let path = user_env_authority_candidates().into_iter().next().unwrap();
+            if case == "concurrent" {
+                exercise_concurrent_reload(&path);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
+            if case == "panic" {
+                assert_reload_config(&Config::get(), "reload-old", 8761);
+                let panic = std::panic::catch_unwind(|| {
+                    Config::from_env_with_generation_hook(|| {
+                        replace_reload_fixture(&path, "reload-new", 8762);
+                        Config::reset_cached();
+                        panic!("deliberate configuration parse interruption");
+                    });
+                });
+                assert!(panic.is_err());
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
+            let before = Config::get();
+            if case == "rejection" {
+                assert!(before.http_bearer_token.is_none());
+                assert!(before.validate_user_env_authority().is_err());
+                assert_eq!(detect_source("HTTP_BEARER_TOKEN"), ConfigSource::Default);
+            } else {
+                assert_reload_config(&before, "reload-old", 8761);
+            }
+
+            replace_reload_fixture(&path, "reload-new", 8762);
+            // Replacing the file alone does not silently change a running generation.
+            assert_eq!(Config::get().http_bearer_token, before.http_bearer_token);
+            Config::reset_cached();
+            assert_reload_config(&Config::get(), "reload-new", 8762);
+            assert_reload_config(&Config::from_env(), "reload-new", 8762);
+            assert_eq!(
+                user_env_value("HTTP_BEARER_TOKEN").as_deref(),
+                Some("reload-new")
+            );
+            assert!(user_env_authority_error().is_none());
+            assert_eq!(
+                detect_source("HTTP_BEARER_TOKEN"),
+                ConfigSource::UserEnvFile
+            );
+            println!("{CHILD_MARKER}:{case}:executed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let xdg = root.join("config");
+        let config_dir = xdg.join(XDG_APP_DIR);
+        let project = root.join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let path = config_dir.join("config.env");
+        if case == "rejection" {
+            fs::write(&path, [0xff]).unwrap();
+        } else {
+            replace_reload_fixture(&path, "reload-old", 8761);
+        }
+        fs::write(
+            project.join(".env"),
+            "HTTP_BEARER_TOKEN=forbidden-fallback\n",
+        )
+        .unwrap();
+
+        let test = match case {
+            "token" => "fresh_process_config_reload_replaces_cached_token",
+            "rejection" => "fresh_process_config_reload_repairs_cached_rejection",
+            "concurrent" => "fresh_process_config_reload_isolates_concurrent_readers",
+            "panic" => "fresh_process_config_reload_restores_scope_after_panic",
+            _ => unreachable!("known reload case"),
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("config::tests::{test}"), "--nocapture"])
+            .current_dir(&project)
+            .env(CHILD_MARKER, case)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("STORAGE_ROOT", root.join("storage"))
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("HTTP_PORT")
+            .output()
+            .expect("isolated reload child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("{CHILD_MARKER}:{case}:executed")),
+            "child did not execute the selected test: {stdout}\n{stderr}"
+        );
     }
 
     #[test]
@@ -6273,6 +6927,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn isolated_default_storage_root_helper_redirects_default_root_into_tempdir() {
+        // br-99aih: the helper must hand tests a default storage root that is
+        // (a) the default root by every definition the guard uses, (b) not
+        // refused by the guard, (c) what `Config::from_env` resolves to, and
+        // (d) private to the test — inside the tempdir and gone afterwards —
+        // even on a host whose real `~/.mcp_agent_mail_git_mailbox_repo/projects/`
+        // exists.
+        let temp_base =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+
+        let (root, from_env_root) = with_isolated_default_storage_root_for_test(|root| {
+            assert!(is_default_storage_root(root));
+            assert!(
+                !default_storage_root_refused_under_test_harness(root),
+                "isolated default root must not be refused: {}",
+                root.display()
+            );
+            assert!(
+                root.starts_with(&temp_base),
+                "isolated root {} must live under the temp dir {}",
+                root.display(),
+                temp_base.display()
+            );
+            // Simulate a test seeding the archive so cleanup is observable.
+            std::fs::create_dir_all(root.join("projects").join("probe"))
+                .expect("seed isolated archive");
+            let config = Config::from_env();
+            assert!(is_default_storage_root(&config.storage_root));
+            (root.to_path_buf(), config.storage_root)
+        });
+
+        assert_eq!(root, from_env_root);
+        assert!(
+            root.ends_with(Path::new(XDG_APP_DIR).join("git_mailbox_repo")),
+            "isolated root must be the XDG default layout: {}",
+            root.display()
+        );
+        assert!(
+            !root.exists(),
+            "isolated tempdir must be removed once the closure returns: {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn isolated_default_storage_root_helper_applies_extra_overrides_but_keeps_isolation() {
+        let temp_base =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("HTTP_PORT", "48123"),
+                // Isolation keys win over extra overrides.
+                ("HOME", "/definitely/not/a/home"),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
+            ],
+            |root| {
+                let config = Config::from_env();
+                assert_eq!(config.http_port, 48123, "extra override must apply");
+                assert_eq!(config.storage_root, root);
+                assert!(root.starts_with(&temp_base));
+                assert!(!root.starts_with("/definitely/not/a/home"));
+                assert!(!default_storage_root_refused_under_test_harness(root));
+            },
+        );
+    }
+
     // -----------------------------------------------------------------------
     // C2/C3 — test-mode guard against default storage_root fall-through
     // -----------------------------------------------------------------------
@@ -6306,45 +7027,67 @@ mod tests {
 
     #[test]
     fn test_mode_guard_warns_but_does_not_panic_by_default_under_harness() {
-        // Default behavior when a test harness is active and storage_root is
-        // the default: WARN, don't panic. This avoids breaking the many
-        // existing integration tests that call `Config::from_env` just to
-        // inspect config defaults without ever writing to storage.
+        // br-99aih: when a test harness is active and storage_root is the
+        // default, the Config-level guard WARNS and returns; the fail-closed
+        // refusal lives in the storage crate's archive funnel. A panic here
+        // would fail every unit test that merely resolves a Config under
+        // cargo-nextest (whose NEXTEST_RUN_ID marker makes the harness
+        // predicate true in every crate). Seed
+        // `<home>/.mcp_agent_mail_git_mailbox_repo/projects/` so the legacy
+        // branch of `default_storage_root_path()` wins, exactly as on a host
+        // that has run the daemon.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
+        let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
         let xdg_data = tmp.path().join("xdg-data");
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(legacy.join("projects")).unwrap();
         std::fs::create_dir_all(&xdg_data).unwrap();
 
-        let result = std::panic::catch_unwind(|| {
-            with_process_env_overrides_for_test(
-                &[
-                    ("HOME", home.to_string_lossy().as_ref()),
-                    ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
-                    ("CARGO_TARGET_TMPDIR", tmp.path().to_string_lossy().as_ref()),
-                    // Neither bypass nor strict mode enabled.
-                    ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
-                    ("AM_STRICT_HOME_STORAGE_GUARD", ""),
-                ],
-                || {
-                    let default_path = default_storage_root_path();
-                    guard_against_default_storage_root_in_test_mode(&default_path);
-                },
-            );
-        });
+        with_process_env_overrides_for_test(
+            &[
+                ("HOME", home.to_string_lossy().as_ref()),
+                ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
+                ("CARGO_TARGET_TMPDIR", tmp.path().to_string_lossy().as_ref()),
+                // Pin STORAGE_ROOT to the seeded legacy root: the user-global
+                // config.env is loaded once per process and may carry its own
+                // STORAGE_ROOT, which would otherwise steer `Config::from_env`
+                // away from the default root this test is about.
+                ("STORAGE_ROOT", legacy.to_string_lossy().as_ref()),
+                // Neither the bypass nor the (now redundant) strict flag.
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
+                ("AM_STRICT_HOME_STORAGE_GUARD", ""),
+            ],
+            || {
+                let default_path = default_storage_root_path();
+                assert_eq!(default_path, legacy, "seeded legacy archive must win");
+                assert!(
+                    default_storage_root_refused_under_test_harness(&default_path),
+                    "shared predicate must flag the default root under a harness"
+                );
 
-        assert!(
-            result.is_ok(),
-            "guard must NOT panic in the default (warn-only) mode"
+                let direct = std::panic::catch_unwind(|| {
+                    guard_against_default_storage_root_in_test_mode(&default_path);
+                });
+                assert!(
+                    direct.is_ok(),
+                    "guard must warn, not panic, under a harness by default"
+                );
+
+                let via_from_env = std::panic::catch_unwind(Config::from_env);
+                let config = via_from_env
+                    .expect("Config::from_env must resolve (with a warning) under a harness");
+                assert_eq!(
+                    config.storage_root, default_path,
+                    "the resolved root is still the default; only archive writes are refused"
+                );
+            },
         );
     }
 
     #[test]
     fn test_mode_guard_panics_in_strict_mode_under_harness() {
-        // Strict mode (`AM_STRICT_HOME_STORAGE_GUARD=1`): panic instead of
-        // warn. Used in CI to force test suites to set STORAGE_ROOT and in
-        // production to ensure no stray test invocation can write to the
-        // real archive.
+        // `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades the default warning to a
+        // panic for suites that want every test to set STORAGE_ROOT up front.
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let xdg_data = tmp.path().join("xdg-data");
@@ -6402,15 +7145,24 @@ mod tests {
         // even if storage_root matches the default. This is the production
         // binary case.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
-        let xdg_data = tmp.path().join("xdg-data");
+        // Canonical base so `Config::from_env`'s canonicalized storage_root
+        // compares equal to the raw default path below.
+        let base = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let home = base.join("home");
+        let xdg_data = base.join("xdg-data");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&xdg_data).unwrap();
+        let expected_default = xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo");
 
         with_process_env_overrides_for_test(
             &[
                 ("HOME", home.to_string_lossy().as_ref()),
                 ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
+                // Pin STORAGE_ROOT to the default so a user-global config.env
+                // (loaded once per process) cannot steer `Config::from_env`
+                // away from the default root under test.
+                ("STORAGE_ROOT", expected_default.to_string_lossy().as_ref()),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", ""),
                 // Clear all harness markers via override, and force the exe-in-deps
                 // fallback off (br-3jkqw) so this test can exercise the true
                 // production path from within a (necessarily deps-hosted) test binary.
@@ -6421,8 +7173,21 @@ mod tests {
             ],
             || {
                 let default_path = default_storage_root_path();
+                assert_eq!(default_path, expected_default);
                 // Must not panic when no harness marker is set.
                 guard_against_default_storage_root_in_test_mode(&default_path);
+                assert!(
+                    !default_storage_root_refused_under_test_harness(&default_path),
+                    "production path must never be refused"
+                );
+                // br-99aih: the production path must still resolve the default
+                // root through `Config::from_env` — the refusal is test-only.
+                let config = Config::from_env();
+                assert_eq!(
+                    config.storage_root, default_path,
+                    "production Config::from_env must still yield default_storage_root_path()"
+                );
+                assert!(is_default_storage_root(&config.storage_root));
             },
         );
     }

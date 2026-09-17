@@ -637,8 +637,11 @@ fn validate_reconstruction(
     Ok(())
 }
 
-fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
-    mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
+    // Engine-dispatching: a live primary that was reconstructed or restored
+    // (no namespace pair) is compared against the archive through canonical
+    // SQLite instead of being treated as unavailable.
+    mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
         path,
         "archive-read live database probe",
     )
@@ -722,7 +725,7 @@ fn build_snapshot(
             .map_err(AcquireError::failed)?;
     let snapshot_path = directory.path().join("mailbox.sqlite3");
     let stats = if slot.scope.sqlite_path.exists() {
-        mcp_agent_mail_db::reconstruct_from_archive_with_live_franken_salvage(
+        mcp_agent_mail_db::reconstruct_from_archive_with_live_salvage(
             &snapshot_path,
             &slot.scope.storage_root,
             &slot.scope.sqlite_path,
@@ -747,6 +750,17 @@ fn build_snapshot(
         ));
     }
     drop(probe);
+
+    // The reconstructed snapshot is a canonical, sidecar-less file in a
+    // process-private directory. The strict query-only pool below opens it
+    // through the bound FrankenSQLite opener, which requires the persistent
+    // namespace pair, so admit the private family once before handing it to
+    // the pool.
+    mcp_agent_mail_db::pool::admit_private_database_with_franken(
+        &snapshot_path,
+        "archive-read snapshot admission",
+    )
+    .map_err(AcquireError::failed)?;
 
     let pool = mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_path),
@@ -1681,6 +1695,103 @@ mod tests {
         drop(conn);
         assert_eq!(snapshot_family(snapshot.path()), family_before);
         drop(snapshots);
+        reset_for_test();
+    }
+
+    #[test]
+    fn fetch_inbox_does_not_write_read_receipts_into_archive_snapshot() {
+        assert_archive_inbox_preserves_databases(None);
+    }
+
+    #[test]
+    fn fetch_inbox_from_archive_preserves_unopenable_live_database() {
+        assert_archive_inbox_preserves_databases(Some(b"damaged live SQLite fixture"));
+    }
+
+    fn assert_archive_inbox_preserves_databases(live_bytes: Option<&[u8]>) {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        if let Some(bytes) = live_bytes {
+            fs::write(&sqlite_path, bytes).expect("seed damaged live database");
+        }
+        let live_family_before = snapshot_family(&sqlite_path);
+        write_archive_fixture(&storage_root);
+        fs::write(
+            storage_root.join(
+                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-00Z__hello__1.md",
+            ),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Alice\"],\"subject\":\"hello\",\"importance\":\"normal\",\"ack_required\":true,\"created_ts\":\"2026-07-19T00:00:00Z\"}\n---\n\narchive inbox body\n",
+        )
+        .expect("write recipient-bearing message");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let cx = Cx::for_testing();
+                let snapshot = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                    .expect("acquire snapshot")
+                    .expect("missing live database requires an archive snapshot");
+                let family_before = snapshot_family(snapshot.path());
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                runtime.block_on(async {
+                    let ctx = fastmcp::prelude::McpContext::new(cx.clone(), 1);
+                    for mark_read in [Some(false), None, Some(true)] {
+                        let response = crate::fetch_inbox(
+                            &ctx,
+                            "/single-flight-project".to_string(),
+                            "Alice".to_string(),
+                            None,
+                            None,
+                            Some(10),
+                            Some(true),
+                            Some(true),
+                            None,
+                            None,
+                            mark_read,
+                        )
+                        .await
+                        .expect("archive inbox remains readable");
+                        let messages: serde_json::Value =
+                            serde_json::from_str(&response).expect("inbox JSON");
+                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                        assert_eq!(messages[0]["id"], 1);
+                        assert_eq!(messages[0]["from"], "Alice");
+                        assert!(
+                            messages[0]["body_md"]
+                                .as_str()
+                                .expect("body")
+                                .contains("archive inbox body")
+                        );
+                        assert!(
+                            messages[0]["read_ts"].is_null(),
+                            "snapshot reads must not invent durable read receipts: {response}"
+                        );
+                        assert!(messages[0]["ack_ts"].is_null());
+                        assert_eq!(
+                            snapshot_family(snapshot.path()),
+                            family_before,
+                            "snapshot database family changed for mark_read={mark_read:?}"
+                        );
+                        assert_eq!(
+                            snapshot_family(&sqlite_path),
+                            live_family_before,
+                            "a degraded read must not create or repair the live database"
+                        );
+                    }
+                });
+            },
+        );
         reset_for_test();
     }
 

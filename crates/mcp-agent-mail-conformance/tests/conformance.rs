@@ -1,3 +1,12 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::match_wildcard_for_single_variants,
+    clippy::literal_string_with_formatting_args
+)]
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
@@ -56,6 +65,43 @@ fn crate_root() -> PathBuf {
 
 fn conformance_fixture_root() -> PathBuf {
     crate_root().join("tests/conformance/fixtures")
+}
+
+/// The Python capture resolved this relative identity against its checkout.
+/// Relocate only the expected path-derived values; keep every returned field
+/// under comparison, including the complete slug and the UID digest.
+fn relocate_identity_fixture(uri: &str, mut expected: Value) -> Value {
+    if uri != "resource://identity/abs-path-backend" {
+        return expected;
+    }
+    assert_eq!(
+        expected["human_key"], "/data/projects/mcp_agent_mail_rust/abs-path-backend",
+        "the relocation must match the recorded fixture origin"
+    );
+    let manifest_dir = crate_root();
+    let workspace = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("conformance crate must be inside the workspace crates directory");
+    let path = workspace.join("abs-path-backend");
+    let path = path.to_str().expect("fixture workspace must be UTF-8");
+    let slug = path
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase();
+    let digest = <sha1::Sha1 as sha1::Digest>::digest(path.as_bytes());
+    let mut uid = String::with_capacity(20);
+    for &byte in &digest[..10] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        uid.push(char::from(HEX[usize::from(byte >> 4)]));
+        uid.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    expected["human_key"] = Value::String(path.to_string());
+    expected["slug"] = Value::String(slug);
+    expected["project_uid"] = Value::String(uid);
+    expected
 }
 
 /// Recursively null out auto-increment integer ID fields in a JSON value.
@@ -317,20 +363,16 @@ fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, Str
     }
 
     match &content[0] {
-        LegacyContent::Text { text, .. } => match serde_json::from_str(text) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(Value::String(text.clone())),
-        },
+        LegacyContent::Text { text, .. } => {
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone())))
+        }
         LegacyContent::Resource { resource, .. } => {
             let text = match resource {
                 LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             }
             .ok_or_else(|| "tool returned Resource content without text".to_string())?;
-            match serde_json::from_str(text) {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(Value::String(text.to_string())),
-            }
+            Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
         }
         LegacyContent::Image { mime_type, .. } => Err(format!(
             "tool returned Image content (mime_type={mime_type}); JSON decode not supported yet"
@@ -354,10 +396,7 @@ fn decode_json_from_resource_contents(
         _ => None,
     }
     .ok_or_else(|| format!("resource {uri} returned no text"))?;
-    match serde_json::from_str(text) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(Value::String(text.to_string())),
-    }
+    Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
 }
 
 fn assert_expected_error(got: &str, expect: &ExpectedError) {
@@ -516,16 +555,12 @@ impl ToolFilterEnvGuard {
             if key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS" {
                 let value = case_env
                     .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS);
+                    .map_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
             } else if key == "AM_SEARCH_ENGINE" {
-                let value = case_env
-                    .get(key)
-                    .map(String::as_str)
-                    .unwrap_or(TEST_SEARCH_ENGINE);
+                let value = case_env.get(key).map_or(TEST_SEARCH_ENGINE, String::as_str);
                 unsafe {
                     std::env::set_var(key, value);
                 }
@@ -806,7 +841,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             case_name: "project_not_found_error",
             input: serde_json::json!({
                 "project_key": "missing-project",
-                "message_id": 999999,
+                "message_id": 999_999,
                 "sender_name": "BlueLake",
                 "body_md": "Reply"
             }),
@@ -837,7 +872,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -847,7 +882,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             input: serde_json::json!({
                 "project_key": "missing-project",
                 "agent_name": "BlueLake",
-                "message_id": 999999
+                "message_id": 999_999
             }),
             expected_err: expected_error_containing("not found"),
         },
@@ -1109,10 +1144,10 @@ fn resolved_value(value: &Value, tokens: &BTreeMap<String, String>) -> Value {
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_string(),
+            |message| (*message).to_string(),
+        ),
     }
 }
 
@@ -1347,7 +1382,7 @@ fn insert_test_message(
     let message_id = next_test_message_id();
     let created_ts = mcp_agent_mail_db::now_micros();
     let recipients_json = serde_json::json!({
-        "to": [recipient.name.clone()],
+        "to": [recipient.name],
         "cc": [],
         "bcc": [],
     })
@@ -1603,7 +1638,9 @@ fn resolved_value_rewrites_legacy_fixture_repo_paths() {
 
 #[test]
 fn run_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let storage_root = env.tmp.path().join("archive");
     let fixtures = &env.fixtures;
@@ -1735,8 +1772,8 @@ fn run_fixtures_against_rust_server_router() {
                     });
                     let actual = decode_json_from_resource_contents(uri, &read_result.contents)
                         .unwrap_or_else(|e| panic!("resource {uri} case {}: {e}", case.name));
-                    let (actual, expected) =
-                        normalize_pair(actual, expected_ok.clone(), &case.normalize);
+                    let expected = relocate_identity_fixture(uri, expected_ok.clone());
+                    let (actual, expected) = normalize_pair(actual, expected, &case.normalize);
                     if let Some(mismatch) =
                         supported_compatibility_mismatch(&actual, &expected, "$")
                     {
@@ -2172,10 +2209,9 @@ fn run_fixtures_against_rust_server_router() {
             continue;
         }
         // Compute SHA1 of path_pattern and verify the SHA1 file exists
-        use sha1::Digest;
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(path_pattern.as_bytes());
-        let digest = hasher.finalize();
+        let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+        sha1::Digest::update(&mut hasher, path_pattern.as_bytes());
+        let digest = sha1::Digest::finalize(hasher);
         let digest_bytes: &[u8] = digest.as_ref();
         let mut sha1_hex = String::with_capacity(digest.len() * 2);
         for &byte in digest_bytes {
@@ -2278,7 +2314,7 @@ fn run_fixtures_against_rust_server_router() {
 
     let ensure_params = CallToolParams {
         name: "ensure_project".to_string(),
-        arguments: Some(serde_json::json!({ "human_key": project_key.clone() })),
+        arguments: Some(serde_json::json!({ "human_key": project_key })),
         meta: None,
     };
     let ensure_result = router
@@ -2324,7 +2360,7 @@ fn run_fixtures_against_rust_server_router() {
     let send_params = CallToolParams {
         name: "send_message".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "sender_name": "BoldCastle",
             "to": ["CalmRiver"],
             "cc": ["QuietMeadow"],
@@ -2390,14 +2426,14 @@ fn run_fixtures_against_rust_server_router() {
     let fetch_params = CallToolParams {
         name: "fetch_inbox".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": project_key.clone(),
+            "project_key": project_key,
             "agent_name": "CalmRiver",
         })),
         meta: None,
     };
     let fetch_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             fetch_params,
             SessionState::new(),
             None,
@@ -2415,7 +2451,9 @@ fn run_fixtures_against_rust_server_router() {
 
 #[test]
 fn tool_filter_profiles_match_fixtures() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixtures = load_tool_filter_fixtures();
 
     for case in fixtures.cases {
@@ -2482,6 +2520,7 @@ fn rust_native_fixture_coverage_matches_classification() {
         "fetch_inbox_events",
         "get_message_delivery_receipt",
         "list_agents",
+        "mark_all_read",
         "resolve_pane_identity",
     ]
     .into_iter()
@@ -2496,7 +2535,9 @@ fn rust_native_fixture_coverage_matches_classification() {
 
 #[test]
 fn run_rust_native_fixtures_against_rust_server_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let fixtures = load_rust_native_tool_fixtures();
     let router = &env.router;
@@ -2691,10 +2732,7 @@ fn run_rust_native_fixtures_against_rust_server_router() {
                             "rust-native tool {} case {} expected error, got ok: {value}",
                             fixture.tool, case.name
                         ),
-                        Ok(Err(err_text)) => {
-                            assert_expected_error(&err_text, expected_err);
-                        }
-                        Err(err_text) => {
+                        Ok(Err(err_text)) | Err(err_text) => {
                             assert_expected_error(&err_text, expected_err);
                         }
                     }
@@ -2707,7 +2745,9 @@ fn run_rust_native_fixtures_against_rust_server_router() {
 
 #[test]
 fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_contract() {
-    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let project_path = env.tmp.path().join("lifecycle-project");
     std::fs::create_dir_all(&project_path).expect("create lifecycle fixture project");
@@ -2995,7 +3035,9 @@ fn window_identity_listing_and_stale_sweep_work_through_the_router() {
 
 #[test]
 fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let project_path = env.tmp.path().join("topic-project");
     std::fs::create_dir_all(&project_path).expect("create topic fixture project");
@@ -3376,7 +3418,9 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
 
 #[test]
 fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("backpressure-shedding.sqlite3");
@@ -3469,7 +3513,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     };
     let critical_result = router
         .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
+            &McpContext::new(cx, req_id),
             critical_params,
             SessionState::new(),
             None,
@@ -3491,7 +3535,9 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
 
 #[test]
 fn product_bus_tools_end_to_end_across_linked_projects() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("product-bus-e2e.sqlite3");
@@ -3938,7 +3984,9 @@ fn fixture_tool_happy_and_failure_shape_coverage() {
 
 #[test]
 fn handwritten_tool_failure_cases_match_rust_router() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -3966,7 +4014,9 @@ fn handwritten_tool_failure_cases_match_rust_router() {
 
 #[test]
 fn force_release_file_reservation_happy_path_is_covered() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("force-release-happy.sqlite3");
@@ -4073,7 +4123,9 @@ fn force_release_file_reservation_happy_path_is_covered() {
 
 #[test]
 fn generated_non_object_arguments_are_rejected_for_every_tool() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let env = setup_fixture_env();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -4143,7 +4195,9 @@ fn fixture_resource_identity_coverage() {
 
 #[test]
 fn resource_query_router_projects_limit_and_contains_are_honored() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-routing.sqlite3");
@@ -4229,7 +4283,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     };
     let zero_result = router
         .handle_resources_read(
-            &McpContext::new(cx.clone(), 1),
+            &McpContext::new(cx, 1),
             &zero_params,
             SessionState::new(),
             None,
@@ -4249,7 +4303,9 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
 
 #[test]
 fn resource_query_router_projects_invalid_query_values_surface_errors() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("projects-query-errors.sqlite3");
@@ -4308,10 +4364,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
                     .unwrap_or("<non-text>");
                 assert!(
                     text.contains(expected_substr),
-                    "expected query validation error containing {:?}, got successful content {:?} for URI {}",
-                    expected_substr,
-                    text,
-                    uri
+                    "expected query validation error containing {expected_substr:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -4320,7 +4373,9 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
 
 #[test]
 fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("resource-error-cases.sqlite3");
@@ -4397,10 +4452,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
                     .unwrap_or("<non-text>");
                 assert!(
                     contains_any(text),
-                    "expected one of {:?}, got successful content {:?} for URI {}",
-                    expected_any,
-                    text,
-                    uri
+                    "expected one of {expected_any:?}, got successful content {text:?} for URI {uri}"
                 );
             }
         }
@@ -4415,7 +4467,9 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
 fn toon_format_resolution_json_fallback() {
     // When TOON_BIN is empty (no encoder available), format requests should
     // resolve to JSON or produce a TOON envelope with fallback data.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("toon-test.sqlite3");
@@ -4448,7 +4502,7 @@ fn toon_format_resolution_json_fallback() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), 1),
+        &McpContext::new(cx, 1),
         params,
         SessionState::new(),
         None,
@@ -4473,7 +4527,9 @@ fn toon_format_resolution_json_fallback() {
 #[test]
 fn llm_mode_parameter_accepted_by_tools() {
     // Verify that tools accepting llm_mode parameter don't reject it.
-    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("llm-test.sqlite3");
@@ -4599,7 +4655,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &McpContext::new(cx.clone(), req_id),
+        &McpContext::new(cx, req_id),
         params,
         SessionState::new(),
         None,

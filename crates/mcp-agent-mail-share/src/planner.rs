@@ -728,7 +728,7 @@ fn generate_github_pages_plan(
     steps.push(PlanStep {
         index: 7,
         id: "git_push".to_string(),
-        description: format!("Push to {} branch", branch),
+        description: format!("Push to {branch} branch"),
         command: Some(format!(
             "git -C {} push origin {}",
             quote_path(&repo_root),
@@ -1051,6 +1051,7 @@ fn generate_custom_plan(
 }
 
 /// Format a plan as human-readable text.
+#[must_use]
 pub fn format_plan_human(plan: &DeploymentPlan) -> String {
     let mut output = String::new();
 
@@ -1544,7 +1545,7 @@ mod tests {
         )
         .expect("write netlify config");
 
-        let project = tempfile::tempdir().expect("project");
+        let project = crate::git::isolated_test_tempdir();
         std::fs::write(project.path().join("wrangler.toml"), "name = \"demo\"")
             .expect("write wrangler config");
         let bundle = project.path().join("nested/output/bundle");
@@ -1571,7 +1572,7 @@ mod tests {
 
     #[test]
     fn resolve_detection_root_keeps_relative_bundle_in_shell_project() {
-        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let shell_cwd = crate::git::isolated_test_tempdir();
         let bundle = shell_cwd.path().join("bundle");
         std::fs::create_dir_all(&bundle).expect("create bundle");
         std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
@@ -1586,7 +1587,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let shell_cwd = tempfile::tempdir().expect("shell cwd");
-        let project = tempfile::tempdir().expect("project");
+        let project = crate::git::isolated_test_tempdir();
         let outside = tempfile::tempdir().expect("outside");
         std::fs::create_dir_all(outside.path().join("scripts")).expect("create outside scripts");
         symlink(
@@ -1613,7 +1614,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let shell_cwd = tempfile::tempdir().expect("shell cwd");
-        let project = tempfile::tempdir().expect("project");
+        let project = crate::git::isolated_test_tempdir();
         let outside = tempfile::tempdir().expect("outside");
         let real = outside.path().join("wrangler.toml");
         std::fs::write(&real, "name = \"outside\"").expect("write external wrangler");
@@ -1693,7 +1694,7 @@ mod tests {
 
         let plan = generate_s3_plan(&inputs, &env, bundle.path()).unwrap();
         assert!(plan.steps.iter().any(|s| s.id == "cloudfront_invalidate"));
-        assert!(plan.warnings.is_empty());
+        assert_eq!(plan.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1955,7 +1956,7 @@ mod tests {
             is_git_repo: true,
             ..Default::default()
         };
-        let bundle = tempfile::tempdir().unwrap();
+        let bundle = crate::git::isolated_test_tempdir();
 
         let project_root = bundle.path().parent().unwrap_or(bundle.path());
         let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();

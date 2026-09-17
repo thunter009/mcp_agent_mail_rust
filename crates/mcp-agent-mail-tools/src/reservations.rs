@@ -459,10 +459,12 @@ fn ts_is_positive(ts: Option<i64>) -> bool {
 /// divergence (the #112 stuck-`released_ts` class).
 ///
 /// A resolved artifact stamped with a *foreign* (superseded) generation is also
-/// divergence, even when every field matches: `find_reservation_artifact` (used
-/// to resolve `view`) is generation-blind, so without this check a row whose only
-/// coverage is a prior-generation artifact looks "healthy" here and never gets
-/// re-emitted under the current generation — while `reservation_parity`'s checker
+/// divergence, even when every field matches: the reader
+/// (`read_project_archive_reservation_for_generation`) prefers the live
+/// generation's artifact but falls back to a prior-generation one when that is
+/// the row's only coverage, so without this check such a row looks "healthy"
+/// here and never gets re-emitted under the current generation — while
+/// `reservation_parity`'s checker
 /// correctly excludes that same artifact as foreign and reports it as missing.
 /// The two subsystems must agree on what counts as current coverage
 /// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
@@ -568,11 +570,13 @@ fn reconcile_active_reservation_archive(
     let mut present = BTreeMap::new();
     for row in active_rows {
         if let Some(id) = row.id
-            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
-                &config.storage_root,
-                &project.slug,
-                id,
-            )
+            && let Some(view) =
+                crate::reservation_parity::read_project_archive_reservation_for_generation(
+                    &config.storage_root,
+                    &project.slug,
+                    id,
+                    db_generation,
+                )
         {
             present.insert(id, view);
         }
@@ -617,11 +621,13 @@ fn reconcile_active_reservation_archive(
 ///
 /// Also heals when the resolved artifact is only available under a *foreign*
 /// (superseded) generation, even though its content — including `released_ts`
-/// — already matches the DB: `read_project_archive_reservation` resolves via
-/// `find_reservation_artifact`, which is generation-blind, so a released row
-/// whose only coverage predates the live database's generation (typically
-/// after `doctor reconstruct` mints a new one) looked fully healthy here and
-/// was never re-emitted under the current generation. Meanwhile
+/// — already matches the DB: `read_project_archive_reservation_for_generation`
+/// falls back to a prior-generation artifact when it is the row's only
+/// coverage, so a released row whose coverage predates the live database's
+/// generation (typically after `doctor reconstruct` mints a new one) would
+/// otherwise look fully healthy here and never be re-emitted under the current
+/// generation (once re-emitted, the reader resolves the live artifact and the
+/// heal converges). Meanwhile
 /// `reservation_parity`'s checker correctly excludes that same foreign-
 /// generation artifact from comparison and reports the row as drift — and
 /// nothing ever reconciled the disagreement, since this was the one code path
@@ -691,11 +697,13 @@ fn reconcile_released_reservation_archive(
     let mut present = BTreeMap::new();
     for row in released_rows {
         if let Some(id) = row.id
-            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
-                &config.storage_root,
-                &project.slug,
-                id,
-            )
+            && let Some(view) =
+                crate::reservation_parity::read_project_archive_reservation_for_generation(
+                    &config.storage_root,
+                    &project.slug,
+                    id,
+                    db_generation,
+                )
         {
             present.insert(id, view);
         }
@@ -1527,38 +1535,26 @@ fn reservation_acquire_failure(
 ) -> McpError {
     let classification = err.classification();
     let cause = classification.class.as_str();
-    let blocks_edits = classification.blocks_edits;
     let safe_to_continue_read_only = classification.safe_to_continue_read_only;
     let recommended_command = classification.recommended_command;
     // Reuse the canonical classified envelope (class / severity / code / metrics)...
     let mut error = db_error_to_mcp_error(err);
     // ...then graft the reservation-acquire fail-closed context onto its data.
-    let guidance = if blocks_edits {
-        "Reservation acquire FAILED CLOSED: current holders are unverifiable because the \
-         reservation index could not be read. Do NOT edit the requested paths until the \
-         database is recovered."
-    } else {
-        "Reservation acquire did NOT grant: the reservation subsystem is temporarily \
-         unavailable (busy/locked). The paths were left unreserved; retry after the \
-         condition clears."
-    };
-    // Fail closed: when the index is unreadable, every requested path is a
-    // DO-NOT-EDIT until reservations can be verified again. (Precomputed because
-    // `json!` cannot take a bare `if`/`else` in value position.)
-    let do_not_edit: Vec<String> = if blocks_edits {
-        requested_paths.to_vec()
-    } else {
-        Vec::new()
-    };
+    let guidance = "Reservation request FAILED CLOSED: current holders could not be \
+         verified for this request. Do NOT edit the requested paths until the reported \
+         cause is resolved and a reservation check or acquire succeeds.";
+    // Generic request errors need no database repair, but an unknown caller
+    // still cannot verify ownership. This reservation-specific policy blocks
+    // every requested path without relabeling the underlying DB classification.
     let context = json!({
         "operation": operation,
         "cause": cause,
         "fail_closed": true,
-        "blocks_edits": blocks_edits,
+        "blocks_edits": true,
         "safe_to_continue_read_only": safe_to_continue_read_only,
         "recommended_command": recommended_command,
         "requested_paths": requested_paths,
-        "do_not_edit": do_not_edit,
+        "do_not_edit": requested_paths,
         "guidance": guidance,
     });
     // `db_error_to_mcp_error` always produces the legacy envelope
@@ -3154,19 +3150,7 @@ pub async fn force_release_file_reservation(
                     &message.subject,
                     &message.body_md,
                 );
-                crate::messaging::enqueue_message_lexical_index(
-                    &mcp_agent_mail_db::search_v3::IndexableMessage {
-                        id: message_id,
-                        project_id,
-                        project_slug: project.slug.clone(),
-                        sender_name: agent_name.clone(),
-                        subject: message.subject.clone(),
-                        body_md: message.body_md.clone(),
-                        thread_id: message.thread_id.clone(),
-                        importance: message.importance.clone(),
-                        created_ts: message.created_ts,
-                    },
-                );
+                crate::messaging::enqueue_message_lexical_index(pool.sqlite_path(), message_id);
                 let all_recipient_names = vec![holder_agent_name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,
@@ -3252,7 +3236,7 @@ pub async fn force_release_file_reservation(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Install the Agent Mail pre-commit guard in a Git repository. The guard rejects commits that overlap active exclusive file reservations while preserving and chaining any existing hook."
+    description = "Install the Agent Mail pre-commit guard into a git repository.\n\nWrites a chain-runner pre-commit hook plus an Agent Mail guard plugin that checks the files staged for a commit against the project's active exclusive file reservations held by other agents. Commits that touch another agent's reserved paths are blocked; `.beads/**` and the holder's own reservations are exempt.\n\nParameters\n----------\nproject_key : str\n    Project identifier (human key or slug).\ncode_repo_path : str\n    Absolute path to the git repository whose hooks should be installed.\n\nReturns\n-------\ndict\n    `{\"hook\": \"<path>\"}` with the installed hook location, or `{\"hook\": \"\"}` when the guard is disabled by configuration.\n\nNotes\n-----\n- Idempotent: re-running refreshes the plugin in place.\n- Advisory by design: `git commit --no-verify` still bypasses the hook.\n- Pair with `uninstall_precommit_guard` to remove the hook."
 )]
 pub fn install_precommit_guard(
     _ctx: &McpContext,
@@ -3317,7 +3301,7 @@ pub fn install_precommit_guard(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Remove the Agent Mail pre-commit guard from a Git repository while preserving other chained hook plugins and restoring any previously preserved hook."
+    description = "Remove the Agent Mail pre-commit guard from a git repository.\n\nDeletes the guard plugin written by `install_precommit_guard`, removes the chain-runner hook when no other plugins remain, and restores any previously preserved pre-commit hook.\n\nParameters\n----------\ncode_repo_path : str\n    Absolute path to the git repository.\n\nReturns\n-------\ndict\n    `{\"removed\": true}` when guard artifacts were removed, `{\"removed\": false}` when nothing was installed.\n\nNotes\n-----\n- Idempotent: safe to call when the guard is already absent."
 )]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
     let repo_path = normalize_repo_path(&code_repo_path)?;
@@ -3457,6 +3441,8 @@ mod tests {
             .get("reservation_acquire")
             .expect("reservation_acquire context block");
         assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        assert_eq!(acq["blocks_edits"], true);
+        assert_eq!(acq["do_not_edit"], serde_json::json!(paths));
         // The whole point of F5: an UNAVAILABLE cause is classified DISTINCTLY
         // from a corruption cause (and both are distinct from a genuine conflict,
         // which is the separate FILE_RESERVATION_CONFLICT path).
@@ -3526,11 +3512,13 @@ mod tests {
         F: FnOnce(Cx) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx))
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs reservation test context");
+            f(cx).await
+        })
     }
 
     async fn ensure_project(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
@@ -3786,6 +3774,15 @@ mod tests {
                 assert_eq!(
                     data["error"]["data"]["reservation_acquire"]["do_not_edit"],
                     serde_json::json!(["src/guard.rs"])
+                );
+                assert_eq!(data["error"]["type"], "NOT_FOUND");
+                let policy = &data["error"]["data"]["reservation_acquire"];
+                assert_eq!(policy["cause"], "request_semantic_error");
+                assert_eq!(policy["blocks_edits"], true);
+                assert_eq!(policy["safe_to_continue_read_only"], true);
+                assert_eq!(
+                    policy["recommended_command"],
+                    "correct the request arguments; no database remediation is needed"
                 );
             });
         });
@@ -4638,6 +4635,144 @@ mod tests {
             ts_is_positive(view.released_ts),
             "healed release artifact must scan back as released"
         );
+    }
+
+    /// Storage names a healed artifact `id-<id>-g<generation>.json` (br-n8qh6);
+    /// mirror that so the read-back below sees exactly what a real heal leaves.
+    fn write_stamped_artifact(reservation_dir: &Path, id: i64, generation: &str, artifact: &Value) {
+        let name = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            Some(generation),
+            id,
+        );
+        std::fs::write(
+            reservation_dir.join(name),
+            serde_json::to_vec_pretty(artifact).expect("serialize artifact"),
+        )
+        .expect("write stamped artifact");
+    }
+
+    #[test]
+    fn released_heal_converges_once_the_live_generation_artifact_exists() {
+        // GH#311 follow-up. A released row whose only coverage is a
+        // prior-generation artifact is healed by re-emitting it under the live
+        // generation — after which BOTH stamped files coexist. The read-back must
+        // then resolve the live artifact and stop healing, even when the
+        // superseded token sorts before the live one (the generation-blind
+        // finder's tie-break), otherwise every reservation read rewrites the
+        // same artifact and enqueues another archive commit forever.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-released-converge";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+        let foreign = "aaaa1111"; // sorts BEFORE the live token
+        let live = "bbbb2222";
+
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let agent_names = names(&[(7, "GreenCastle")]);
+        let prior =
+            released_reservation_artifact_json("/abs/proj", "GreenCastle", &rows[0], Some(foreign));
+        write_stamped_artifact(&reservation_dir, 1, foreign, &prior);
+
+        let read_live = || {
+            crate::reservation_parity::read_project_archive_reservation_for_generation(
+                &storage_root,
+                slug,
+                1,
+                Some(live),
+            )
+            .expect("artifact resolves")
+        };
+
+        // Pass 1: foreign-only coverage → heal under the live generation.
+        let mut present = BTreeMap::new();
+        present.insert(1, read_live());
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert_eq!(heal.len(), 1, "foreign-only coverage must be re-emitted");
+        write_stamped_artifact(&reservation_dir, 1, live, &heal[0]);
+
+        // Pass 2: the live artifact is resolved → converged, no further heal.
+        present.clear();
+        present.insert(1, read_live());
+        assert_eq!(present[&1].generation.as_deref(), Some(live));
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert!(heal.is_empty(), "must converge after one heal: {heal:?}");
+
+        // The generation-blind reader still resolves the foreign artifact here —
+        // the regression this test pins.
+        let blind =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("blind read");
+        assert_eq!(blind.generation.as_deref(), Some(foreign));
+    }
+
+    #[test]
+    fn active_heal_converges_once_the_live_generation_artifact_exists() {
+        // Same convergence property for the active-row healer.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-active-converge";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+        let foreign = "aaaa1111";
+        let live = "bbbb2222";
+
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let agent_names = names(&[(7, "GreenCastle")]);
+        let prior =
+            active_reservation_artifact_json("/abs/proj", "GreenCastle", &rows[0], Some(foreign));
+        write_stamped_artifact(&reservation_dir, 1, foreign, &prior);
+
+        let read_live = || {
+            crate::reservation_parity::read_project_archive_reservation_for_generation(
+                &storage_root,
+                slug,
+                1,
+                Some(live),
+            )
+            .expect("artifact resolves")
+        };
+
+        let mut present = BTreeMap::new();
+        present.insert(1, read_live());
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert_eq!(heal.len(), 1, "foreign-only coverage must be re-emitted");
+        write_stamped_artifact(&reservation_dir, 1, live, &heal[0]);
+
+        present.clear();
+        present.insert(1, read_live());
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &agent_names,
+            &present,
+            Some(live),
+        );
+        assert!(heal.is_empty(), "must converge after one heal: {heal:?}");
     }
 
     #[test]

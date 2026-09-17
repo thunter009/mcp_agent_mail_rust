@@ -16,7 +16,7 @@
 //! refuses fast — BEFORE any forensic capture — until either
 //!
 //! * the cooldown elapses (one half-open attempt is then admitted),
-//! * the database content changes (operator replaced/quarantined it), or
+//! * the database content changes with no unfinished automatic attempt, or
 //! * an operator-invoked path (doctor repair/reconstruct) runs with the
 //!   explicit [`RecoveryBreakerBypassGuard`], which is never refused.
 //!
@@ -62,18 +62,22 @@ fn parse_positive_u64(raw: Option<&str>, default: u64) -> u64 {
 
 #[must_use]
 pub fn config_from_env() -> RecoveryBreakerConfig {
+    // Read through the shared process-env accessor so the knobs honour the
+    // same override layer as every other AM_* setting (including the test
+    // override scope); a raw `std::env::var` here made the thresholds
+    // unreachable from tests and inconsistent with `Config`.
     let max_failures = parse_positive_u64(
-        std::env::var("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES")
-            .ok()
-            .as_deref(),
+        mcp_agent_mail_core::config::process_env_value(
+            "AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES",
+        )
+        .as_deref(),
         u64::from(DEFAULT_MAX_CONSECUTIVE_FAILURES),
     );
     RecoveryBreakerConfig {
         max_consecutive_failures: u32::try_from(max_failures)
             .unwrap_or(DEFAULT_MAX_CONSECUTIVE_FAILURES),
         cooldown_secs: parse_positive_u64(
-            std::env::var("AM_RECOVERY_BREAKER_COOLDOWN_SECS")
-                .ok()
+            mcp_agent_mail_core::config::process_env_value("AM_RECOVERY_BREAKER_COOLDOWN_SECS")
                 .as_deref(),
             DEFAULT_COOLDOWN_SECS,
         ),
@@ -92,6 +96,20 @@ pub struct RecoveryBreakerState {
     /// Truncated human-readable reason for the most recent failure.
     pub last_failure_reason: String,
     pub tripped: bool,
+    /// Armed before automatic recovery starts; cleared by a terminal result.
+    /// While set, changed bytes may be our own interrupted mutation and must
+    /// not reset the failure lineage. Process death cannot clear this marker.
+    #[serde(default)]
+    pub attempt_in_progress: bool,
+}
+
+impl RecoveryBreakerState {
+    /// Whether this history governs the current database generation.
+    /// An unfinished attempt may have changed the bytes before process death.
+    #[must_use]
+    pub fn applies_to(&self, fingerprint: &str) -> bool {
+        self.attempt_in_progress || self.db_fingerprint == fingerprint
+    }
 }
 
 /// What the breaker says about an automatic recovery attempt.
@@ -120,7 +138,7 @@ pub fn evaluate(
     let Some(state) = state else {
         return BreakerVerdict::Allow;
     };
-    if state.db_fingerprint != fingerprint {
+    if !state.applies_to(fingerprint) {
         // Different content ⇒ different problem (operator replaced or
         // quarantined the file, or it changed on its own). Start fresh.
         return BreakerVerdict::Allow;
@@ -153,9 +171,7 @@ pub fn record_failure(
     now_unix: i64,
 ) -> RecoveryBreakerState {
     let consecutive_failures = match prev {
-        Some(prev) if prev.db_fingerprint == fingerprint => {
-            prev.consecutive_failures.saturating_add(1)
-        }
+        Some(prev) if prev.applies_to(fingerprint) => prev.consecutive_failures.saturating_add(1),
         _ => 1,
     };
     let mut truncated_reason = reason.to_string();
@@ -175,7 +191,28 @@ pub fn record_failure(
         last_failure_unix: now_unix,
         last_failure_reason: truncated_reason,
         tripped: consecutive_failures >= config.max_consecutive_failures,
+        attempt_in_progress: false,
     }
+}
+
+/// Arm a counted attempt before entering automatic recovery. A terminal
+/// failure replaces this record without counting the same attempt twice.
+#[must_use]
+pub(crate) fn record_attempt(
+    prev: Option<&RecoveryBreakerState>,
+    fingerprint: &str,
+    config: RecoveryBreakerConfig,
+    now_unix: i64,
+) -> RecoveryBreakerState {
+    let mut state = record_failure(
+        prev,
+        fingerprint,
+        "automatic recovery attempt did not complete",
+        config,
+        now_unix,
+    );
+    state.attempt_in_progress = true;
+    state
 }
 
 /// PURE: the state written after a successful recovery. The sidecar is
@@ -189,6 +226,7 @@ pub fn cleared_state(fingerprint: &str) -> RecoveryBreakerState {
         last_failure_unix: 0,
         last_failure_reason: String::new(),
         tripped: false,
+        attempt_in_progress: false,
     }
 }
 
@@ -239,12 +277,7 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
 
     #[cfg(windows)]
     {
-        // Stable Rust does not expose BY_HANDLE_FILE_INFORMATION's link count.
-        // Keep the existing Windows breaker path available; a follow-up must
-        // add a safe stable wrapper before this platform can reject hard links
-        // as strictly as Unix does.
-        let _ = file;
-        Ok(1)
+        mcp_agent_mail_core::disk::windows_file_link_count(file)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -472,6 +505,7 @@ fn recovery_breaker_state_is_semantically_valid(state: &RecoveryBreakerState) ->
         && state.last_failure_unix >= 0
         && state.last_failure_reason.len() <= MAX_REASON_BYTES + '…'.len_utf8()
         && (!state.tripped || state.consecutive_failures > 0)
+        && (!state.attempt_in_progress || state.consecutive_failures > 0)
 }
 
 /// Persist the sidecar atomically (write-tmp-then-rename).
@@ -637,6 +671,58 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_attempt_retains_changed_content_history_and_cooldown() {
+        let first = record_attempt(None, "fp-a", CFG, 1_000);
+        let second = record_attempt(Some(&first), "fp-b", CFG, 1_010);
+        let third = record_attempt(Some(&second), "fp-c", CFG, 1_020);
+        assert!(third.attempt_in_progress);
+        assert_eq!(third.consecutive_failures, 3);
+        assert!(third.tripped);
+        assert!(matches!(
+            evaluate(Some(&third), "fp-d", CFG, 1_030),
+            BreakerVerdict::Refuse {
+                consecutive_failures: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            evaluate(Some(&third), "fp-d", CFG, 1_120),
+            BreakerVerdict::AllowHalfOpen
+        );
+
+        let completed = record_failure(Some(&third), "fp-d", "terminal failure", CFG, 1_120);
+        assert_eq!(completed.consecutive_failures, 4);
+        assert!(!completed.attempt_in_progress);
+        assert_eq!(
+            evaluate(Some(&completed), "operator-replacement", CFG, 1_121),
+            BreakerVerdict::Allow
+        );
+        assert!(!cleared_state("fp-d").attempt_in_progress);
+    }
+
+    #[test]
+    fn unfinished_attempt_without_a_count_is_invalid_authority() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"content").unwrap();
+        let mut invalid = cleared_state(&fingerprint_db(&db));
+        invalid.attempt_in_progress = true;
+        assert_eq!(
+            store(&db, &invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        std::fs::write(
+            breaker_sidecar_path(&db),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&db).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn tripped_refuses_within_cooldown_and_half_opens_after() {
         let mut state = record_failure(None, "fp", "x", CFG, 0);
         state = record_failure(Some(&state), "fp", "x", CFG, 0);
@@ -677,6 +763,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "future clock".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         assert_eq!(
             evaluate(Some(&state), "fp", CFG, 1_000),
@@ -697,6 +784,7 @@ mod tests {
             last_failure_unix: 1_000,
             last_failure_reason: "failed twice".to_string(),
             tripped: false,
+            attempt_in_progress: false,
         };
         let lowered = RecoveryBreakerConfig {
             max_consecutive_failures: 2,
@@ -821,17 +909,15 @@ mod tests {
 
         let contender = try_acquire_file_lock(&db)
             .map(|_unexpected_owner| ())
-            .map_err(|error| (error.kind(), error.to_string()));
+            .map_err(|error| (error.raw_os_error(), error.to_string()));
         std::fs::write(&release, b"release").expect("release holder");
         let status = holder.wait().expect("wait for breaker-lock holder");
         assert!(status.success(), "breaker-lock holder failed: {status}");
-        let (contender_kind, contender_message) =
+        let (contender_code, contender_message) =
             contender.expect_err("a second process must not enter the breaker transition");
-        assert!(
-            matches!(
-                contender_kind,
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Other
-            ),
+        assert_eq!(
+            contender_code,
+            fs2::lock_contended_error().raw_os_error(),
             "unexpected lock error: {contender_message}"
         );
         try_acquire_file_lock(&db).expect("lock must release when the owner process exits");
@@ -911,6 +997,49 @@ mod tests {
                 & 0o777,
             0o400
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hard_linked_breaker_authority_preserves_sentinels() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"content").unwrap();
+        let state = cleared_state(&fingerprint_db(&db));
+
+        for (authority, sentinel, contents) in [
+            (
+                breaker_lock_path(&db),
+                td.path().join("lock-sentinel"),
+                b"lock evidence".as_slice(),
+            ),
+            (
+                breaker_sidecar_path(&db),
+                td.path().join("state-sentinel"),
+                b"state evidence".as_slice(),
+            ),
+        ] {
+            std::fs::write(&sentinel, contents).unwrap();
+            std::fs::hard_link(&sentinel, &authority).unwrap();
+            let mut permissions = std::fs::metadata(&sentinel).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&sentinel, permissions).unwrap();
+
+            let error = if authority == breaker_lock_path(&db) {
+                try_acquire_file_lock(&db).unwrap_err()
+            } else {
+                store(&db, &state).unwrap_err()
+            };
+            assert!(error.to_string().contains("hard links"), "{error}");
+            assert!(
+                std::fs::metadata(&sentinel)
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), contents);
+            assert_eq!(std::fs::read(&authority).unwrap(), contents);
+        }
     }
 
     #[test]

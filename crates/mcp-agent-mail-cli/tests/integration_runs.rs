@@ -664,6 +664,169 @@ fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
         .expect("checkpoint startup recovery orphan fixture");
 }
 
+#[test]
+fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    conn.execute_raw("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE")
+        .unwrap();
+    let now = mcp_agent_mail_db::now_micros();
+    for pid in 1..=50_i64 {
+        insert_project(
+            &conn,
+            pid,
+            &format!("project-{pid:02}"),
+            &format!("/projects/{pid}"),
+        );
+        insert_agent(&conn, pid, pid, "Reader", "codex-cli", "gpt-5");
+        for offset in 0..6_i64 {
+            let id = pid * 10 + offset;
+            insert_message(&conn, id, pid, pid, "overview fixture", "body");
+            insert_recipient(&conn, id, pid);
+            conn.execute_sync(
+                "UPDATE messages SET importance = ?, ack_required = 1 WHERE id = ?",
+                &[
+                    SqlValue::Text(if offset < 2 { "urgent" } else { "normal" }.into()),
+                    SqlValue::BigInt(id),
+                ],
+            )
+            .unwrap();
+            if offset >= 3 {
+                conn.execute_sync(
+                    "UPDATE message_recipients SET read_ts = ?, ack_ts = ? WHERE message_id = ?",
+                    &[
+                        SqlValue::BigInt(now),
+                        SqlValue::BigInt(now),
+                        SqlValue::BigInt(id),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+             VALUES (?, ?, ?, 'src/**', 1, 'overview', ?, ?)",
+            &[SqlValue::BigInt(pid), SqlValue::BigInt(pid), SqlValue::BigInt(pid),
+              SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+        ).unwrap();
+    }
+    insert_project(&conn, 51, "empty-project", "/projects/empty");
+    // An active reservation alone must keep its missing project visible.
+    conn.execute_sync(
+        "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+         VALUES (100, 100, 1, 'orphan/**', 1, 'orphan', ?, ?)",
+        &[SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+    ).unwrap();
+    // Expired and ledger-released orphan leases must not invent projects.
+    conn.execute_sync(
+        "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts)
+         VALUES (101, 101, 1, 'expired/**', 1, 'expired', ?, ?),
+                (102, 102, 1, 'released/**', 1, 'released', ?, ?)",
+        &[SqlValue::BigInt(now - 2_000_000), SqlValue::BigInt(now - 1_000_000),
+          SqlValue::BigInt(now), SqlValue::BigInt(now + 3_600_000_000)],
+    ).unwrap();
+    conn.execute_sync(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (102, ?)",
+        &[SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.execute_raw("COMMIT").unwrap();
+    conn.close_sync().unwrap();
+
+    let mut child_env = env.isolated_env();
+    child_env.push(("AM_INTERFACE_MODE".into(), "cli".into()));
+    let overview = |counts: bool| {
+        let args = if counts {
+            vec!["robot", "overview", "--counts", "--json"]
+        } else {
+            vec!["robot", "overview", "--json"]
+        };
+        let started = Instant::now();
+        let out = run_am(&child_env, Some(env.hostile_repo()), &args, None);
+        eprintln!(
+            "GH274 cold CLI {args:?}: {:?}; binary={}",
+            started.elapsed(),
+            am_bin().display()
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut payload =
+            serde_json::from_slice::<Value>(&out.stdout).expect("one overview JSON envelope");
+        let object = payload.as_object_mut().expect("overview object");
+        object.remove("_meta");
+        object.remove("_alerts");
+        object.remove("_actions");
+        payload
+    };
+    let first = overview(false);
+    let second = overview(false);
+    assert_eq!(first, second, "separate CLI processes must agree");
+    assert_eq!(first["project_count"], 52);
+    let projects = first["projects"].as_array().unwrap();
+    for pid in 1..=50 {
+        let slug = format!("project-{pid:02}");
+        let row = projects.iter().find(|row| row["slug"] == slug).unwrap();
+        assert_eq!(row["unread"], 3);
+        assert_eq!(row["urgent"], 2);
+        assert_eq!(row["ack_overdue"], 3);
+        assert_eq!(row["reservations"], 1);
+    }
+    let orphan = projects
+        .iter()
+        .find(|row| row["slug"] == "[unknown-project-100]")
+        .unwrap();
+    assert_eq!(orphan["reservations"], 1);
+    assert_eq!(orphan["unread"], 0);
+    let empty = projects
+        .iter()
+        .find(|row| row["slug"] == "empty-project")
+        .unwrap();
+    assert_eq!(empty["unread"], 0);
+    assert_eq!(empty["reservations"], 0);
+    assert_eq!(
+        overview(true),
+        json!({"project_count": 52, "unread": 150, "urgent": 100, "ack_overdue": 150})
+    );
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_message(&conn, 999, 1, 1, "new message after cold polling", "body");
+    insert_recipient(&conn, 999, 1);
+    conn.execute_sync(
+        "UPDATE message_recipients SET read_ts = ?, ack_ts = ? WHERE message_id = 10",
+        &[SqlValue::BigInt(now), SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.execute_sync(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, ?)",
+        &[SqlValue::BigInt(now)],
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    let updated = overview(false);
+    for row in updated["projects"].as_array().unwrap() {
+        if row["slug"] == "project-01" {
+            assert_eq!(row["unread"], 3);
+            assert_eq!(row["urgent"], 1);
+            assert_eq!(row["ack_overdue"], 2);
+            assert_eq!(row["reservations"], 0);
+        } else {
+            let original = projects
+                .iter()
+                .find(|old| old["slug"] == row["slug"])
+                .unwrap();
+            assert_eq!(row, original, "unrelated projects must remain unchanged");
+        }
+    }
+    assert_eq!(
+        overview(true),
+        json!({"project_count": 52, "unread": 150, "urgent": 99, "ack_overdue": 149})
+    );
+}
+
 fn seed_startup_recovery_archive_only(env: &TestEnv) {
     let project_path = env.tmp.path().join("reconstructed-project");
     std::fs::create_dir_all(&project_path).expect("create reconstruct project path");
@@ -2869,6 +3032,9 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
         .expect("open sqlite db");
     insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
     insert_agent(&conn, 202, 2, "greencastle", "test", "test");
+    // Seeding is complete; the child must own schema initialization before it
+    // can evaluate the duplicate-name conflict this test exercises.
+    drop(conn);
 
     let source_archive_file = env
         .storage_root
@@ -3447,6 +3613,193 @@ fn installed_binary_parity_probe_compares_source_and_installed_am() {
         run_root.display(),
         report
     );
+}
+
+#[test]
+fn robot_search_locked_live_index_returns_private_results_with_refresh_alert() {
+    let env = TestEnv::new();
+    let project_path = env.tmp.path().join("locked-index-project");
+    std::fs::create_dir_all(&project_path).unwrap();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "locked-index-project",
+        project_path.to_str().unwrap(),
+    );
+    insert_agent(&conn, 1, 1, "Recipient", "test", "test");
+    insert_message(&conn, 1, 1, 1, "original message", "original body");
+    insert_recipient(&conn, 1, 1);
+    mcp_agent_mail_db::close_db_conn(conn, "seed locked index fixture");
+    let index_dir = env.storage_root.join("search_index");
+    mcp_agent_mail_db::search_v3::init_or_switch_bridge(&index_dir).unwrap();
+    assert_eq!(
+        mcp_agent_mail_db::search_v3::backfill_from_db(&env.database_url())
+            .unwrap()
+            .0,
+        1
+    );
+    // The production backfill retains the actual Tantivy writer in this
+    // process while the child CLI attempts its independent refresh.
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_message(&conn, 2, 1, 1, "pending refresh", "private availability");
+    insert_recipient(&conn, 2, 1);
+    mcp_agent_mail_db::close_db_conn(conn, "commit pending index message");
+    let source_bytes = || {
+        ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"]
+            .into_iter()
+            .map(|suffix| {
+                (
+                    suffix,
+                    std::fs::read(format!("{}{suffix}", env.db_path.display())).ok(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = source_bytes();
+    let index_before = snapshot_tree(&index_dir);
+    let output = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "pending",
+            "--project",
+            "locked-index-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "private search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        robot_total_results(&result, "locked index private search"),
+        1
+    );
+    assert_ne!(
+        robot_search_index_state(&result, "locked index health"),
+        "fresh"
+    );
+    assert!(
+        result["_alerts"].as_array().unwrap().iter().any(|alert| {
+            let summary = alert["summary"].as_str().unwrap_or_default();
+            summary.contains("Live lexical refresh failed")
+                && summary.to_lowercase().contains("writer")
+        }),
+        "missing explicit writer refusal: {result}"
+    );
+    assert!(source_bytes() == before, "source family bytes changed");
+    assert_eq!(
+        snapshot_tree(&index_dir),
+        index_before,
+        "locked live index changed"
+    );
+    let replacement = tempfile::TempDir::new().unwrap();
+    mcp_agent_mail_db::search_v3::init_or_switch_bridge(replacement.path()).unwrap();
+    let recovered = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "pending",
+            "--project",
+            "locked-index-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        recovered.status.success(),
+        "refresh after writer release: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(robot_total_results(&recovered, "recovered search"), 1);
+    assert_eq!(
+        robot_search_index_state(&recovered, "recovered index"),
+        "fresh"
+    );
+    assert!(
+        source_bytes() == before,
+        "recovery changed source family bytes"
+    );
+}
+
+#[test]
+fn robot_search_sidecarless_canonical_source_stays_private_and_unchanged() {
+    let env = TestEnv::new();
+    let project_path = env.tmp.path().join("restored-project");
+    std::fs::create_dir_all(&project_path).unwrap();
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(env.db_path.to_str().unwrap())
+        .expect("open canonical recovery fixture");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("initialize canonical recovery schema");
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'restored-project', ?, 0)",
+        &[SqlValue::Text(project_path.to_str().unwrap().to_string())],
+    ).unwrap();
+    conn.execute_raw(
+        "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES (1, 1, 'Recipient', 'test', 'test', '', 0, 0);
+         INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts) VALUES (1, 1, 1, 'canonical recovery', 'restored content', 'normal', 0, 1704067200000000);
+         INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to');",
+    ).unwrap();
+    drop(conn);
+    let before = file_snapshot(&env.db_path);
+    let output = run_am(
+        &env.isolated_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "search",
+            "canonical",
+            "--project",
+            "restored-project",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "canonical search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(robot_total_results(&result, "canonical private search"), 1);
+    assert_eq!(file_snapshot(&env.db_path), before);
+    for suffix in ["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        assert!(
+            !PathBuf::from(format!("{}{suffix}", env.db_path.display())).exists(),
+            "search created source sidecar {suffix}"
+        );
+    }
+    assert!(
+        !env.storage_root
+            .join("search_index/backfill_state.json")
+            .exists()
+    );
+    let index_dir = result
+        .get("search_index")
+        .or_else(|| result.get("data").and_then(|data| data.get("search_index")))
+        .and_then(|health| health.get("index_dir"))
+        .and_then(Value::as_str)
+        .expect("search reports its persistent index directory");
+    assert!(!Path::new(index_dir).join("backfill_state.json").exists());
 }
 
 #[test]
@@ -4952,7 +5305,800 @@ fn list_projects_with_agents_shows_agent_names() {
     );
 }
 
+#[test]
+fn reconstruct_preview_and_repair_agree_on_reservation_lifecycle_merge() {
+    check_reconstruct_preview_reservations(false, false);
+}
+
+#[test]
+fn reconstruct_preview_and_repair_refuse_ambiguous_reservation_stable_keys() {
+    check_reconstruct_preview_reservations(true, false);
+}
+
+#[test]
+fn reconstruct_preview_models_receipt_reseed_without_touching_chain() {
+    check_reconstruct_preview_reservations(false, true);
+}
+
+fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: bool) {
+    let preview_env = TestEnv::new();
+    let repair_env = TestEnv::new();
+    let project_dir = preview_env.storage_root.join("projects/parity-project");
+    let profile_dir = project_dir.join("agents/BlueLake");
+    let reservations_dir = project_dir.join("file_reservations");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::create_dir_all(&reservations_dir).unwrap();
+    std::fs::write(
+        project_dir.join("project.json"),
+        r#"{"slug":"parity-project","human_key":"/reconstruct-parity","created_at":0}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        r#"{"name":"BlueLake","program":"codex-cli","model":"test","inception_ts":"2026-08-27T05:00:00Z","last_active_ts":"2026-08-27T05:00:00Z"}"#,
+    )
+    .unwrap();
+    let mut reservation = json!({
+        "id": 174, "project": "/reconstruct-parity", "agent": "BlueLake",
+        "db_generation": "11111111111111111111111111111111",
+        "path_pattern": "src/parity/**", "exclusive": true, "reason": "preview parity",
+        "created_ts": "2026-08-27T06:22:00Z", "expires_ts": "2026-08-27T07:22:00Z",
+        "released_ts": null,
+    });
+    std::fs::write(
+        reservations_dir.join("id-174-g11111111111111111111111111111111.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    mcp_agent_mail_db::reconstruct_from_archive(&preview_env.db_path, &preview_env.storage_root)
+        .expect("build real source from active archive generation");
+    reservation["released_ts"] = "2026-08-27T07:00:00Z".into();
+    reservation["db_generation"] = "22222222222222222222222222222222".into();
+    std::fs::write(
+        reservations_dir.join("id-174-g22222222222222222222222222222222.json"),
+        serde_json::to_vec(&reservation).unwrap(),
+    )
+    .unwrap();
+    // The DB has a conflicting later release. Archive-first reconstruction
+    // must keep the archive's terminal state, warn, and preserve one identity.
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(preview_env.db_path.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        conn.query_sync("SELECT COUNT(*) AS n FROM file_reservations", &[])
+            .unwrap()[0]
+            .get_named::<i64>("n")
+            .unwrap(),
+        1,
+        "the fixture must contain an actual active reservation before salvage"
+    );
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts = 1787901000000000; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, released_ts FROM file_reservations;",
+    )
+    .unwrap();
+    if ambiguous_source {
+        // A healthy SQLite image with an ambiguous semantic identity. Merely
+        // classifying salvage as readable cannot detect this promotion refusal.
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             SELECT 999, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations; \
+             INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+             VALUES (999, 1787901000000000);",
+        )
+        .unwrap();
+    }
+    drop(conn);
+    assert!(
+        mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+            &preview_env.db_path
+        )
+        .unwrap(),
+        "the negative must be semantic ambiguity, not SQLite corruption"
+    );
+
+    // Independent byte-identical input copies; the actual repair cannot alter
+    // what the preview inspected or accidentally validate its scratch output.
+    std::fs::copy(&preview_env.db_path, &repair_env.db_path).unwrap();
+    let mut pending = vec![preview_env.storage_root.clone()];
+    while let Some(source) = pending.pop() {
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let destination = repair_env
+                .storage_root
+                .join(path.strip_prefix(&preview_env.storage_root).unwrap());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&destination).unwrap();
+                pending.push(path);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(path, destination).unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(&preview_env.db_path).unwrap(),
+        std::fs::read(&repair_env.db_path).unwrap()
+    );
+    let preview_archive = snapshot_tree(&preview_env.storage_root);
+    let repair_archive = snapshot_tree(&repair_env.storage_root);
+    assert_eq!(
+        preview_archive.keys().collect::<Vec<_>>(),
+        repair_archive.keys().collect::<Vec<_>>()
+    );
+    for (path, original) in &preview_archive {
+        let copied = &repair_archive[path];
+        // Copy timestamps differ; the before/after preview check below still
+        // requires exact metadata preservation on the original tree.
+        assert_eq!(copied.kind, original.kind);
+        assert_eq!(copied.content_hash, original.content_hash);
+        assert_eq!(copied.len, original.len);
+        assert_eq!(copied.mode, original.mode);
+    }
+    let before = snapshot_tree(preview_env.tmp.path());
+    let run = |env: &TestEnv, mode: &str| {
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .current_dir(env.hostile_repo())
+            .args(["doctor", "reconstruct", mode, "--json"])
+            .output()
+            .unwrap()
+    };
+    let preview = run(&preview_env, "--dry-run");
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap_or_else(|error| {
+        panic!(
+            "preview stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&preview.stdout),
+            String::from_utf8_lossy(&preview.stderr)
+        )
+    });
+    assert_eq!(snapshot_tree(preview_env.tmp.path()), before);
+    assert_eq!(preview_json["actions_taken"], 0);
+    assert_eq!(preview_json["salvage"]["status"], "would_merge");
+    #[cfg(unix)]
+    {
+        let unsafe_scratch = Command::new(am_bin())
+            .env_clear()
+            .envs(preview_env.isolated_env())
+            .env("TMPDIR", &preview_env.storage_root)
+            .current_dir(preview_env.hostile_repo())
+            .args(["doctor", "reconstruct", "--dry-run", "--json"])
+            .output()
+            .unwrap();
+        assert!(!unsafe_scratch.status.success());
+        assert!(
+            String::from_utf8_lossy(&unsafe_scratch.stderr)
+                .contains("temporary directory must be outside the mailbox archive")
+        );
+        assert_eq!(snapshot_tree(preview_env.tmp.path()), before);
+    }
+    let repair_before = std::fs::read(&repair_env.db_path).unwrap();
+    let repair_archive_before = snapshot_tree(&repair_env.storage_root);
+    let repaired = run(&repair_env, "--yes");
+    if ambiguous_source {
+        assert!(!preview.status.success());
+        assert!(!repaired.status.success());
+        assert_eq!(preview_json["candidate_validation"]["would_refuse"], true);
+        let preview_error = preview_json["candidate_validation"]["detail"]
+            .as_str()
+            .unwrap();
+        let repair_error = String::from_utf8_lossy(&repaired.stderr);
+        for expected in ["unique stable keys", "src/parity/**", "BlueLake"] {
+            assert!(preview_error.contains(expected), "{preview_error}");
+            assert!(repair_error.contains(expected), "{repair_error}");
+        }
+        assert_eq!(std::fs::read(&repair_env.db_path).unwrap(), repair_before);
+        // Repair is allowed to retain forensics; authoritative archive files
+        // still cannot be rewritten by a refused candidate.
+        let repair_archive_after = snapshot_tree(&repair_env.storage_root);
+        for (path, original) in repair_archive_before {
+            assert_eq!(
+                repair_archive_after.get(&path),
+                Some(&original),
+                "{}",
+                path.display()
+            );
+        }
+    } else {
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        assert_eq!(preview_json["candidate_validation"]["status"], "valid");
+        assert_eq!(
+            preview_json["candidate_validation"]["recovered"]["reservations"],
+            1
+        );
+        assert_eq!(
+            preview_json["candidate_validation"]["recovered"]["source_verified"],
+            true
+        );
+        assert!(
+            preview_json["candidate_validation"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|text| {
+                    text.contains("conflicting row/ledger release timestamp")
+                        && text.contains("keeping the archive candidate")
+                })),
+            "preview must report the existing archive-first release precedence: {preview_json}"
+        );
+        let conn = mcp_agent_mail_db::DbConn::open_file(repair_env.db_path.to_str().unwrap())
+            .expect("reopen promoted candidate through the runtime engine");
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern, released_ts FROM file_reservations",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "lifecycle variants must share one identity");
+        assert_eq!(
+            rows[0].get_named::<String>("path_pattern").unwrap(),
+            "src/parity/**"
+        );
+        assert_eq!(
+            rows[0].get_named::<i64>("released_ts").unwrap(),
+            1_787_814_000_000_000
+        );
+        conn.close_sync().unwrap();
+        if check_reseed {
+            let run_reseed = |mode: &str| {
+                Command::new(am_bin())
+                    .env_clear()
+                    .envs(repair_env.isolated_env())
+                    .current_dir(repair_env.hostile_repo())
+                    .args([
+                        "doctor",
+                        "reconstruct",
+                        mode,
+                        "--json",
+                        "--reseed-receipt-chain",
+                    ])
+                    .output()
+                    .unwrap()
+            };
+            let healthy_before = snapshot_tree(repair_env.tmp.path());
+            let refused = run_reseed("--dry-run");
+            assert!(!refused.status.success());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("verifies cleanly"));
+            assert_eq!(snapshot_tree(repair_env.tmp.path()), healthy_before);
+
+            // The successful real reconstruction above created a real receipt.
+            // Add structural corruption without deleting or rewriting its proof.
+            let receipt_path = healthy_before
+                .keys()
+                .find(|path| path.to_string_lossy().ends_with(".receipt.json"))
+                .expect("successful promotion wrote a receipt");
+            let broken_path = repair_env
+                .tmp
+                .path()
+                .join(receipt_path)
+                .with_file_name("broken.receipt.json");
+            std::fs::write(&broken_path, b"{}").unwrap();
+            let broken_before = snapshot_tree(repair_env.tmp.path());
+            let reseed_preview = run_reseed("--dry-run");
+            assert!(
+                reseed_preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reseed_preview.stderr)
+            );
+            let preview: Value = serde_json::from_slice(&reseed_preview.stdout).unwrap();
+            assert_eq!(preview["candidate_validation"]["status"], "valid");
+            assert_eq!(preview["would_reseed_receipt_chain"], true);
+            assert_eq!(preview["actions_taken"], 0);
+            assert_eq!(snapshot_tree(repair_env.tmp.path()), broken_before);
+
+            let reseeded = run_reseed("--yes");
+            assert!(
+                reseeded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reseeded.stderr)
+            );
+            let conn = mcp_agent_mail_db::DbConn::open_file(repair_env.db_path.to_str().unwrap())
+                .expect("reopen after the previewed receipt reseed");
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) AS n FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap(),
+                1
+            );
+            conn.close_sync().unwrap();
+            assert!(
+                snapshot_tree(repair_env.tmp.path()).keys().any(|path| {
+                    path.to_string_lossy().contains(".broken-")
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name == "broken.receipt.json")
+                }),
+                "the real reseed must preserve the broken chain in quarantine"
+            );
+        }
+    }
+}
+
 // ---- Serve commands (dry checks) ----
+
+#[test]
+fn explicit_sender_token_mode_refuses_persisted_identity_and_accepts_explicit_sources() {
+    check_explicit_sender_token_mode(false);
+}
+
+#[test]
+fn offline_registration_issues_and_persists_native_sender_credentials() {
+    check_explicit_sender_token_mode(true);
+}
+
+fn check_explicit_sender_token_mode(direct_registration: bool) {
+    let env = TestEnv::new();
+    let project = env.hostile_repo().to_str().unwrap();
+    let run = |args: &[&str], explicit_mode: bool, token_env: Option<&str>| {
+        let mut command = Command::new(am_bin());
+        command
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true")
+            .current_dir(project)
+            .args(args);
+        if explicit_mode {
+            command.env("AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN", "1");
+        }
+        if let Some(token) = token_env {
+            command.env("AGENT_MAIL_SENDER_TOKEN", token);
+        }
+        command.output().expect("run actual token-policy CLI")
+    };
+    let registration_args = [
+        if direct_registration {
+            "agents"
+        } else {
+            "macros"
+        },
+        if direct_registration {
+            "register"
+        } else {
+            "start-session"
+        },
+        "--project",
+        project,
+        if direct_registration {
+            "--name"
+        } else {
+            "--agent-name"
+        },
+        "BlueLake",
+        "--program",
+        "codex-cli",
+        "--model",
+        "test",
+        "--json",
+    ];
+    let registration = run(&registration_args, false, None);
+    assert!(
+        registration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registration.stderr)
+    );
+    let identity: Value = serde_json::from_slice(&registration.stdout).unwrap();
+    let agent = if direct_registration {
+        &identity
+    } else {
+        &identity["agent"]
+    };
+    let token = agent["registration_token"]
+        .as_str()
+        .expect("real registration token");
+    let send = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "BlueLake",
+        "--to",
+        "BlueLake",
+        "--subject",
+        "explicit identity",
+        "--body",
+        "durable body",
+        "--json",
+    ];
+    // The existing fail-closed *server* profile requires a valid token, proving
+    // default CLI success actually used the persisted registration credential.
+    let default_send = run(&send, false, None);
+    assert!(
+        default_send.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default_send.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&default_send.stdout).unwrap();
+    assert_eq!(receipt["receipt_mode"], "redacted");
+    assert_eq!(receipt["verified_sender"], true);
+    assert!(receipt["id"].as_i64().is_some_and(|id| id > 0));
+    for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
+        assert!(receipt.get(forbidden).is_none(), "leaked {forbidden}");
+    }
+    let before_db = file_snapshot(&env.db_path);
+    let before_archive = snapshot_tree(&env.storage_root);
+    for token_env in [None, Some(" \t ")] {
+        let refused = run(&send, true, token_env);
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains("persisted identity tokens are not reused"),
+            "{error}"
+        );
+        assert!(!error.contains(token));
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), before_archive);
+    }
+    let token_path = env.tmp.path().join("sender-token");
+    std::fs::write(&token_path, format!("  {token}\n")).unwrap();
+    for (flag, value) in [
+        ("--sender-token", token),
+        ("--sender-token-file", token_path.to_str().unwrap()),
+    ] {
+        let mut args = send.to_vec();
+        args.extend([flag, value]);
+        let sent = run(&args, true, None);
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+    }
+    let sent = run(&send, true, Some(token));
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+        .unwrap();
+    let count = rows[0].get_named::<i64>("n").unwrap();
+    conn.close_sync().unwrap();
+    assert_eq!(
+        count, 4,
+        "only default and three explicitly authorized sends persist"
+    );
+    if direct_registration {
+        // A second process re-registers the existing project/agent through the
+        // same native tool, rotates its proof, and can immediately reuse it.
+        let registered_again = run(&registration_args, false, None);
+        assert!(
+            registered_again.status.success(),
+            "{}",
+            String::from_utf8_lossy(&registered_again.stderr)
+        );
+        let refreshed: Value = serde_json::from_slice(&registered_again.stdout).unwrap();
+        assert_eq!(refreshed["id"], agent["id"]);
+        assert!(
+            refreshed["registration_token"]
+                .as_str()
+                .is_some_and(|fresh| !fresh.is_empty() && fresh != token)
+        );
+        let sent = run(&send, false, None);
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&sent.stdout).unwrap();
+        assert_eq!(receipt["verified_sender"], true);
+
+        let archived_projects: Vec<_> = std::fs::read_dir(env.storage_root.join("projects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(archived_projects.len(), 1);
+        let archived_project: Value = serde_json::from_slice(
+            &std::fs::read(archived_projects[0].join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived_project["human_key"], project);
+        let profile =
+            std::fs::read_to_string(archived_projects[0].join("agents/BlueLake/profile.json"))
+                .unwrap();
+        let archived: Value = serde_json::from_str(&profile).unwrap();
+        assert_eq!(archived["name"], "BlueLake");
+        assert!(archived.get("registration_token").is_none());
+        assert!(!profile.contains(token));
+        assert!(!profile.contains(refreshed["registration_token"].as_str().unwrap()));
+
+        let before_db = file_snapshot(&env.db_path);
+        let before_archive = snapshot_tree(&env.storage_root);
+        let denied = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_REGISTRATION_PROOF_GATE_ENABLED", "true")
+            .current_dir(project)
+            .args(registration_args)
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("proof"));
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), before_archive);
+        let owner = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &env.storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .unwrap()
+        .expect("real owner lock");
+        let owned_archive = snapshot_tree(&env.storage_root);
+        let denied = run(&registration_args, false, None);
+        assert!(!denied.status.success());
+        let error = String::from_utf8_lossy(&denied.stderr);
+        assert!(
+            error.contains("Refusing local SQLite fallback")
+                || error.contains("mailbox activity lock is busy"),
+            "{error}"
+        );
+        assert_eq!(file_snapshot(&env.db_path), before_db);
+        assert_eq!(snapshot_tree(&env.storage_root), owned_archive);
+        drop(owner);
+    }
+}
+
+#[test]
+fn serve_http_preserves_existing_client_configs_by_default() {
+    check_serve_http_client_config_setup(false);
+}
+
+#[test]
+fn robot_metrics_reads_live_server_calls_and_labels_offline_fallback() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let log_path = env.tmp.path().join("metrics-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.hostile_repo())
+        .args([
+            "serve-http",
+            "--no-tui",
+            "--no-auth",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("start real metrics server");
+    // Reap the owned server even when an assertion or startup probe fails.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline && server.try_wait().unwrap().is_none(),
+                "server failed to start: {}",
+                std::fs::read_to_string(&log_path).unwrap()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let metrics = || {
+            let output = Command::new(am_bin())
+                .env_clear()
+                .envs(env.isolated_env())
+                .env("HTTP_PORT", port.to_string())
+                .current_dir(env.hostile_repo())
+                .args(["robot", "metrics", "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).expect("metrics JSON")
+        };
+        let before = metrics();
+        assert_eq!(before["source"], "live-server", "{before}");
+        let calls_before = before["total_calls"].as_u64().unwrap();
+        for id in 1..=3 {
+            let body = tool_call(id, "health_check", json!({})).to_string();
+            let mut socket =
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(socket, "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains("\"result\""), "{response}");
+            assert!(!response.contains("\"isError\":true"), "{response}");
+        }
+        let after = metrics();
+        assert_eq!(after["source"], "live-server", "{after}");
+        assert_eq!(
+            after["total_calls"].as_u64().unwrap(),
+            calls_before + 3,
+            "{after}"
+        );
+        let health = after["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "health_check")
+            .expect("actual server health calls in metrics");
+        assert_eq!(health["calls"], 3, "{health}");
+    }));
+    let _ = server.kill();
+    server.wait().expect("reap metrics server");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    let offline = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.hostile_repo())
+        .args(["robot", "metrics", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let offline: Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(offline["source"], "local-process", "{offline}");
+    assert_eq!(offline["total_calls"], 0, "{offline}");
+    assert!(
+        offline["source_detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty())
+    );
+}
+
+#[test]
+fn serve_http_updates_client_configs_only_with_explicit_setup() {
+    check_serve_http_client_config_setup(true);
+}
+
+fn check_serve_http_client_config_setup(setup: bool) {
+    let env = TestEnv::new();
+    let project = env.hostile_repo();
+    // Detection keys Claude installation off its config root, not ~/.claude.json.
+    std::fs::create_dir_all(env.home_dir.join(".claude/projects")).unwrap();
+    std::fs::create_dir_all(env.xdg_config_home.join("claude-code/projects")).unwrap();
+    let seed = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .current_dir(project)
+        .args([
+            "setup",
+            "run",
+            "--yes",
+            "--agent",
+            "claude,cursor",
+            "--no-hooks",
+            "--token",
+            "isolated-startup-test-token",
+            "--port",
+            "8765",
+        ])
+        .output()
+        .expect("seed actual client setup");
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let config_paths = [
+        project.join("cursor.mcp.json"),
+        env.home_dir.join(".cursor/mcp.json"),
+        env.home_dir.join(".claude.json"),
+        env.user_config_env_path(),
+    ];
+    let mut before: Vec<_> = config_paths
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                std::fs::read(path).expect("read seeded config"),
+            )
+        })
+        .collect();
+    let cache_dir = env.storage_root.join(".setup-self-heal");
+    let cache_existed = cache_dir.exists();
+    if !setup && cache_existed {
+        for entry in std::fs::read_dir(&cache_dir).unwrap() {
+            let path = entry.unwrap().path();
+            before.push((path.clone(), std::fs::read(path).unwrap()));
+        }
+    }
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut command = Command::new(am_bin());
+    command
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(project)
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log);
+    if setup {
+        command.arg("--setup");
+    }
+    let mut child = command.spawn().expect("start actual HTTP server");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut healthy = false;
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        if let Ok(mut socket) =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+        {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
+            if socket.write_all(format!("GET /health/liveness HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes()).is_ok() {
+                let mut response = [0; 256];
+                if let Ok(count) = socket.read(&mut response) {
+                    healthy = String::from_utf8_lossy(&response[..count]).starts_with("HTTP/1.1 200");
+                }
+            }
+        }
+        if healthy {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Reap this test's own server before assertions, including startup failures.
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(&log_path).expect("read server log");
+    assert!(healthy, "server never reached HTTP liveness:\n{log}");
+    for (path, bytes) in before {
+        let after = std::fs::read(&path).unwrap();
+        if setup && path != env.user_config_env_path() {
+            let content = String::from_utf8_lossy(&after);
+            assert!(
+                content.contains(&format!("http://127.0.0.1:{port}/mcp/")),
+                "explicit setup did not update {}:\n{content}\n{log}",
+                path.display()
+            );
+            assert!(!content.contains("http://127.0.0.1:8765/mcp/"));
+        } else {
+            assert_eq!(after, bytes, "startup rewrote {}:\n{log}", path.display());
+        }
+    }
+    if !setup {
+        assert_eq!(
+            cache_dir.exists(),
+            cache_existed,
+            "startup created a setup cache"
+        );
+    }
+}
 
 #[test]
 fn legacy_am_serve_reports_migration_preflight() {
@@ -4986,6 +6132,183 @@ fn legacy_am_serve_reports_migration_preflight() {
             "legacy am serve stderr missing {fragment:?}\nActual stderr:\n{stderr}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_discovers_nondefault_mailbox_daemon_port() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let project = env.hostile_repo.to_str().unwrap();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("discovered-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let command = || {
+        let mut cmd = Command::new(am_bin());
+        cmd.env_clear()
+            .envs(env.isolated_env())
+            .env_remove("HTTP_HOST")
+            .env_remove("HTTP_PORT")
+            .env("TMPDIR", env.tmp.path())
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&env.hostile_repo);
+        cmd
+    };
+    let mut server_command = command();
+    server_command
+        .args([
+            "serve-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--no-tui",
+            "--no-auth",
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut server = OwnedServer(server_command.spawn().unwrap());
+    let registration = [
+        "macros",
+        "start-session",
+        "--project",
+        project,
+        "--agent-name",
+        "BlueLake",
+        "--program",
+        "codex-cli",
+        "--model",
+        "test",
+        "--json",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            // Seed only the explicit private endpoint. Verify discovery with a
+            // read before permitting an automatically routed mutation.
+            let out = command()
+                .env("HTTP_PORT", port.to_string())
+                .args(registration)
+                .output()
+                .unwrap();
+            if out.status.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "registration failed: {}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                std::fs::read_to_string(&log_path).unwrap()
+            );
+        }
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let out = command()
+        .args(["agents", "list", "--project", project, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("BlueLake"));
+    let out = command().args(registration).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let send = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "BlueLake",
+        "--to",
+        "BlueLake",
+        "--subject",
+        "discovered-port-proof",
+        "--body",
+        "durable port discovery body",
+        "--json",
+    ];
+    let out = command().args(send).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inbox = [
+        "inbox",
+        "--project",
+        project,
+        "--agent",
+        "BlueLake",
+        "--all",
+        "--include-bodies",
+        "--json",
+    ];
+    let out = command().args(inbox).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+
+    // A deliberately unavailable explicit port must not be silently replaced.
+    // The owned-mailbox refusal still queues the user's unsent message.
+    let out = command().env("HTTP_PORT", "1").args(send).output().unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("UNSENT"), "{error}");
+    assert!(error.contains(":1/"), "{error}");
+    assert!(
+        error.contains(&format!("AGENT_MAIL_URL=http://127.0.0.1:{port}/mcp/")),
+        "{error}"
+    );
+    let out = command()
+        .env("HTTP_PORT", "1")
+        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+        .args(inbox)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+
+    // Once the listener is gone its hint is stale; local reopen still sees
+    // the message committed through the actual daemon.
+    drop(server);
+    let out = command()
+        .env("HTTP_PORT", "1")
+        .args(inbox)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
 }
 
 #[test]

@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines)]
+
 use mcp_agent_mail_conformance::Fixtures;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,9 +279,15 @@ fn audit_doc_matches_live_inventory() {
         .iter()
         .map(|(name, _cluster)| (*name).to_string())
         .collect();
+    // Audit baseline: 49 = 42 compatibility (37 captured + fetch_topic +
+    // list_window_identities, sweep_stale_agents, summarize_recent,
+    // fetch_summary) + 7 Rust-native (`mark_all_read`, GH#273, landed
+    // 2026-08-31). Bumping this
+    // number is a reviewed contract change: update the audit doc table and the
+    // README/AGENTS counts in the same commit.
     assert_eq!(
         runtime_tools.len(),
-        48,
+        49,
         "tool count drifted from audit baseline"
     );
 
@@ -436,7 +446,7 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     for needle in [
         "# mcp-agent-mail-conformance",
         "## Current coverage (as of 2026-08-27)",
-        "48 tools",
+        "49 tools",
         "37 tools have Python behavior fixtures",
         "5 additional Python-compatible tools",
         "fetch_topic",

@@ -264,7 +264,7 @@ is used in hot paths.
 | `DATABASE_URL`                 | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `DATABASE_POOL_SIZE`           | auto (4-16 by cores)  | Connection pool size             |
 | `DATABASE_MAX_OVERFLOW`        | auto (max 32 total; fsqlite writer bound) | Additional overflow connections   |
-| `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
+| `DATABASE_POOL_TIMEOUT`        | `10` (seconds)        | Pool acquisition timeout; values of 1000 or more are read as milliseconds |
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
@@ -877,6 +877,8 @@ am serve-http
 DATABASE_URL=sqlite:///path/to/new.sqlite3 am serve-http
 ```
 
+The three-slash form names an absolute path (`sqlite:///var/lib/am/x.sqlite3` is `/var/lib/am/x.sqlite3`, the same as `sqlite:////var/lib/am/x.sqlite3`). A path relative to the working directory must be spelled that way: `sqlite:///./x.sqlite3` or `sqlite://x.sqlite3`. A missing relative target is never replaced by an absolute file that happens to share the suffix.
+
 ### Run in production mode
 ```bash
 APP_ENVIRONMENT=production \
@@ -1109,10 +1111,33 @@ am robot atc --summary-only --toon | grep kill_switch
 
 ### Related env vars
 
+The complete `AM_ATC_*` surface is registered in `am flags` — run `am config atc`
+(or `am flags list --subsystem atc`) for effective values and their sources, and
+`am flags explain <VAR>` for accepted values. Defaults and meanings are tabulated
+in the README ("Air Traffic Control (ATC) configuration").
+
 | Variable | Values | Default | Purpose |
 |---|---|---|---|
-| `AM_ATC_WRITE_MODE` | `off`, `shadow`, `live` | `off` | Controls experience write pipeline |
-| `ATC_LEARNING_DISABLED` | `0`, `1` | `0` | Hard override: forces write mode to `off` |
+| `ATC_LEARNING_DISABLED` | `0`, `1` | `0` | Hard override: forces `AM_ATC_WRITE_MODE=off` and `AM_ATC_ENABLED=false` |
+| `AM_ATC_ENABLED` | `true`, `false` | `true` | Master switch; `false` = passive liveness only (no probes/advisories/releases, DB `last_active_ts` heuristics) |
+| `AM_ATC_EXECUTOR_MODE` | `shadow`, `dry_run`, `canary`, `live` | `shadow` | Whether decisions become mail / reservation releases |
+| `AM_ATC_WRITE_MODE` | `off`, `shadow`, `live` | `off` | Controls the experience write pipeline |
+| `AM_ATC_PROBE_INTERVAL_SECS` | integer ≥ 5 | `120` | Operator tick / probe cadence |
+| `AM_ATC_ADVISORY_COOLDOWN_SECS` | integer ≥ 10 | `300` | Per-agent advisory cooldown |
+| `AM_ATC_SUMMARY_INTERVAL_SECS` | integer ≥ 10 | `300` | Summary log cadence |
+| `AM_ATC_SAFE_MODE_RECOVERY_COUNT` | integer ≥ 1 | `20` | Correct predictions to exit safe mode |
+| `AM_ATC_EPROCESS_THRESHOLD` | float > 0 | `20` | Calibration alert threshold (enters safe mode) |
+| `AM_ATC_CUSUM_THRESHOLD` | float > 0 | `5` | CUSUM change-point threshold |
+| `AM_ATC_CUSUM_DELTA` | float > 0 | `0.1` | CUSUM minimum detectable shift |
+| `AM_ATC_LEDGER_CAPACITY` | integer ≥ 10 | `1000` | Evidence ledger ring-buffer size |
+| `AM_ATC_SUSPICION_K` | float > 0 | `3` | Rhythm-liveness suspicion factor |
+| `AM_ATC_EXPERIENCE_MAX_ROWS` | integer (`0` = off) | `50000` | Ceiling on raw experience rows |
+| `AM_ATC_RETENTION_SWEEP_INTERVAL_SECS` | integer (`0` = off) | `900` | Ceiling-enforcement sweep cadence |
+| `AM_ATC_POPULATION_RECENCY_SECS` | integer ≥ 0 | `604800` | Hydration recency window (7 days) |
+| `AM_ATC_POPULATION_LIMIT` | `1..=65536` | `4096` | Max agents per population sync |
+| `AM_ATC_POLICY_BUNDLE_PATH` | path | unset | Policy bundle JSON overriding the baseline |
+| `AM_ATC_CANARY_REPORT_PATH` | path | unset | Exact canary report JSON for robot/TUI (no restart needed) |
+| `AM_ATC_CANARY_REPORT_DIR` | path | unset | Directory of `latest_canary_report.json` (no restart needed) |
 
 ### ATC observability signals
 

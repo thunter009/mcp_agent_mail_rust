@@ -50,10 +50,11 @@ pub use identity::*;
 pub use macros::*;
 pub use messaging::*;
 pub use metrics::{
-    LatencySnapshot, MetricsSnapshotEntry, record_call, record_call_idx, record_error,
-    record_error_idx, record_latency, record_latency_idx, record_rejection, record_rejection_idx,
-    reset_tool_latencies, reset_tool_metrics, slow_tools, tool_index, tool_meta,
-    tool_metrics_snapshot, tool_metrics_snapshot_full,
+    LatencySnapshot, MetricsSnapshotEntry, RECENT_TOOL_CALL_CAPACITY, RecentToolCall,
+    RecentToolCallOutcome, recent_call_count, recent_calls_since, record_call, record_call_idx,
+    record_error, record_error_idx, record_latency, record_latency_idx, record_recent_call,
+    record_rejection, record_rejection_idx, reset_tool_latencies, reset_tool_metrics, slow_tools,
+    tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
 pub use reservation_parity::*;
@@ -348,10 +349,13 @@ pub mod tool_util {
         // A5 (br-bvq1x.1.5): record the typed class at the single chokepoint
         // where a DB error is surfaced to a caller, so corruption-class trend
         // counters (and the K3 circuit breaker) see every classified failure
-        // exactly once.
-        mcp_agent_mail_core::global_metrics()
-            .corruption
-            .record_class(classification.class.as_str());
+        // exactly once. A semantic miss (GH#313) is not a storage failure and
+        // must not feed the failure trend.
+        if classification.class != mcp_agent_mail_db::DbErrorClass::RequestSemanticError {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_class(classification.class.as_str());
+        }
         match e {
             // D3 (br-bvq1x.4.3): a bounded retry loop already spent its
             // budget. Render an honest, class-distinct envelope that reports
@@ -1154,7 +1158,7 @@ pub mod tool_util {
     }
 
     fn query_read_db_inventory(
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     ) -> Result<ReadReconcileInventory, String> {
         let tables = conn
             .query_sync(
@@ -1241,7 +1245,7 @@ pub mod tool_util {
     pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
-        conn: &mcp_agent_mail_db::DbConn,
+        conn: &impl mcp_agent_mail_db::pool::SyncQuery,
         archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
@@ -1280,22 +1284,27 @@ pub mod tool_util {
 
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
+        snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
     }
 
     impl ToolReadPool {
-        const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
+        pub(crate) const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
             Self {
                 pool,
-                _snapshot: None,
+                snapshot: None,
             }
         }
 
         fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
             Self {
                 pool: snapshot.pool(),
-                _snapshot: Some(snapshot),
+                snapshot: Some(snapshot),
             }
+        }
+
+        /// Snapshot-local IDs cannot authorize writes to either database.
+        pub(crate) fn live_sqlite_path(&self) -> Option<&str> {
+            self.snapshot.is_none().then(|| self.pool.sqlite_path())
         }
     }
 
@@ -2220,6 +2229,17 @@ body
             assert_eq!(data["error"]["type"], "NOT_FOUND");
             assert_eq!(data["error"]["recoverable"], true);
             assert_eq!(data["error"]["data"]["entity"], "Agent");
+            // GH#313: a lookup miss must not wear the storage-failure policy
+            // (reads unsafe, edits blocked, "run am doctor health").
+            let envelope = &data["error"]["data"]["failure_envelope"];
+            assert_eq!(envelope["class"], "request_semantic_error");
+            assert_eq!(envelope["policy"]["blocks_edits"], false);
+            assert_eq!(envelope["policy"]["safe_to_continue_read_only"], true);
+            assert_eq!(envelope["policy"]["repairable"], false);
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "request_semantic_error"
+            );
         }
 
         #[test]
@@ -2292,15 +2312,14 @@ body
             let temp = tempfile::tempdir().expect("tempdir");
             let db_path = temp.path().join("custom.sqlite3");
             let database_url = format!("sqlite:///{}", db_path.display());
-            let xdg_data_home = temp.path().join("xdg");
-            let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
 
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[
-                    ("DATABASE_URL", database_url.as_str()),
-                    ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
-                ],
-                || {
+            // br-99aih: redirect the *default* storage root into a private
+            // tempdir (HOME + XDG_DATA_HOME); an XDG-only override still
+            // resolved to the operator's live archive on any host that had run
+            // the daemon.
+            mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[("DATABASE_URL", database_url.as_str())],
+                |_isolated_default_root| {
                     Config::reset_cached();
                     let storage_root = Config::from_env().storage_root;
                     let project_dir = storage_root.join("projects").join("ahead-project");
@@ -2915,6 +2934,7 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("fetch_topic", clusters::MESSAGING),
     ("fetch_inbox_events", clusters::MESSAGING),
     ("mark_message_read", clusters::MESSAGING),
+    ("mark_all_read", clusters::MESSAGING),
     ("acknowledge_message", clusters::MESSAGING),
     ("get_message_delivery_receipt", clusters::MESSAGING),
     // Contact

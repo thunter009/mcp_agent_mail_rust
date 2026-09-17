@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{AgentResponse, ProjectResponse, WhoisResponse};
 use crate::llm;
 use crate::messaging::InboxMessage;
-use crate::reservations::{ReleaseResult, ReservationResponse};
+use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 use mcp_agent_mail_db::micros_to_iso;
@@ -60,7 +60,9 @@ pub struct PreparedThread {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationCycleResponse {
     pub file_reservations: ReservationResponse,
-    pub released: Option<ReleaseResult>,
+    /// Preserve the release tool's complete result, including a queued intent
+    /// and its replay receipt when the lease could not yet be released.
+    pub released: Option<Value>,
 }
 
 /// Contact handshake response
@@ -133,8 +135,15 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server
+    // (GH#310). Over HTTP the daemon fills this from the `X-Tmux-Socket`
+    // header and ignores any body value. Ignored when `pane_id` is absent.
+    tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
+    let tmux_socket_path =
+        crate::identity::validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
     let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
@@ -168,9 +177,10 @@ pub async fn macro_start_session(
     // fresh name is minted below), while a dead binding is adopted and its
     // record rewritten with this caller's pane facts.
     let resolved_name = agent_name.or_else(|| {
-        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane_on_server(
             &project.human_key,
             pane_id.as_deref(),
+            mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
         )
         .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
@@ -185,6 +195,7 @@ pub async fn macro_start_session(
         None,
         reaper_exempt,
         pane_id,
+        tmux_socket_path,
         registration_proof,
     )
     .await?;
@@ -351,6 +362,7 @@ pub async fn macro_prepare_thread(
             model,
             agent_name,
             task_description,
+            None,
             None,
             None,
             None,
@@ -576,7 +588,7 @@ pub async fn macro_file_reservation_cycle(
                 return Err(e);
             }
         };
-        Some(parse_json::<ReleaseResult>(release_json, "released")?)
+        Some(parse_json::<Value>(release_json, "released")?)
     } else {
         None
     };
@@ -689,8 +701,17 @@ pub async fn macro_contact_handshake(
     // NOTE: Removed manual same-project fast path that bypassed side effects.
     // We now always delegate to request_contact/respond_contact to ensure
     // consistent behavior, normalization, and archive writes.
-
-    let request_json = crate::contacts::request_contact(
+    //
+    // GH#313: when this macro approves the request itself, the target must
+    // not receive the ack-required "Contact request from X" intro — it would
+    // look actionable after the link is already approved. The pending intro
+    // is deferred and replaced by a non-actionable approval notice below.
+    let intro = if should_auto_accept {
+        crate::contacts::ContactIntro::Deferred
+    } else {
+        crate::contacts::ContactIntro::PendingRequest
+    };
+    let request_json = crate::contacts::request_contact_with_intro(
         ctx,
         source_project_key.clone(),
         from_agent.clone(),
@@ -704,6 +725,7 @@ pub async fn macro_contact_handshake(
         program.clone(),
         model.clone(),
         task_description.clone(),
+        intro,
     )
     .await?;
     let request_val: Value = parse_json(request_json, "request")?;
@@ -723,7 +745,16 @@ pub async fn macro_contact_handshake(
             Some(ttl),
         )
         .await?;
-        Some(parse_json(respond_json, "response")?)
+        let response_val: Value = parse_json(respond_json, "response")?;
+        crate::contacts::send_contact_approved_notice(
+            ctx,
+            &source_project_key,
+            &from_agent,
+            &target_project_key,
+            &target_agent_name,
+        )
+        .await?;
+        Some(response_val)
     } else {
         None
     };
@@ -994,14 +1025,36 @@ mod tests {
                 granted: Vec::new(),
                 conflicts: Vec::new(),
             },
-            released: Some(ReleaseResult {
-                released: 3,
-                released_at: "2026-02-06T12:00:00Z".into(),
-            }),
+            released: Some(serde_json::json!({
+                "released": 3,
+                "released_at": "2026-02-06T12:00:00Z",
+            })),
         };
         let val: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(val["released"]["released"], 3);
+    }
+
+    #[test]
+    fn reservation_cycle_response_preserves_queued_release_receipt() {
+        let payload = serde_json::json!({
+            "file_reservations": {"granted": [], "conflicts": []},
+            "released": {
+                "released": 0,
+                "released_at": "2026-09-05T02:00:00Z",
+                "status": "queued",
+                "queued": true,
+                "message": "lease release queued because DB unavailable",
+                "intent": {
+                    "id": "release-receipt",
+                    "path": "/private-fixture/degraded_intents/release_file_reservations.jsonl",
+                    "content_sha256": "receipt-digest",
+                    "replay": "automatic_on_next_successful_release_file_reservations_call"
+                }
+            }
+        });
+        let parsed: ReservationCycleResponse = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), payload);
     }
 
     // -----------------------------------------------------------------------
@@ -1431,22 +1484,20 @@ mod tests {
 
     #[test]
     fn reservation_cycle_auto_release_present() {
-        use crate::reservations::ReleaseResult;
-
         let resp = ReservationCycleResponse {
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
                 conflicts: Vec::new(),
             },
-            released: Some(ReleaseResult {
-                released: 5,
-                released_at: "2026-02-12T12:00:00Z".into(),
-            }),
+            released: Some(serde_json::json!({
+                "released": 5,
+                "released_at": "2026-02-12T12:00:00Z",
+            })),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ReservationCycleResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.released.is_some());
-        assert_eq!(parsed.released.unwrap().released, 5);
+        assert_eq!(parsed.released.unwrap()["released"], 5);
     }
 
     // -----------------------------------------------------------------------

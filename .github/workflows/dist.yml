@@ -15,7 +15,7 @@ concurrency:
 env:
   # Release sibling path dependencies are pinned so rerunning a tag resolves
   # the same source bytes even after their default branches advance.
-  FRANKENSEARCH_COMMIT: e2d24118b06e4a1a4bbff16968f70767f35d5bb3
+  FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
   FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
   BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
   CARGO_ZIGBUILD_VERSION: '0.23.3'
@@ -139,12 +139,12 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -210,12 +210,12 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -296,12 +296,12 @@ jobs:
             fi
           }
 
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install pinned Rust toolchain

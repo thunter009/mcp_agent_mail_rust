@@ -105,9 +105,94 @@ fn is_hex_token(s: &str) -> bool {
 /// reader can safely use the returned path.
 #[must_use]
 pub fn find_reservation_artifact(reservations_dir: &Path, id: i64) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(reservations_dir).ok()?;
     let mut legacy: Option<PathBuf> = None;
     let mut stamped: Option<PathBuf> = None;
+    for_each_artifact_of_id(reservations_dir, id, |path, parsed| {
+        if parsed.generation.is_some() {
+            match &stamped {
+                Some(existing) if existing <= &path => {}
+                _ => stamped = Some(path),
+            }
+        } else if legacy.is_none() {
+            legacy = Some(path);
+        }
+    })?;
+    stamped.or(legacy)
+}
+
+/// Locate the stable archive artifact for reservation `id` **as attributed to
+/// the live database generation** — the artifact the reservation parity
+/// checker compares against the DB row (GH#311).
+///
+/// [`find_reservation_artifact`] is generation-blind: it prefers *any*
+/// generation-stamped name, including debris left by a superseded DB
+/// generation. The parity checker, by contrast, excludes foreign-generation
+/// artifacts from comparison and reports drift against the current-generation
+/// or legacy artifact. A fixer that mutates the artifact behind a parity
+/// finding must therefore resolve the same file the checker did — otherwise
+/// it rewrites prior-generation history and leaves the flagged drift in place.
+///
+/// Selection mirrors the checker's admission rule exactly:
+///
+/// - `current_generation == Some(g)`: the `id-<id>-g<g>.json` artifact wins;
+///   otherwise the legacy `id-<id>.json`; otherwise `None`. A stamped artifact
+///   with any *other* generation is never returned.
+/// - `current_generation == None` (unseeded `db_identity`): generations cannot
+///   be attributed, so a single stamped artifact wins over legacy (as in
+///   [`find_reservation_artifact`]). When **several** stamped artifacts share
+///   the id, the checker's pick is directory-order dependent and cannot be
+///   reproduced safely, so this returns `None` — callers must treat that as
+///   "skip explicitly", never guess.
+///
+/// Symlinked entries are ignored (never dereferenced), matching the other
+/// finder.
+#[must_use]
+pub fn find_reservation_artifact_for_generation(
+    reservations_dir: &Path,
+    id: i64,
+    current_generation: Option<&str>,
+) -> Option<PathBuf> {
+    let current_generation = current_generation.filter(|generation| !generation.is_empty());
+    let mut legacy: Option<PathBuf> = None;
+    let mut current: Option<PathBuf> = None;
+    // Only consulted when the live generation is unknown.
+    let mut unattributed_stamped: Vec<PathBuf> = Vec::new();
+    for_each_artifact_of_id(reservations_dir, id, |path, parsed| {
+        match (current_generation, parsed.generation.as_deref()) {
+            (_, None) => {
+                if legacy.is_none() {
+                    legacy = Some(path);
+                }
+            }
+            (Some(live), Some(stamped)) => {
+                if stamped == live && current.is_none() {
+                    current = Some(path);
+                }
+                // A differently-stamped artifact is prior-generation debris:
+                // never a candidate.
+            }
+            (None, Some(_)) => unattributed_stamped.push(path),
+        }
+    })?;
+    if current_generation.is_some() {
+        return current.or(legacy);
+    }
+    match unattributed_stamped.len() {
+        0 => legacy,
+        1 => unattributed_stamped.pop(),
+        _ => None,
+    }
+}
+
+/// Visit every regular-file (non-symlink) stable artifact for reservation
+/// `id` in `reservations_dir`. Returns `None` when the directory is unreadable
+/// so callers can distinguish "no such artifact" from "could not look".
+fn for_each_artifact_of_id(
+    reservations_dir: &Path,
+    id: i64,
+    mut visit: impl FnMut(PathBuf, ParsedReservationArtifact),
+) -> Option<()> {
+    let entries = std::fs::read_dir(reservations_dir).ok()?;
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -123,17 +208,9 @@ pub fn find_reservation_artifact(reservations_dir: &Path, id: i64) -> Option<Pat
         if parsed.id != id {
             continue;
         }
-        let path = entry.path();
-        if parsed.generation.is_some() {
-            match &stamped {
-                Some(existing) if existing <= &path => {}
-                _ => stamped = Some(path),
-            }
-        } else if legacy.is_none() {
-            legacy = Some(path);
-        }
+        visit(entry.path(), parsed);
     }
-    stamped.or(legacy)
+    Some(())
 }
 
 #[cfg(test)]
@@ -237,6 +314,96 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(find_reservation_artifact(dir.path(), 404).is_none());
         assert!(find_reservation_artifact(&dir.path().join("does-not-exist"), 1).is_none());
+    }
+
+    fn file_name(path: &Path) -> &str {
+        path.file_name().and_then(|name| name.to_str()).unwrap()
+    }
+
+    #[test]
+    fn find_for_generation_ignores_foreign_stamped_and_picks_legacy() {
+        // GH#311: a stale legacy artifact next to prior-generation debris. The
+        // parity checker compares the legacy file against the live row, so the
+        // generation-aware finder must return it — NOT the foreign artifact
+        // that the generation-blind finder prefers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let current = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        std::fs::write(root.join("id-1.json"), "{}").expect("legacy");
+        std::fs::write(root.join(format!("id-1-g{foreign}.json")), "{}").expect("foreign");
+
+        let blind = find_reservation_artifact(root, 1).expect("blind");
+        assert_eq!(file_name(&blind), format!("id-1-g{foreign}.json"));
+
+        let aware =
+            find_reservation_artifact_for_generation(root, 1, Some(&current)).expect("aware");
+        assert_eq!(file_name(&aware), "id-1.json");
+    }
+
+    #[test]
+    fn find_for_generation_prefers_current_stamped_over_legacy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("id-5.json"), "{}").expect("legacy");
+        std::fs::write(root.join("id-5-gaaaa.json"), "{}").expect("current");
+        std::fs::write(root.join("id-5-gbbbb.json"), "{}").expect("foreign");
+        let found = find_reservation_artifact_for_generation(root, 5, Some("aaaa")).expect("find");
+        assert_eq!(file_name(&found), "id-5-gaaaa.json");
+    }
+
+    #[test]
+    fn find_for_generation_returns_none_when_only_foreign_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("id-7-gbbbb.json"), "{}").expect("foreign");
+        assert!(find_reservation_artifact_for_generation(root, 7, Some("aaaa")).is_none());
+        // ...and an empty generation token is treated as unknown, not as a
+        // literal generation, matching `reservation_artifact_filename`.
+        assert_eq!(
+            find_reservation_artifact_for_generation(root, 7, Some(""))
+                .map(|p| file_name(&p).to_owned()),
+            Some("id-7-gbbbb.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn find_for_generation_without_live_generation_matches_blind_finder_when_unambiguous() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("id-9.json"), "{}").expect("legacy");
+        // Legacy only → legacy.
+        let found = find_reservation_artifact_for_generation(root, 9, None).expect("legacy");
+        assert_eq!(file_name(&found), "id-9.json");
+        // One stamped + legacy → the stamped one (checker admits both, stamped wins).
+        std::fs::write(root.join("id-9-gcccc.json"), "{}").expect("stamped");
+        let found = find_reservation_artifact_for_generation(root, 9, None).expect("stamped");
+        assert_eq!(file_name(&found), "id-9-gcccc.json");
+    }
+
+    #[test]
+    fn find_for_generation_without_live_generation_refuses_ambiguous_stamped_set() {
+        // Two stamped artifacts and no live generation: the checker's pick is
+        // directory-order dependent, so the finder must refuse rather than guess.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("id-3.json"), "{}").expect("legacy");
+        std::fs::write(root.join("id-3-gaaaa.json"), "{}").expect("stamped a");
+        std::fs::write(root.join("id-3-gbbbb.json"), "{}").expect("stamped b");
+        assert!(find_reservation_artifact_for_generation(root, 3, None).is_none());
+        // With the live generation known, the ambiguity disappears.
+        let found = find_reservation_artifact_for_generation(root, 3, Some("bbbb")).expect("b");
+        assert_eq!(file_name(&found), "id-3-gbbbb.json");
+    }
+
+    #[test]
+    fn find_for_generation_returns_none_for_missing_id_or_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(find_reservation_artifact_for_generation(dir.path(), 404, Some("aaaa")).is_none());
+        assert!(
+            find_reservation_artifact_for_generation(&dir.path().join("missing"), 1, None)
+                .is_none()
+        );
     }
 
     #[test]

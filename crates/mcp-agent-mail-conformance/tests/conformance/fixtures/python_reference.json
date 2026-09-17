@@ -2599,12 +2599,12 @@
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": null,
-                  "subject": "Contact request from BlueLake",
+                  "subject": "Contact approved: BlueLake -> GreenCastle",
                   "importance": "normal",
-                  "ack_required": true,
+                  "ack_required": false,
                   "created_ts": null,
                   "attachments": [],
-                  "body_md": "BlueLake requests permission to contact GreenCastle.",
+                  "body_md": "BlueLake requested permission to contact GreenCastle; the request was approved on BlueLake's behalf (auto_accept), so no action is required.\n\nApproved link: BlueLake (project /abs/path/backend) -> GreenCastle (project /abs/path/backend).\n\nTo revoke it, call respond_contact(project_key='/abs/path/backend', to_agent='GreenCastle', from_agent='BlueLake', from_project='/abs/path/backend', accept=false).",
                   "from": "BlueLake",
                   "kind": "to"
                 },
@@ -2976,7 +2976,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3131,7 +3131,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3259,7 +3259,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3722,7 +3722,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3877,7 +3877,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -4005,7 +4005,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -5537,10 +5537,10 @@
         }
       ]
     },
-    "resource://tooling/recent/60?agent=BlueLake&project=abs-path-backend": {
+    "resource://tooling/recent/60?agent=NoSuchAgent&project=abs-path-backend": {
       "cases": [
         {
-          "name": "tooling_recent",
+          "name": "tooling_recent_unknown_agent_is_empty",
           "input": {},
           "expect": {
             "ok": {
@@ -5588,20 +5588,8 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 2,
+              "count": 1,
               "messages": [
-                {
-                  "id": 2,
-                  "project_id": 1,
-                  "sender_id": 1,
-                  "thread_id": null,
-                  "subject": "Contact request from BlueLake",
-                  "importance": "normal",
-                  "ack_required": true,
-                  "created_ts": null,
-                  "attachments": [],
-                  "kind": "to"
-                },
                 {
                   "id": 3,
                   "project_id": 1,
@@ -5619,8 +5607,7 @@
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/messages/0/created_ts",
-              "/messages/1/created_ts"
+              "/messages/0/created_ts"
             ]
           }
         }
@@ -5675,16 +5662,16 @@
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": null,
-                  "subject": "Contact request from BlueLake",
+                  "subject": "Contact approved: BlueLake -> GreenCastle",
                   "importance": "normal",
-                  "ack_required": true,
+                  "ack_required": false,
                   "created_ts": null,
                   "attachments": [],
                   "from": "BlueLake",
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake"
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact approved: BlueLake -> GreenCastle"
                   }
                 },
                 {
@@ -5848,16 +5835,16 @@
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": null,
-                  "subject": "Contact request from BlueLake",
+                  "subject": "Contact approved: BlueLake -> GreenCastle",
                   "importance": "normal",
-                  "ack_required": true,
+                  "ack_required": false,
                   "created_ts": null,
                   "attachments": [],
                   "from": "BlueLake",
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact approved: BlueLake -> GreenCastle",
                     "authored_ts": null,
                     "insertions": 0,
                     "deletions": 0,
@@ -6093,12 +6080,12 @@
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": null,
-                  "subject": "Contact request from BlueLake",
+                  "subject": "Contact approved: BlueLake -> GreenCastle",
                   "importance": "normal",
-                  "ack_required": true,
+                  "ack_required": false,
                   "created_ts": null,
                   "attachments": [],
-                  "body_md": "BlueLake requests permission to contact GreenCastle.",
+                  "body_md": "BlueLake requested permission to contact GreenCastle; the request was approved on BlueLake's behalf (auto_accept), so no action is required.\n\nApproved link: BlueLake (project /abs/path/backend) -> GreenCastle (project /abs/path/backend).\n\nTo revoke it, call respond_contact(project_key='/abs/path/backend', to_agent='GreenCastle', from_agent='BlueLake', from_project='/abs/path/backend', accept=false).",
                   "from": "BlueLake",
                   "to": [
                     "GreenCastle"
@@ -6107,7 +6094,7 @@
                   "bcc": [],
                   "commit": {
                     "hexsha": null,
-                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | Contact approved: BlueLake -> GreenCastle",
                     "authored_ts": null,
                     "insertions": 0,
                     "deletions": 0,

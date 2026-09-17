@@ -15,6 +15,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
+/// Read the Windows hard-link count from an already-open file authority.
+///
+/// The capability metadata wrapper supplies stable handle information. Cloning
+/// the handle keeps this independent of subsequent pathname replacement.
+#[cfg(windows)]
+pub fn windows_file_link_count(file: &std::fs::File) -> io::Result<u64> {
+    let retained = cap_std::fs::File::from_std(file.try_clone()?);
+    Ok(cap_fs_ext::MetadataExt::nlink(&retained.metadata()?))
+}
+
+/// Move a Windows filesystem object without replacing an occupied name.
+///
+/// Do not enable replacement or cross-volume copy/delete, and do not alter
+/// source attributes before attempting the move. Unsupported path encodings
+/// fail before calling the string-based Windows wrapper.
+#[cfg(windows)]
+pub fn windows_rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    fn checked_path(path: &Path) -> io::Result<&str> {
+        path.to_str()
+            .filter(|text| !text.contains('\0'))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows recovery move requires Unicode paths without NUL bytes",
+                )
+            })
+    }
+
+    winsafe::MoveFileEx(
+        checked_path(source)?,
+        Some(checked_path(destination)?),
+        winsafe::co::MOVEFILE::WRITE_THROUGH,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw().cast_signed()))
+}
+
 /// Return whether `path` is one of macOS's protected compatibility aliases.
 ///
 /// macOS presents `/var`, `/tmp`, and `/etc` as root-owned symlinks into
@@ -797,6 +833,21 @@ pub fn is_sqlite_memory_database_url(database_url: &str) -> bool {
     )
 }
 
+/// Turn a `sqlite:` database URL into the filesystem path it names.
+///
+/// Contract (br-z73au): the three-slash form is **absolute**, like the
+/// four-slash form. `sqlite:///var/lib/am/storage.sqlite3` and
+/// `sqlite:////var/lib/am/storage.sqlite3` both name `/var/lib/am/...`; this
+/// is what every documented example, `DbPoolConfig`'s error text, and the
+/// installed base rely on, and reinterpreting it as CWD-relative would
+/// silently retarget existing deployments to a fresh database. A path is
+/// relative to the current directory only when it is spelled that way:
+/// `sqlite:///./rel/db.sqlite3`, `sqlite:///../rel/db.sqlite3`, or the
+/// host-less two-slash form `sqlite://rel/db.sqlite3`. Downstream, a missing
+/// relative target is never replaced by an absolute file that happens to
+/// share the same suffix; only a relative file that exists but is unhealthy
+/// while `/<same path>` is healthy triggers the legacy absolute fallback
+/// (see `pool::resolve_sqlite_path_with_absolute_fallback`).
 #[must_use]
 pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf> {
     let stripped = sqlite_path_component(database_url)?;
@@ -839,6 +890,11 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
         // captured Windows URLs without surprise.
         path.remove(0);
     }
+    if path.starts_with(r"/\\") {
+        // The slash before a backslash UNC root belongs to `sqlite:///`.
+        // Keep both network-root backslashes, including a verbatim namespace.
+        path.remove(0);
+    }
 
     if path.is_empty() {
         return None;
@@ -850,23 +906,28 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
 /// Construct a `sqlite:///` URL from a filesystem path, applying the
 /// normalizations that `sqlite_file_path_from_database_url` expects.
 ///
-/// On Windows this strips a leading `\\?\` (or `\\?\UNC\`) verbatim prefix
-/// returned by `fs::canonicalize` and converts path separators to `/`. Without
-/// the prefix-strip, the literal `?` inside `\\?\` is interpreted as the URL
-/// query separator and the embedded path is truncated to garbage (issue #93).
+/// Windows drive paths use forward slashes without their leading `\\?\`.
+/// Network paths retain their UNC root and use backslashes to distinguish it
+/// from the Unix absolute-path slash forms. Extended UNC paths also retain
+/// their namespace: removing it can change long paths or trailing-dot names.
+/// The parser preserves the literal `?` inside that namespace (issue #93).
 ///
 /// Use this everywhere a `SQLite` database URL is constructed from a `Path`
 /// instead of `format!("sqlite:///{}", path.display())`.
 #[must_use]
 pub fn sqlite_url_from_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    // Strip Windows UNC verbatim prefix (`\\?\` or `\\?\UNC\`).  Stripping
-    // these is always safe because the byte sequence is not a legal component
-    // of any normal Unix path; doing it unconditionally lets cross-platform
-    // tests on Linux exercise this branch without `cfg!(windows)` gating.
-    let stripped = raw
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| raw.strip_prefix(r"\\?\"));
+    if raw.starts_with(r"\\?\UNC\")
+        || (raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\"))
+    {
+        return format!("sqlite:///{raw}");
+    }
+    if cfg!(windows) && raw.starts_with("//") {
+        return format!("sqlite:///{}", raw.replace('/', r"\"));
+    }
+    // Preserve the existing drive-path normalization, including captured
+    // Windows paths parsed by tooling running on Unix.
+    let stripped = raw.strip_prefix(r"\\?\");
     let cleaned: std::borrow::Cow<'_, str> = match stripped {
         Some(s) => std::borrow::Cow::Owned(s.replace('\\', "/")),
         None if cfg!(windows) => std::borrow::Cow::Owned(raw.replace('\\', "/")),
@@ -1163,6 +1224,61 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_count_tracks_the_handle_after_path_replacement() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let alias = dir.path().join("alias");
+        let moved = dir.path().join("moved");
+        std::fs::write(&source, b"original").unwrap();
+        let authority = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_link_count(&authority).unwrap(), 1);
+        std::fs::hard_link(&source, &alias).unwrap();
+        windows_rename_noreplace(&source, &moved).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+
+        assert_eq!(windows_file_link_count(&authority).unwrap(), 2);
+        let replacement = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_link_count(&replacement).unwrap(), 1);
+        assert_eq!(std::fs::read(&alias).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_collision_preserves_readonly_source_and_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&destination, b"sentinel bytes").unwrap();
+        let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions).unwrap();
+
+        let error = windows_rename_noreplace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"sentinel bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_rejects_nul_before_touching_the_source() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let mut nul_destination = destination.as_os_str().to_os_string();
+        nul_destination.push("\0suffix");
+
+        let error = windows_rename_noreplace(&source, Path::new(&nul_destination)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert!(!destination.exists());
+    }
+
     #[test]
     fn bounded_control_file_read_rejects_oversized_input() {
         let dir = tempdir().unwrap();
@@ -1245,7 +1361,9 @@ mod tests {
             ),
         ] {
             let classified = classify_sqlite_recovery_candidate_name(primary, OsStr::new(name))
-                .unwrap_or_else(|| panic!("expected published candidate: {name}"));
+                .unwrap_or_else(|| {
+                    panic!("expected published candidate: {name}"); // ubs:ignore -- cfg(test) assertion
+                });
             assert_eq!(classified.kind(), expected_kind, "candidate {name}");
         }
 
@@ -1878,6 +1996,81 @@ mod tests {
         assert_eq!(url, "sqlite:////var/data/db.sqlite3");
         let parsed = sqlite_file_path_from_database_url(&url).expect("round-trip");
         assert_eq!(parsed, PathBuf::from("/var/data/db.sqlite3"));
+    }
+
+    #[test]
+    fn sqlite_url_round_trip_preserves_windows_unc_network_root() {
+        for path in [
+            r"\\server\share\mail\db.sqlite3",
+            r"\\?\UNC\server\share\mail\db.sqlite3",
+            r"\\server\share with spaces\mail\db.sqlite3",
+            r"\\?\UNC\server\share\trailing.\db.sqlite3",
+            r"\\?\UNC\server\share\trailing \db.sqlite3",
+        ] {
+            let url = sqlite_url_from_path(Path::new(path));
+            assert_eq!(
+                sqlite_file_path_from_database_url(&url),
+                Some(PathBuf::from(path)),
+                "network root and namespace must survive: {url:?}"
+            );
+        }
+        let long_path = format!(
+            r"\\?\UNC\server\share\{}\db.sqlite3",
+            "directory\\".repeat(35)
+        );
+        assert_eq!(
+            sqlite_file_path_from_database_url(&sqlite_url_from_path(Path::new(&long_path))),
+            Some(PathBuf::from(long_path))
+        );
+    }
+
+    #[test]
+    fn sqlite_url_parses_windows_unc_without_consuming_the_network_root() {
+        for scheme in ["sqlite", "sqlite+aiosqlite"] {
+            for path in [
+                r"\\server\share\db.sqlite3",
+                r"\\?\UNC\server\share\db.sqlite3",
+            ] {
+                for separator in ["//", "///"] {
+                    for suffix in ["", "?mode=ro", "#fragment", "?mode=ro#fragment"] {
+                        let url = format!("{scheme}:{separator}{path}{suffix}");
+                        assert_eq!(
+                            sqlite_file_path_from_database_url(&url),
+                            Some(PathBuf::from(path)),
+                            "UNC URL should retain its network root: {url:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(sqlite_file_path_from_database_url(r"https:///\\server\share\db").is_none());
+        assert!(sqlite_file_path_from_database_url("sqlite:///?mode=ro").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_url_from_forward_slash_unc_path_keeps_network_root() {
+        let url = sqlite_url_from_path(Path::new("//server/share/mail/db.sqlite3"));
+        assert_eq!(
+            sqlite_file_path_from_database_url(&url),
+            Some(PathBuf::from(r"\\server\share\mail\db.sqlite3"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_url_unc_handling_preserves_unix_path_contract() {
+        for path in ["/tmp/db.sqlite3", r"/tmp/back\slash/db.sqlite3"] {
+            assert_eq!(
+                sqlite_file_path_from_database_url(&sqlite_url_from_path(Path::new(path))),
+                Some(PathBuf::from(path))
+            );
+        }
+        // Repeated forward slashes retain the documented Unix absolute-path rule.
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite://///tmp/db.sqlite3"),
+            Some(PathBuf::from("/tmp/db.sqlite3"))
+        );
     }
 
     #[test]

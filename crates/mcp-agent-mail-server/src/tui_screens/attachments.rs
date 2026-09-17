@@ -1928,17 +1928,17 @@ mod tests {
 
     #[test]
     fn b8_attachments_tick_retries_after_unavailable_without_data_change() {
-        let broken = broken_db_state();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("attachments-retry.sqlite3");
-        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open healthy db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        let temp = tempfile::tempdir().expect("private healthy database fixture");
+        let database = temp.path().join("healthy.sqlite3");
+        let conn = DbConn::open_file(database.to_str().unwrap()).expect("create real database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("initialize healthy schema");
-        drop(conn);
+        conn.close_sync().expect("close fixture writer");
+        let broken = broken_db_state();
         let healthy = TuiSharedState::new(&Config {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            storage_root: dir.path().join("storage"),
-            ..Config::default()
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&database),
+            storage_root: temp.path().join("archive"),
+            ..Default::default()
         });
         let mut screen = AttachmentExplorerScreen::new();
 
@@ -1952,6 +1952,10 @@ mod tests {
         assert!(
             !screen.db_context_unavailable,
             "interval retry should recover once healthy even without new data generation"
+        );
+        assert!(
+            screen.last_error.is_none(),
+            "healthy schema must be queryable"
         );
     }
 

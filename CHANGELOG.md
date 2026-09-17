@@ -2,15 +2,1196 @@
 
 All notable changes to [MCP Agent Mail (Rust)](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) are documented in this file.
 
-Versions marked **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked **[Tag only]** exist as git tags but were never published as GitHub Releases.
+Versions marked **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked **[Tag only]** have git tags without a currently published GitHub Release.
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
+The latest review covers [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
+and the installer correction on `main`. Entries use git diffs, tag targets,
+GitHub publication metadata, Beads records, and executed release receipts.
+Publication dates are UTC; post-tag installer changes are identified separately.
+
+## Release Timeline
+
+Recent releases; the earlier version history continues below.
+
+| Version | Published (UTC) | Status | Delivered capability |
+|---------|-----------------|--------|----------------------|
+| [v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.36) | 2026-09-16 | **Release** | Windows/WAL recovery, contention and search fixes; six signed platform archives and matching GHCR images |
+| [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
+| [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
+| [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) | 2026-09-07 | **Release** | FrankenSQLite 0.3.18 and signed self-update manifest verification |
+
 ---
 
-## [Unreleased]
+## Unreleased
 
-## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-27 **[Release]**
+- **CLI commands discover a mailbox daemon's nondefault port.** Mail, inbox,
+  registration and other proxy commands use verified listener hints for the
+  mailbox's sole exclusive owner when no endpoint was explicitly configured.
+  Explicit endpoints retain precedence; failed requests report the verified
+  listener as a remediation hint. Dead or ambiguous listeners are ignored.
+  (#323)
+- **Browser health polling no longer runs slow snapshot work on HTTP workers.**
+  `/mail/ws-state` now uses the existing bounded mail dispatch pool and request
+  timeout. Saturated dispatch returns HTTP 503 while liveness remains available;
+  snapshot payloads and method/WebSocket rejection behavior are unchanged.
+  (`br-02zlk`)
+- **Failed staged health probes retain a small private diagnostic report.**
+  Doctor output includes the JSON report path after the temporary database
+  copy is removed. Reports preserve the failure reason and its conclusive or
+  inconclusive classification, cap text fields to keep each report below
+  32 KiB, and contain no database copy. A report-write failure does not change
+  the health verdict. The existing independent confirmation requirement before
+  reconstruction remains in place. ([GH #300](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/300); `br-fw21x`)
+- **The installers on `main` accept the release's documentation files.**
+  Signed DSR archives include `README.md` and `LICENSE` alongside the two
+  binaries. Bash and PowerShell now permit exactly those optional regular
+  files, while rejecting unexpected paths, duplicate entries, missing binaries,
+  and links. This correction follows the v0.3.36 tag: use the documented
+  installer URL on `main`, not the installer script frozen at that tag.
+
+## v0.3.36 — 2026-09-16 [Release]
+
+Changes after the [v0.3.35 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.35),
+reviewed through 2026-09-16 and published as six platform archives.
+
+### Fixed
+
+- **Filesystem and TUI regression tests use private, real fixtures.** Missing
+  paths no longer depend on host-global directories, permission-denial tests
+  drop root privileges before attempting writes, and healthy TUI snapshots
+  initialize a real database. Existing golden output remains unchanged.
+  ([tests](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eeff5d0f))
+- **Explicit sender credentials accept leading hyphens.** Generated tokens
+  beginning with `-` are now accepted as `--sender-token` values instead of
+  being parsed as command-line options. Following options still parse normally;
+  token validation and explicit-identity requirements are unchanged.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2a00d06b))
+- **Windows recovery can flush and reopen promoted databases.** Recovery now
+  opens directory and database flush handles with the write access Windows
+  requires, without truncating their contents. SQLite path validation waits
+  for a complete drive or UNC root before inspecting canonical verbatim
+  paths. Native Windows regressions cover repeated promotion, receipt failure
+  rollback, and preservation of a committed recovery generation.
+- **Backup retention follows the configured database.** Custom database
+  names and locations now receive the same inventory, verified-snapshot
+  pinning, and rotation as the default mailbox. Timestamped backups use their
+  recorded generation instead of copied filesystem modification times;
+  quarantine remains under the archive root and failed cross-device moves
+  leave the source backup intact.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/05682121))
+- **Recovery rollback preserves collisions and flushes every restored parent.**
+  A newly occupied original path is left untouched while independent files
+  are restored. A failed directory flush no longer prevents the remaining
+  restored parents from being flushed; failures are reported together.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9d46c65421e8ac5f8a04631d4e3a0d1a5e65effb))
+- **The pinned FrankenSQLite engine compiles on Windows.** Its namespace
+  generation probe now reads the synchronized file identity instead of comparing
+  the identity with its mutex. Native Windows namespace tests cover the fix;
+  the existing SQL and WAL compatibility changes remain in the dependency pin.
+  ([engine fix](https://github.com/Dicklesworthstone/frankensqlite/commit/2633b38a26bde68db23172b12aa402ed698cc309))
+- **Share snapshots preserve an occupied destination.** Publication now uses
+  an atomic no-clobber operation, retains the private completed image when
+  publication fails, and flushes the parent directory on Unix before reporting
+  success. Collision and durability failures remain explicit.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f0970cf0))
+- **End-to-end checks isolate their artifacts and mailbox state.** HTTP
+  subsuites write separate traces; guard fixtures respect active reservations;
+  macro sessions complete the MCP handshake and wait for actual responses.
+  Missing responses no longer count as successful macro calls.
+  ([HTTP](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c7a530a9),
+  [guard and macros](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/db4cade2))
+- **Stdio clients can propose newer MCP protocol versions.** Initialization
+  negotiates the supported version and leaves a usable session instead of
+  rejecting a valid proposal before negotiation. Malformed proposals and
+  messages mixing incompatible protocol eras still fail explicitly.
+  ([#321](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/321),
+  [implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb90c26c))
+- **Setup refuses to overwrite a token file changed during configuration.**
+  Token resolution retains the original file contents, identity, and parent
+  directory authority through the save. Concurrent edits, replacements, and
+  newly created files require a fresh setup attempt, including when the token
+  was supplied explicitly. Existing permission and Git-secret protections
+  remain enforced.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/feefb9bbd30c4b1782ac6b52c092d41a8b9ddc6b))
+- **Contended writes release their pool connection before retry backoff.**
+  Each retry acquires its own connection, allowing unrelated reads and writes
+  to use a small pool while the failed operation waits. Successful message
+  writes retain their connection for the post-commit consistency sample.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/69fe649a8704a40f11031d93e2b93a79f5cad9a0))
+- **Engine cursor-state errors no longer falsely block all writes.** Complete
+  recognized cursor-type diagnostics are engine limitations; explicit or mixed
+  corruption evidence still trips the breaker. WAL/SHM classification matches
+  complete tokens so a freelist "walk" is not mistaken for WAL damage.
+  ([#320](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/320))
+- **Prepared UPDATE and DELETE bind indexed predicates correctly.** The engine
+  numbers parameters before compiling reordered index probes, preventing a later
+  WHERE condition from using an earlier parameter's value. CREATE TABLE storage
+  also normalizes the prefix that canonical SQLite requires for ADD COLUMN,
+  preserving the original table body and expression parentheses.
+  ([engine fix](https://github.com/Dicklesworthstone/frankensqlite/commit/c76b22ec557344bf173f61e8f63580670d99ee62))
+- **Reservation reads remain available when corruption blocks writes.** The
+  six reservation lookup/list paths no longer apply the write breaker's
+  refusal. Reads still report errors and trip the breaker when they discover
+  corruption; reservation mutations remain blocked.
+  ([#319](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/319))
+- **Committed message retries do not depend on scanning the archive.** Matching
+  idempotency keys replay the original result even when IDs are exhausted or
+  a cold archive scan would fail. Fresh messages still validate the archive
+  and elect their ID transactionally, with the scan outside the transaction.
+- **Readiness responses do not wait for optional diagnostic refreshes.** Project
+  and message counts plus ATC sidecar checks refresh on the existing HTTP
+  runtime, with only one refresh in flight. Responses expose cached or unknown
+  values and sample age; failed refreshes do not make old counts appear fresh.
+  The database readiness checks remain required.
+- **Doctor reads committed WAL state without rebuilding away corruption.**
+  Unix probes can stage a live FrankenSQLite family through the engine's
+  shared file descriptors, retaining namespace and checkpoint locks while
+  checking source bytes and identity. Private canonical checks now see
+  WAL-only schema versions and damaged physical pages without releasing a
+  live writer's locks. Logical VACUUM exports remain separate and cannot
+  establish physical integrity.
+- **Deferred WAL commits remain visible after an external reader releases.**
+  The complete FrankenSQLite dependency family is pinned to immutable
+  revision `c76b22ec557344bf173f61e8f63580670d99ee62`, carrying the upstream WAL
+  lifetime repair while retaining Asupersync 0.4.9. Commits remain independent
+  of reader-blocked checkpoint completion; subsequent maintenance makes the
+  committed row visible to a fresh canonical reader.
+  ([upstream repair](https://github.com/Dicklesworthstone/frankensqlite/commit/fa6eebc318ee41230ecd7f85febce7a6f0f2326c))
+- **Read-only mailbox probes work alongside live writers and empty WALs.**
+  The engine binds an existing WAL under shared locks, admits protected empty
+  snapshots without writing reader marks, and distinguishes an active rollback
+  journal owner from an abandoned journal requiring recovery. Cold checkpoints
+  initialize through the normal recovery protocol. Migration completion also
+  initializes the WAL index before reporting success.
+- **VACUUM exports reopen as standalone read-only databases.** Exported images
+  carry the standalone journal header while preserving application and schema
+  metadata. Canonical import verification uses a private physical copy so it
+  cannot disturb the migrated database's native locks.
+- **Robot search refreshes a reconstructed mailbox's live lexical index.**
+  Native live mailboxes use guarded read-only database connections for the
+  refresh, while query results remain based on a private snapshot. If the
+  index writer is busy, search still returns those results with a refresh
+  warning and unavailable index health. A later successful refresh restores
+  health. Canonical and archive fallback snapshots cannot publish into the
+  live index.
+- **Search retries a rebuild interrupted by mailbox writes.** Interactive
+  lexical search retries when a source change invalidates an unpublished
+  backfill, with a bounded retry budget. The rejected writer is rolled back;
+  unrelated errors still fail immediately.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/30755f68db1ee7f674c239f46d791ef5d1e8c3a9))
+- **Relevance pagination recognizes its boundary after corpus growth.**
+  When the boundary message is still present, its ID anchors the next page
+  even if newly indexed messages changed its BM25 score. This prevents the
+  preceding page from replaying solely because those scores shifted.
+- **Explicit legacy paths cannot silently select a UTF-8 alias.** Import and
+  status commands reject non-UTF-8 source, destination, and resolved path
+  authorities before converting them to database or receipt strings.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/acdac5aa389be45d99603189214af67ed5b0830b))
+- **Failed imports retain the held mailbox lock while staging partial output.**
+  Retry readiness checks include leftover WAL/SHM files and validate retained
+  receipt directories. Partial archive contents are staged without moving the
+  activity lock; a retry is reported ready only when its target is usable.
+  ([retry checks](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d4ee8de9383192eb750f201269ac05f4d6a06f54),
+  [lock preservation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5766634ae01f0b71cb25077f91e551615d1b536c))
+- **Contact-response errors explain the request direction.** A missing directed
+  request now identifies the two agents and projects and explains which agent
+  belongs in `from_agent`. The tool does not retry the reverse direction or
+  approve a different request.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/58979629fe0b94b4d84a4fb6aeb25c1086fe4b18))
+- **Overview batches counts across projects.** `am robot overview`
+  replaces per-project message-count queries with one grouped query and counts
+  active reservations from one fleet-wide candidate scan. Release-ledger
+  filtering and orphan-project visibility are preserved. `--counts` uses the
+  same aggregation; separate CLI processes do not share the snapshot cache.
+  ([#274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
+- **Reconstruction dry-run validates a real candidate.** The doctor now
+  builds the same archive-and-salvage candidate as reconstruction in private
+  scratch space, checks full integrity and the promotion receipt's stable-key
+  continuity rules, and reports accepted candidate counts or an actionable
+  refusal. JSON output is a single document and refused previews exit nonzero.
+  The live database and archive remain untouched; promotion still revalidates
+  under its own locks.
+  ([#271](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/271))
+- **Starting a server preserves MCP client configuration.** Bare interactive
+  `am` and `am serve-http` no longer repoint existing project/user clients to a
+  temporary server. Use `am setup run` or the new `am serve-http --setup` flag
+  when client configuration should change.
+  ([#318](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/318))
+- **Verified CLI sends accept redacted delivery receipts.** The fail-closed
+  send profile could deliver a message and then report an unexpected response
+  shape. The CLI now recognizes native redacted receipts, keeps the message ID
+  and verification result, and omits message contents from its output.
+- **Offline agent registration uses the native identity workflow.**
+  `am agents register` now issues and persists a sender credential and archives
+  the agent profile, matching the server-backed path. Registration-proof and
+  mailbox-owner refusals remain enforced before local mutation.
+- **Reservation normalization recognizes authoritative project human keys.**
+  The doctor accepts an artifact's project slug or its matching database human
+  key, allowing proven legacy migration and stale-generation quarantine while
+  leaving unrelated project payloads untouched.
+  ([#271](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/271))
+- **Lexical search notices edits and deletions below the highest message ID.**
+  Transactional change counters invalidate stale hits and cached misses without
+  rescanning an unchanged mailbox. Append-only changes retain incremental
+  backfill; edits, deletions, and replaced source files rebuild the index.
+  A source changed during rebuilding cannot publish partial results or a fresh
+  completion marker. Older databases without counters use a pinned read and
+  content verification. This is the independent br-2xdhw implementation of the
+  problem discussed in [PR #316](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/316).
+  ([freshness implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8a0675864ea4c81ad25a41937c392e265ba95462))
+- **Private snapshots and concurrent mailboxes keep separate search contents.**
+  Snapshot searches use a private disk-backed Tantivy index, preserving lexical
+  syntax without rewriting the live index or its completion marker. Message
+  indexing now takes an explicit mailbox and committed message ID, rereads the
+  current row, and rejects updates for another source; delayed notifications
+  cannot overwrite newer text with a caller's stale copy.
+  ([source binding](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f2da49585d77bd98dadf1ba31f5050c9c2013c2a))
+- **Committed delivery does not wait behind a lexical rebuild.** Best-effort
+  indexing skips a busy index and invalidates cached search results. The durable
+  change counter lets the next search catch up from the committed mailbox.
+  Each backfill pass stops at its initial maximum message ID, so continuing
+  deliveries cannot make the scan follow an ever-growing tail.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1d87eacc512fcb6447986f624bd18787696d393b))
+- **`am doctor health` no longer fails on unusable diagnostic history.** A
+  stale `.doctor/latest` report that is zero-byte, truncated, or not a doctor
+  report at all used to abort the command with a bare
+  `parsing report.json: EOF while parsing a value at line 1 column 0` *after*
+  every live check had already passed, so a healthy mailbox reported a hard
+  failure with no path and no remedy. Unreadable history is now reported as
+  unknown rather than unhealthy: health names the offending report and how it
+  is damaged, falls back to the newest report that does parse, and lets only a
+  report it could actually read set the exit code. Recorded `actions.jsonl`
+  bytes are surfaced as crash evidence with an `am doctor undo <run> --dry-run`
+  inspection path, and nothing on disk is moved or removed — health stays a
+  read-only probe. A readable report carrying findings still exits 1, and a
+  `latest` run with no `report.json` at all keeps its existing exit 1 under
+  `fm-doctor-state-files-orphan-run-dirs`. `am doctor triage --json` gained
+  `report_usable` and now reports `total_findings: null` for a present but
+  unreadable report, instead of a `0` indistinguishable from a clean scan.
+  (GH#315)
+- **Setup detects OMP installations selected by runtime overrides.** Automatic
+  `am setup run` and `am setup status` now use the existing OMP configuration
+  resolver alongside the upstream filesystem detector. Installations selected
+  through `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, `OMP_PROFILE`, or `PI_PROFILE`
+  no longer need explicit `--agent omp` selection. Invalid active profiles are
+  reported as undetected without hiding other agents; explicit detector roots
+  and connector filters retain their behavior. The real-process regression
+  matrix runs on Unix; native Windows profile isolation remains unverified.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6b9e84541ac98dc391453f74ba3957e02f4eba9f),
+  [br-86hk0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1654))
+- **Configuration reset reloads user-file values and rejection state together.**
+  After replacing or repairing `config.env`, `Config::reset_cached()` starts a
+  new generation for both parsed settings and the file authority. In-flight
+  readers may finish with their old snapshot but cannot populate the new cache
+  with stale credentials. Existing `Config` clones retain their snapshots.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ce66a70cadc20de9baab37b1c348daeaa02934f5),
+  [br-e6oxx](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L2151))
+- **Observed in-place configuration rewrites are rejected.** User env-file
+  reads require repeated bounded byte reads and stable metadata, so retaining
+  the inode and restoring mtime no longer bypasses the generation check.
+  Rejection still suppresses stale legacy-file fallback. This detects observed
+  races; it does not lock out a writer that changes and restores bytes between
+  observations.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3e034b965c81e5e33152e8a6795af74f4ac1a905),
+  [br-sh712](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L2546))
+- **Secret-bearing setup files keep owner read/write access.** Native setup and
+  installer writers publish private `0600` files and backups, including when the
+  old file is read-only or group-readable. Permission repair also runs when
+  configuration content is unchanged. TOML installation uses the private
+  backup/replace helpers and checks source identity around the backup.
+  ([implementation](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9e4ee92a78f0c212b81c611b94019f41ac1a063),
+  [br-atwzh](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/ce66a70cadc20de9baab37b1c348daeaa02934f5/.beads/issues.jsonl#L1965))
+
+### Added
+
+- **Explicit sender-token selection for CLI deployments.** Set
+  `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1` to require a token supplied by
+  flag, file or environment and refuse persisted-identity token reuse. The
+  shared policy covers send, queued-send replay and contact handshakes;
+  automatic reuse remains the default. This is a CLI credential-selection
+  policy, not MCP session identity or isolation between processes sharing an
+  OS account.
+  ([#280](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/280))
+
+### Release verification
+
+- The final pre-version-bump workspace run passed **17,547 tests**, with
+  **36 existing skips** and no failures. The recorded source remained unchanged
+  throughout the run. Workspace/all-target check, strict Clippy, and formatting
+  checks passed. All six released targets passed runtime checks: native Linux
+  x86_64 GNU/musl, GNU ARM64 under QEMU, native Windows, native Apple Silicon,
+  and Intel Mac under Rosetta. Both container architectures passed 22 real
+  HTTP/persistence checks. Signed v0.3.35-to-v0.3.36 upgrade and forced reinstall
+  preserved the existing mailbox and archive. GitHub assets were downloaded
+  anonymously and verified against the established minisign key.
+- **Mac builds require macOS 13 or newer.** Zig crashed during final linking;
+  LLVM 22 successfully linked the preserved optimized objects through RCH.
+  The minimum matches the native dependencies' deployment target. Linux GNU
+  builds require glibc 2.28; the musl build is static. No GitHub Actions ran.
+- **Fresh-install tests preserve the doctor's actual exit status.** Healthy
+  output and reported findings are checked separately, and panic output cannot
+  pass as an expected findings exit. Structured traces retain both the actual
+  status and allowed status set.
+  ([exit assertions](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d2e6ae20a4a70f9199533442c6d818b32720491b),
+  [crash classification](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2a73f0f745803173ba82a3a36c6e412ade3c5598))
+- **Robot metrics have a live-server regression.** The integration test starts
+  a real HTTP server, sends MCP health calls, and checks that the metrics report
+  the live server as their source and include those calls. Offline fallback has
+  separate assertions.
+  ([regression](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a89eba7300b0d5d7113530c6245cd7bb34038dfb))
+
+## [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) — 2026-09-09 [Release]
+
+The tag was created at 04:12:42 UTC from
+[this source commit](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/56bb26d747ebd87bbb233d5a19cf268ade522d82).
+The GitHub Release was published at 05:54:10 UTC with six platform archives,
+checksums, a checksum signature, and the update manifest. Publication metadata
+was verified again on 2026-09-11; asset listing alone is not a new installation
+or platform-validation receipt.
+
+This patch closes the authorization gap left after PR #310: the agent
+lifecycle tools require the registration token when called over HTTP. It also
+carries the bounded tmux probe reader work that landed on `main` after
+v0.3.34 (8f1fec3f: stdout is drained within the child deadline without
+detached reader threads, and incomplete facts are discarded on timeout, I/O
+failure, or output over 1 MiB). FrankenSQLite remains pinned to 0.3.18 with
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1. The release configuration
+enables lexical search in portable binaries.
+
+### Security
+
+- **Lifecycle tools require the registration token over HTTP** (follow-up to
+  [PR #310](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/310),
+  option (c) of its review). `retire_agent`, `unretire_agent` and
+  `deregister_agent` accepted a tmux pane bound to the agent in place of the
+  `registration_token` on every transport. Over stdio that pane is the
+  caller's own; over `am serve-http` the pane id and — since GH#310 — the
+  tmux socket to look it up on arrive from the client (`X-Tmux-Pane` /
+  `X-Tmux-Socket` headers, or a body `pane_id`), so a remote caller that
+  named another agent's pane could retire or deregister that agent without
+  ever holding its token. Authorization is now decided by a per-transport
+  policy (`LifecycleAuthPolicy`): `TokenOrBoundPane` over stdio (unchanged),
+  `TokenRequired` over HTTP. The daemon stamps a transport-owned
+  `call_transport = "http"` argument on every lifecycle call it forwards,
+  overwriting any body value, and the tools treat an absent value as stdio;
+  a present-but-unknown value is an `INVALID_ARGUMENT` refusal, never a
+  downgrade. An HTTP call without a token is refused before any tmux probe
+  runs. The `AUTHENTICATION_REQUIRED` refusal now says which transport and
+  policy applied (`transport`, `policy`, `reason` = `token_required` /
+  `token_mismatch` / `no_bound_pane`) and where the token comes from (the
+  `registration_token` field of the register_agent / create_agent_identity /
+  macro_start_session response). A supplied-but-wrong token stays loud on
+  both transports; registration, `macro_start_session` reuse and
+  `resolve_pane_identity` keep using the caller's pane and socket exactly as
+  in v0.3.34. Tests: HTTP + bound pane without token is refused (and does not
+  probe), HTTP + valid token is allowed, stdio + bound pane is allowed, a
+  body-forged `stdio` transport is overwritten by the daemon, malformed
+  socket headers behave as before.
+
+### Also in this tag (landed on `main` after v0.3.34)
+
+- **Tmux probe readers are bounded** (8f1fec3f, closes the v0.3.34 known
+  issue): stdout is drained within the child deadline without detached reader
+  threads; on timeout, I/O failure, or output over 1 MiB the child is reaped
+  and the facts are discarded as unverifiable.
+- **Reservations fail closed on every unverifiable acquire** (404caf6d).
+- **Doctor/database recovery hardening** (br-l1q6z series): archive rebuilds
+  are promoted over a source whose `integrity_check` raises (GH#312), a
+  corrupt primary is recovered from the Git archive with the bytes
+  quarantined, doctor integrity stages a physical family copy under exclusive
+  FrankenSQLite namespace flocks so `VACUUM` cannot hide damage, index
+  key-order complaints are classified as index-only damage, crashed recovery
+  mutations stay on one breaker lineage, and proactive backups are reused
+  only when the verified generation is unchanged.
+- **No stale contact intro after auto-accept; `NOT_FOUND` is not a storage
+  failure** (GH#313, 708ae6ba). **Pre-push guard scan is bounded and batches
+  its git work** (PR #314, 4717f869). Archive mail UI is served without
+  SQLite and cancelled DB polls are refused (07c94443). Test fixtures are
+  isolated from process env and operator databases.
+
+## [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) — 2026-09-08 [Release]
+
+Published at 02:58:05 UTC from
+[the frozen release source](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0125f0505fa0ba604dbbbb580fad56d283e46488).
+This patch makes identity lookups return when tmux stalls and preserves network
+roots in Windows inbox snapshots. FrankenSQLite remains pinned to 0.3.18 with
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1; those dependency versions
+already shipped in v0.3.33. Portable binaries include lexical search.
+
+### Security
+
+- **Tmux identity probes have a deadline** (follow-up to
+  [PR #310](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/310)).
+  `X-Tmux-Socket` lets a caller steer the pane-facts queries at a socket of
+  its choosing, and those queries ran `tmux` through an unbounded
+  `Command::output()`. A socket held by a listener that accepts the
+  connection and never answers (`nc -lU /tmp/x`) therefore blocked the
+  identity tool call — and its dispatch slot — for as long as the listener
+  lived. Registration, `macro_start_session` reuse, lifecycle
+  authentication, `resolve_pane_identity`, bare/composite key normalization,
+  the GH#252 live-holder check and the record liveness probe now spawn
+  `tmux` with a 2 s deadline (`AM_TMUX_PROBE_TIMEOUT_MS`, clamped
+  50–60000): at the deadline the child is killed and reaped, a
+  `TMUX_PROBE_TIMEOUT` warning is logged, and the query reports pane facts
+  unavailable — the same degraded outcome as a missing `tmux` binary. A
+  liveness probe that times out is *unverifiable*, never *dead*, so a stalled
+  server can neither enable adoption nor a cleanup purge. The ambient probes
+  (the caller's own `$TMUX_PANE` composite lookup, stale-identity cleanup)
+  get the same bound. This bounds the caller's wait; the descendant-held stdout
+  reader limitation is recorded under known issues below.
+
+### Fixed
+
+- **Windows UNC roots survive SQLite URL round trips.** Ordinary and extended
+  network roots retain their leading separators, allowing read-only inbox
+  snapshots when temporary storage is on a UNC path. The regression covers
+  local SMB shares; it does not certify every network server or long-path
+  variant.
+
+- **`resolve_pane_identity` without a `pane_id` ignores the caller's tmux
+  socket.** The `$TMUX_PANE` fallback names this
+  process's own pane, on its own server; a caller-supplied
+  `tmux_socket_path` (or the daemon-injected `X-Tmux-Socket`) was
+  nevertheless used to resolve it, so the caller's server was asked about the
+  daemon's pane id and a colliding `%N` there could verify the wrong pane.
+  The socket now applies only to an explicit `pane_id`.
+
+### Distribution and upgrades
+
+- **Both binaries ship for six targets:** GNU Linux x86_64 and ARM64, static
+  musl x86_64, macOS ARM64 and Intel, and Windows x86_64 MSVC. GNU binaries
+  require glibc 2.28 or newer; Windows uses static CRT and system DLLs only.
+  Eleven flat archives, eleven checksum sidecars, a release manifest,
+  `SHA256SUMS`, and its minisign signature make 25 uploaded assets. Every draft
+  and public asset was independently downloaded and verified against the executed binary
+  hashes. GitHub's two automatic source archives are separate from that count.
+- **GHCR now publishes the same release binaries for amd64 and arm64** under
+  `v0.3.34`, `0.3.34`, `0.3`, and `latest`. Both images pass non-root HTTP
+  messaging and restart/archive checks; anonymous registry reads match the
+  tested image digests. The container recipe uses architecture-specific
+  BuildKit package-list caches outside the image layers. All builds and
+  publication used DSR/fleet tooling; GitHub Actions remained disabled.
+- **Homebrew and ACFS agree with the release.** The
+  [Homebrew update](https://github.com/Dicklesworthstone/homebrew-tap/commit/70888dea15d78e824814d5ada9f44e29c6f4dca1)
+  pins v0.3.34 and all four archive hashes. The required ACFS checksum refresh
+  passed; Agent Mail's unchanged public installer matches its existing pin.
+- **Signed upgrades preserve mailbox state.** The actual v0.3.33-to-v0.3.34
+  update and forced signed reinstall preserve existing messages, identities,
+  receipt rows, and archive bytes. A new message survives process exit and
+  reaches the archive. Fresh public Bash installs also pass on the build host
+  and a separate host. These are validation results for the existing signed
+  updater, which first shipped in v0.3.33.
+
+### Validation and known issues
+
+- Workspace/all-target `cargo check`, Clippy with warnings denied, and
+  `cargo fmt --check` pass. The focused identity/path selection passes 123
+  tests; doctests pass 4 with 21 ignored. The GNU binaries pass the canonical
+  nine-phase mail workflow with 42 assertions. Native Windows and macOS ARM64
+  checks pass; Intel macOS runs under Rosetta and Linux ARM64 under QEMU.
+- The pre-version-bump workspace gate ran 17,384 tests: 17,372 passed,
+  12 failed, and 37 were skipped. Two passing fixtures were reported as leaky.
+  All 12 failures also appear in v0.3.33's recorded gate; this is not an
+  all-green workspace claim. Failures cover integrity/lock handling, legacy
+  configuration, an external SQLite reader, archive HTTP error responses,
+  static export, and ATC learning. Final compiler, executable, and publication
+  evidence is summarized in the
+  [release record](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2266).
+- The previously tracked FrankenSQLite bound-UPDATE persistence,
+  ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader boundary
+  defects remain open. This release does not change the engine version.
+- Post-release source review found that a descendant retaining tmux's stdout
+  pipe can leave the detached reader alive after the caller times out.
+  [br-tl2sg](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2564)
+  remains open; the release tests do not prove reader cleanup in that case.
+- Native UNC checks exercise localhost SMB, not every network server or
+  long-path variant. The v0.3.33 comparison executable timed out on ordinary
+  UNC after local setup/readback succeeded; its extended-UNC case was not
+  reached. Homebrew syntax/formula validation passed; a fresh `brew install`
+  and the full PowerShell installer flow were not rerun.
+
+### Completed workstreams and representative commits
+
+The Windows path workstream
+[br-bzh9p](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2117)
+and distribution workstream
+[br-itacp](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0ca77962e81d52e2f51355dd496709d1a32efa7a/.beads/issues.jsonl#L2266)
+are closed. The tmux changes are follow-ups to PR #310, which closed before
+this release; the new reader-lifetime issue remains separate.
+
+**Representative commits:**
+[tmux deadlines and ambient socket routing](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/57bb812077082681a3b4764233ec37102bfacd6e),
+[Windows UNC round trips](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b8e6076d21fa7753af23df360bd9d7764324b3b8),
+and [container package-cache handling](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9a8c69b8de5feb85f5cea60a698f8bb1c6553db7).
+
+## [v0.3.33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.33) — 2026-09-07
+
+FrankenSQLite is pinned to **0.3.18**, up from **0.3.11** in v0.3.32. That
+engine line carries the page-allocator EOF-growth double-grant fix (0.3.16,
+the "page N double-referenced" corruption class recurring on v0.3.32 in
+GH#278), the GH#402 post-commit checkpoint rescan fix (0.3.14), and 0.3.18's
+rowid-seek planning for parameterized `rowid IN (?, …)` lists, GID-aware
+namespace-sidecar modes, and fail-closed byte-neutral read-only WAL readers.
+SQLModel 0.4.0, Asupersync 0.4.9, and FastMCP 0.7.1 remain pinned to the
+compatible runtime stack. The portable binaries include lexical search.
+
+### Known issues
+
+- FrankenSQLite 0.3.18 still reproduces the tracked bound-UPDATE persistence,
+  ADD COLUMN catalog-normalization, and foreign SQLite WAL-reader close/write-loss
+  probes. Those engine defects remain open. Validation results and limitations
+  accompany the release.
+
+- **Container-history correction, 2026-09-08:** this entry previously said
+  GHCR was frozen at v0.3.13. The retained pre-v0.3.34 registry inspection
+  reported v0.3.30; it does not establish when that image was published.
+  The [v0.3.34 release](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34)
+  subsequently published and verified matching amd64/arm64 images through
+  DSR/fleet tooling. The old frozen-image warning is no longer current.
+
+### Security
+
+- **`am self-update` now verifies the signed release manifest (GH#292).** The
+  updater used to compare the archive against an unsigned `SHA256SUMS`
+  fetched from the same place as the archive, which is weaker than the
+  installer's trust model and than "Downloaded and verified" implied. It now
+  downloads `SHA256SUMS.minisig` as well and verifies it over the exact
+  manifest bytes with a pure-Rust minisign verifier (ed25519 + BLAKE2b, no
+  `minisign` executable required) against the maintainer release key embedded
+  in the binary (id `1BBD79B28BF718D0`, the key pinned in the installers).
+  Only an authenticated manifest is consulted for the archive digest. A
+  missing signature, a tampered manifest or trusted comment, an unknown
+  signing key, or a checksum mismatch aborts the update before any binary is
+  replaced. The trusted key set is a list so a future key rotation can trust
+  old and new keys across a transition. Debug builds accept
+  `AM_SELF_UPDATE_MINISIGN_PUBKEY` for the mocked E2E suite; release builds
+  refuse to run the updater when that variable is set.
+
+### Added
+
+- **Small archive-ahead deltas are applied in place instead of rebuilding the
+  mailbox (GH#284).** When the Git archive is a few messages ahead of a
+  canonically healthy database, startup used to reconstruct the entire
+  mailbox into a candidate and promote it, which on a large mailbox was a
+  full rebuild for a one-row difference and could trip the promotion guard
+  for unrelated reasons (GH#271). The pool's archive-ahead reconcile and the
+  cli startup self-heal now first ingest only the missing archive messages
+  (with any project or agent rows they need) through the runtime engine in
+  one transaction on the live file, reusing the reconstruct's importers and
+  its canonical-id free-slot checks. The path refuses without writing when
+  the delta is not the simple case: more than
+  `AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES` missing messages (default 64, `0`
+  disables), an archive file that does not parse, or a canonical id already
+  held by a different live message; those cases still reconstruct.
+- **`resource://tooling/recent/{window_seconds}` returns real activity.** The
+  server's tool dispatch wrapper now records every finished call (tool,
+  `project_key`, `agent_name`, latency, ok/error/rejected) into a bounded
+  in-memory ring of the last 512 calls, and the resource reads that ring:
+  `?agent=` and `?project=` filter by exact argument value, `?limit=` caps the
+  entries (default 100), `format=json` stays a no-op, anything else is
+  refused with `InvalidParams`, and a window outside 1..=604800 seconds is
+  refused instead of silently returning nothing. The ring is per process and
+  not persisted across restarts. Previously the resource parsed its
+  parameters and always returned `count: 0` (br-ciwph). The Python-parity
+  fixture case now pins the filter semantics (an unknown agent yields no
+  entries) instead of the old always-empty result.
+- **The seven `?{query}` aliases of the static tooling and config resources
+  refuse unsupported parameters.** `resource://config/environment`,
+  `tooling/directory`, `tooling/schemas`, `tooling/metrics`,
+  `tooling/metrics_core`, `tooling/diagnostics`, and `tooling/locks` used to
+  parse the query and discard it. They now accept only the documented
+  `format=json` and return `InvalidParams` naming the offending key for
+  anything else, so a caller passing `?project=` learns it did nothing.
+  `resource://tooling/schemas?cluster=<name>` is the one real filter: it
+  narrows the schema map to that cluster and refuses unknown cluster names
+  with the known list. `tooling/metrics` and `tooling/metrics_core` keep
+  accepting `?window=<seconds>` (their counters are cumulative since process
+  start) and now report it back as `window_seconds` with
+  `window_applied: false` and a note pointing at `tooling/recent`, instead
+  of dropping it silently.
+
+- **`am robot handoff --max-seconds <n>` (default 20) with honest partial
+  output.** The dashboard used to run one `messages LEFT JOIN
+  message_recipients` aggregate per in-progress bead; FrankenSQLite executes
+  that join as a whole-table nested loop, so on a 40k-message mailbox the
+  command produced no output inside a 600 s timeout. The mail state is now
+  gathered in two batched, join-free `IN (...)` lookups with the exact
+  `LEFT JOIN` semantics reproduced in Rust (proven against the old SQL as an
+  oracle), the `.beads/issues.jsonl` parse skips non-`in_progress` records
+  before decoding them, and a wall-clock budget stops the enrichment loop
+  with `summary.scanned` / `summary.truncated_by_budget` plus a warn alert
+  instead of hanging. Measured on the reference mailbox (16 projects, 697
+  agents, 40,422 messages, 66 in-progress beads): 0.30 s end to end.
+- **`am doctor capabilities --json` and `am doctor triage --json` are
+  accepted.** Both outputs were already JSON, but the flag the agent handbook,
+  AGENTS.md, and `triage.capabilities_url` all advertised was a usage error.
+- **Real MCP descriptions for `install_precommit_guard` and
+  `uninstall_precommit_guard`.** Both tools shipped with an empty
+  `description`, so every MCP client listed them without any guidance.
+- **The doc-drift guard now pins the `am doctor` verb count, the `am robot`
+  subcommand count, and the TUI theme count** straight from the clap tree and
+  `NAMED_THEME_COUNT`, so README/AGENTS tables can no longer drift from the
+  shipped CLI surface the way they had (8 documented doctor verbs of 28,
+  robot counted as 16/17/18, 5 themes of 42).
+
+- **`am doctor vacuum` — supported in-DB reclaim for orphaned pages (GH#289).**
+  An archive reconstruct could leave the promoted database with a majority of
+  its pages orphaned (`Page N: never used`, `freelist_count=0`) — pure
+  space-accounting waste with no supported way to reclaim it, so a successful
+  recovery ended in a permanently unhealthy-looking mailbox. The new verb runs
+  the same supervised-owner protocol as `repair` (drain first, `--take-ownership`
+  for provably dead owners, `--allow-live-owner` escape hatch), VACUUMs and
+  ANALYZEs the mailbox in place, and reports before/after page counts and the
+  typed integrity class. `--dry-run` previews read-only (allowed while a live
+  owner holds the mailbox); structural damage refuses the vacuum and routes to
+  `reconstruct` instead.
+
+- **Typed integrity classes in doctor health/triage (GH#286).** `am doctor
+  health` and `triage` reported one identical P0 "needs reconstruct" verdict
+  for a database with only leaked/orphaned pages (every b-tree and index
+  intact, every row readable) and for genuine structural damage, so alert
+  rules were either permanently noisy or blind. Integrity-check failures now
+  classify as `leaked_pages_only` / `index_only` / `structural` (with
+  `leaked_pages`, `structural_errors`, and `first_structural_error` fields on
+  the triage finding). Leaked-pages-only reports as a distinct **degraded**
+  P2 finding (`live-mailbox-leaked-pages`) recommending `am doctor vacuum`,
+  and `am doctor health` exits 0 for it; structural damage keeps the P0
+  reconstruct verdict, now annotated with the class counts.
+
+### Fixed
+
+- **Windows snapshot readers use the existing SQLite path encoder.** Canonical
+  temporary paths contain a `\\?\` prefix; directly interpolating them into a
+  SQLite URL left an extra leading slash in the parsed filesystem path. Inbox,
+  search, product, and ATC snapshot pools now use `sqlite_url_from_path` to open
+  the intended private database.
+- **Health-verdict caching compiles on Windows and retains real file identity.**
+  The metadata stamp now uses Windows volume and file-index information instead
+  of unconditionally importing Unix APIs. Missing identity declines reuse.
+  A native Windows regression checks that replacement invalidates the stamp
+  even when the replacement has the same size and modification time.
+- **Offline CLI commands drain queued archive writes before process exit.**
+  Ordinary sends previously returned success with a persisted SQLite row but
+  could exit before writing its archive artifact. CLI shutdown now drains the
+  existing write queue and commit coalescer. Contact-handshake welcomes also
+  drain while retaining the macro's mailbox mutation locks. The real workflow
+  checks ordinary sends and welcomes against SQLite and archive files after
+  their CLI processes exit.
+- **Read and acknowledgement replies require actual stored integer receipts.**
+  Suppressed writes return an error and roll back inbox statistics instead of
+  inventing a timestamp or leaving an idempotent success record. Real-engine
+  trigger coverage exercises read, acknowledgement, and acknowledgement of an
+  already-read message.
+- **Synchronous inbox-stat rebuilding uses the existing primary-key JOIN.**
+  Empty inboxes, orphan recipients, pending acknowledgements and rollback
+  semantics remain covered by eight real-engine regressions. No measured
+  performance improvement is claimed.
+- **The allocator regression returns its only pooled connection before the
+  next message creation.** This removes a test-owned acquisition deadlock
+  while retaining the durable sequence and shared allocator assertions.
+
+- **Reconcile-on-read converges after healing a prior-generation reservation
+  artifact (GH#311 follow-up).** The reservation read path resolved a row's
+  archive artifact with the generation-blind `find_reservation_artifact`,
+  whose tie-break among stamped names is the lexicographically smallest. Once
+  a foreign-only row had been healed by re-emitting it under the live
+  generation, both `id-<id>-g<foreign>.json` and `id-<id>-g<live>.json`
+  coexisted and — whenever the superseded token sorted first — every later
+  `file_reservation_paths` call resolved the foreign artifact again, rewrote
+  the identical live artifact and enqueued another archive commit. The active
+  and released healers now read through the generation-aware
+  `read_project_archive_reservation_for_generation` (live-generation or legacy
+  artifact first, blind fallback only when that is the row's sole coverage),
+  so the second read resolves the healed artifact and the heal stops.
+- **The reservation parity fixer reconciles the artifact the detector flagged,
+  never prior-generation history (GH#311).** `am doctor fix --only
+  fm-db-state-files-reservation-db-archive-parity` resolved the archive
+  artifact to rewrite with the generation-blind `find_reservation_artifact`,
+  which prefers *any* `id-<id>-g<generation>.json` — including debris from a
+  superseded DB generation that the detector had explicitly excluded from
+  comparison. With a released live row, a stale legacy `id-<id>.json` and a
+  foreign-generation artifact sharing the id, one pass rewrote the foreign
+  artifact's `released_ts` representation, left the legacy artifact unchanged
+  and reported `actions_taken: 1` while the drift persisted. The parity report
+  now carries the `live_generation` the detector attributed artifacts against,
+  and the fixer (release rewrite and GH#167 collision quarantine alike)
+  resolves through the new generation-aware
+  `find_reservation_artifact_for_generation`: current-generation or legacy
+  artifact only, foreign artifacts left byte-identical, and an explicit skip
+  when the flagged file cannot be identified unambiguously (an unseeded
+  generation with several stamped candidates). A legacy-named artifact whose
+  embedded `db_generation` is foreign is refused the same way. Regression
+  coverage: released row + stale legacy + foreign stamped id → only the legacy
+  artifact changes, the foreign bytes are identical, and the second detector
+  pass is clean.
+- **`am doctor fix --only <fm-id>` exits with the envelope's `exit_code`
+  (GH#311).** The JSON envelope already reported `ok: false, exit_code: 1`
+  when findings survived the fix, but the process exited 0, so shell callers
+  had to parse the JSON to notice. The process now exits `1`
+  (`findings_present_no_fix`: findings remain, nothing mutated) or `2`
+  (`fix_partial`: actions taken, findings remain) per the published
+  `am doctor capabilities` exit table; `--dry-run` and a clean post-fix
+  detection still exit 0. Documented in `--help` and the robot handbook.
+- **Pane identity lookups run on the caller's tmux server, not the daemon's
+  (GH#310).** tmux pane ids are only unique per server. The `am` CLI sent only
+  `X-Tmux-Pane: %N` and the `serve-http` daemon queried `%N` on its own
+  ambient tmux, so a caller under a different server (a `-L`/`-S` socket, an
+  orchestrator's private tmux) whose `%N` collided with a pane on the daemon's
+  server got a *verified* identity binding for the wrong pane; a
+  non-colliding id merely degraded to `legacy-unverified`. The CLI now also
+  sends `X-Tmux-Socket` (the first `$TMUX` field, validated to an absolute,
+  bounded, CR/LF/NUL-free path — malformed values omit the header rather than
+  failing the request), the daemon validates it and injects it as the
+  transport-owned `tmux_socket_path` argument of the identity tools (any
+  body-supplied value is discarded over HTTP), and every pane-facts query —
+  registration, `macro_start_session` reuse, lifecycle authentication,
+  `resolve_pane_identity`, bare/composite normalization and the GH#252
+  live-holder check — runs `tmux -S <socket>` when present. Without `$TMUX`
+  nothing changes.
+- **Canonical schema init no longer fails on a pre-v27/v28 database.** The
+  CLI ran the whole base DDL blob before migrations, so on a Python-era or
+  pre-v27/v28 mailbox it created `idx_messages_project_topic` and
+  `idx_agents_project_active` before the v27/v28 migrations could add
+  `messages.topic` and `agents.retired_at`, and stopped with "no such
+  column". The migration ledger already defers those two derived index
+  statements behind their column migrations; canonical init now executes
+  the base DDL without them
+  (`schema::init_schema_sql_base_deferring_column_dependent_indexes`) and
+  the deferred migrations create the indexes once the columns exist. The
+  base DDL and the recorded migration ids are unchanged.
+- **Automatic SQLite-family cleanup drains writers before it opens the
+  recovery-breaker election file.** A cleanup refused because this process's
+  writers did not drain left a `<db>.am-recovery-breaker.lock` beside a
+  family it never touched. The tripped-breaker refusal stays first as a
+  pure read, the writer drain runs next, and only then does admission open
+  the election lock and re-evaluate the breaker under it.
+- **ATC explain and simulate validate a source before taking the mailbox
+  activity lock.** Both readers acquired the shared SQLite activity lock
+  first, so pointing them at a file that is not a database left a
+  `<db>.activity.lock` artifact beside it. The metadata and header checks
+  now run before the lock, through a no-follow descriptor that stays open
+  until the read connection has closed.
+- **The startup dashboard lists agents from a degraded or pre-v28 mailbox.**
+  Its agents query referenced `agents.retired_at` and the deregistration
+  ledger unconditionally, so a database lacking either returned no agents
+  at all; the query now includes each filter only when the schema has it.
+- **The CLI's explicit project lookup no longer attaches a distinct path to
+  a slug-colliding project.** The database human-key lookup gained a
+  stable-slug fallback for absolute keys (so reads find the row
+  `ensure_project` would reuse), which silently defeated the identity guard
+  in `get_project_record`: `am products link --project /x/repo/a/b` resolved
+  the registered `/x/repo/a-b`, and a case variant of a registered path
+  resolved on a case-sensitive filesystem. The lookup is now layered
+  (`queries::get_project_by_human_key_exact` without the fallback, and
+  `get_project_by_human_key` with it); the CLI's explicit lookup uses the
+  exact layer.
+- **Doctor salvage considers a backup the runtime engine wrote.** Salvage
+  candidate discovery reused the restore rule that requires a standalone
+  main file, which excluded a `.bak` carrying its FrankenSQLite namespace
+  pair; the current database's failure was then reported as the only
+  candidate. Salvage reads through a private canonical copy, so only
+  journal/WAL companions disqualify a candidate now
+  (`pool::sqlite_salvage_read_candidates`).
+- **Archive save and share export read a family whose live open is refused
+  for a damaged sidecar.** When the guarded live open refused a mailbox for
+  a recovery-classified sidecar (truncated or header-only WAL, stale SHM) and
+  no archive authority existed, the command failed. The snapshot source now
+  falls back to a private no-follow copy of the whole family, settled and
+  read through canonical SQLite; the live family is never opened, written,
+  or cleaned.
+- **Backup restore lands again when a sidecar slot holds junk.** A directory,
+  device, FIFO, or symlink squatting in the live family's `-wal`, `-shm`,
+  `-journal`, or namespace slot made `am doctor restore` (and every other
+  recovery promotion) fail with "source is missing or its SQLite family
+  contains a non-regular object": the recovery receipt stages the source
+  generation before promotion and is deliberately fail-closed on a
+  non-regular family member. Promotion now retires such objects by rename
+  (the usual `<sidecar>.corrupt-<timestamp>` quarantine name, never deleted)
+  before the receipt looks, while regular sidecars stay in place for the
+  receipt to account for.
+- **The pre-commit guard no longer honors a superseded foreign-generation
+  reservation artifact (GH#299).** After a mailbox rebuild the archive can hold
+  `id-<id>-g<old>.json` with `released_ts: null` from the previous database
+  generation next to `id-<id>-g<current>.json` released under the current one.
+  The guard treated the old artifact as an active reservation and refused
+  unrelated commits until its `expires_ts` passed (100+ ids on one recovered
+  archive). A same-id released artifact from another generation that is at
+  least as recent now supersedes the unreleased twin; an old-generation
+  artifact with no released twin stays active. `am doctor archive-normalize`
+  already quarantines foreign-generation artifacts when it can read the
+  live database's generation; when that diagnostic open is refused or the
+  database carries no generation it now says so (a warning and a
+  `reservation_artifact_detection_skipped` list in `--json`) instead of
+  reporting zero reservation actions as if there were nothing to do.
+- **Doctor's file-sanity failure says which probe failed (GH#300).** The
+  staged health probes answered "unhealthy" without a reason, so
+  `am doctor check` reported an opaque `possible corruption` and recommended
+  stop-and-reconstruct. Each probe branch now records its reason (the primary
+  engine's leading integrity rows, the canonical compatibility probe's error,
+  a failed open, a missing or non-regular family member), the staged probe
+  re-keys it under the live path and marks it as a private-copy probe, and the
+  doctor detail includes it with a pointer to confirm with `am doctor health`
+  before reconstructing. `health_check` also lists every input behind its
+  `health_level` (`health_level_contributors`: verdict roll-up, live
+  pressure, archive lag, coalescer tail latency, deleted executable), so a
+  red top level that no decomposed verdict explains is attributable instead
+  of looking like flapping aggregation.
+- **Auto-registered recipients get an archived profile, and the
+  `send_message` description says so (GH#301).** A send to an unregistered
+  recipient in the same project auto-registers a placeholder agent
+  (program/model `unknown`) when `MESSAGING_AUTO_REGISTER_RECIPIENTS` is on and
+  the registration proof gate is off. The placeholder was DB-only, so DB and
+  archive agent inventories drifted by one and a reconstruct could not recreate
+  it. The same profile shape `register_agent` archives is now written for it,
+  and the tool description no longer claims unknown recipients fail fast.
+- **`am` reads no longer refuse a mailbox that lacks FrankenSQLite namespace
+  sidecars (br-vhxdc).** The CLI's live read-only opener (startup banner,
+  pre-open health probe, sync mailbox reads, doctor source selection, robot
+  mailbox and attachment reads, migration format detection, agent-start
+  reservation checks) now goes through the engine-dispatching guarded opener:
+  FrankenSQLite when the family carries its namespace pair, canonical
+  SQLite's true read-only flags otherwise. A mailbox last written by canonical
+  SQLite, restored from a `.bak`, or produced by archive reconstruction was
+  previously refused with "a complete pre-existing namespace sidecar pair is
+  required". The schema, health, project, and timestamp-format probes on
+  those paths are generic over the connection engine.
+- **Database-path policy sees the configured spelling again.** Since the
+  mailbox-identity work, the shared path helpers the cli and the server
+  used for opening and validating the database returned the frozen identity
+  (symlinks followed, relative spellings anchored to the current directory),
+  so the startup probes' "must not be a symlink" checks and the cli's
+  regular-file checks were validating the resolved target instead of what
+  the operator configured, and explicit relative spellings were rewritten.
+  `ResolvedMailboxSqlitePath` now carries `selected_path` (spelling after
+  only the legacy absolute fallback) beside `canonical_path` (identity), and
+  the cli runtime resolver and the server URL resolver use the spelling.
+  Registry keys still use the identity. The pool likewise freezes the
+  configured storage-root spelling beside its identity and hands the
+  spelling to archive recovery and reconcile, so a symlinked storage root is
+  refused as archive authority again instead of being followed to wherever
+  the link points.
+- **`DATABASE_POOL_TIMEOUT` means seconds everywhere (GH#245 follow-up).** The
+  tool-call pools parsed the variable as milliseconds while the server
+  readiness path and the operator runbook treated it as seconds, so
+  `DATABASE_POOL_TIMEOUT=30` gave every tool-call pool a 30 ms acquire wait.
+  Both paths now share one interpretation: seconds, with values of 1000 or
+  more read as milliseconds so a setting that followed the old code comment
+  keeps its meaning. The runbook default is corrected to the shipped 10 s.
+- **`am doctor` reads a resting WAL family without touching it (br-s9d8a).**
+  A database left with WAL/SHM sidecars by a canonical or Python-era writer
+  and no live owner could not be read by the guarded read-only canonical
+  opener: WAL recovery needs a writable SHM, the read-only SHM policy turned
+  the open into SQLITE_CANTOPEN, and because the open was lazy the failure
+  surfaced only on the first query, so no fallback ever ran. `am doctor
+  health` reported a healthy mailbox as "Database open probe failed" and
+  the fixers' read-only probes declined. The opener now probes eagerly so a
+  refusal is an open error; a family with no WAL and no SHM is opened
+  `immutable=1` (no locks, no sidecars created beside it); and both the
+  doctor's canonical source selection and the explicit-offline candidate
+  fall back to the same private staged copy the health probe uses, which
+  applies the WAL inside the copy and leaves the source bytes alone.
+- **Startup self-heal can diagnose index-only corruption again instead of
+  reconstructing from the archive.** Recovery admission arms the durable
+  circuit breaker with a provisional failure before an attempt runs. The
+  FrankenSQLite guarded opener already let the attempt's own read-only
+  probes pass through that arming, but the offline canonical opener did not,
+  so every canonical probe issued from inside the admitted attempt (the
+  index-only REINDEX classifier and the double-probe cross-check) was refused
+  as "recovery-breaker state records 1 failed attempt(s)". The in-place
+  REINDEX fast path (br-mdfpz, the fix for the nine-day crash loop on the
+  csd host) therefore never fired under startup self-heal and every
+  index-only case fell through to archive reconstruction. The canonical
+  opener now consults the same admission guard; outside the attempt the
+  armed breaker still refuses.
+- **`AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES` and
+  `AM_RECOVERY_BREAKER_COOLDOWN_SECS` are read through the same process-env
+  layer as every other `AM_*` knob.** They were read with a raw
+  `std::env::var`, so values supplied through the configuration override
+  layer were ignored.
+- **`sqlite:` URL contract written down and the tool-metrics worker follows
+  it (br-z73au).** The three-slash form names an absolute path, the same as
+  four slashes; a working-directory-relative database must be spelled
+  `sqlite:///./x.sqlite3` or `sqlite://x.sqlite3`. A missing relative target
+  is never replaced by an absolute file that shares its suffix; only a
+  relative file that exists but is unhealthy next to a healthy `/<same>`
+  triggers the legacy absolute fallback. The contract is documented on the
+  parser and in the operator runbook. The tool-metrics persistence worker
+  used to be tested against the opposite expectation (adopt the absolute
+  file); it persists into the runtime's database, and its test now says so.
+  Seven fixtures that spelled relative targets with three slashes now use
+  the explicit form, and two search-side tests are renamed to describe the
+  behaviour they actually pin.
+- **Startup no longer pays the staged FrankenSQLite health check three times
+  (br-eru3j).** Every staged health probe copies the SQLite family into a
+  private tempdir and runs the FrankenSQLite quick check on the copy; on a
+  163 MB mailbox that check alone takes 8-13 s under fsqlite 0.3.14, and a
+  server start ran it for the startup integrity probe, the pool-init probe,
+  and the first `health_check` within seconds of each other (measured
+  `initialize` 16-19 s, first tool call 8 s). A healthy verdict is now kept
+  for 30 s keyed by the family's metadata (main file device/inode/length/
+  mtime, WAL/journal/cert length+mtime, shm and namespace sidecar
+  presence+length) and reused while nothing changed, so the check runs once
+  per start. Any write invalidates it, unhealthy verdicts are never kept, and
+  `AM_HEALTH_VERDICT_REUSE_SECS=0` disables the reuse (max 600). The
+  per-validation-unit thread storm inside fsqlite's quick check itself is an
+  upstream defect and remains.
+- **A healthy live database keeps serving when its archive-ahead reconcile
+  fails (br-bgwj1, br-plksu).** Startup and pool initialization reconcile a
+  healthy primary against an archive that is ahead of it by rebuilding a
+  candidate from the archive and promoting it. When that reconstruction or
+  promotion failed (a recovery-receipt refusal over duplicate reservation
+  artifacts, a writer that would not drain, an unwritable directory), the
+  error propagated out of the integrity probe and the process exited 1 into
+  a systemd restart loop, even though the live database had just passed its
+  health check. The failure is now caught at the reconstruction step: if the
+  primary is still healthy afterwards the server keeps serving it, the drift
+  is recorded as pending for the periodic retry and `am doctor health`, and a
+  warning names the retry path (`am doctor reconstruct --yes`). Only a
+  primary that is no longer healthy after the attempt still fails startup.
+  Policy refusals that run before the reconstruction (read-only intent,
+  symlinked paths, a tripped breaker, a live owner) are unchanged and stay
+  fatal.
+- **A failed archive-drift reconcile no longer arms the recovery breaker
+  (br-plksu).** The drift reconcile of a healthy primary now runs under the
+  mutation-only admission (it still refuses to run concurrently with a real
+  recovery) instead of the outcome-recording admission, so its failures
+  cannot count toward tripping the breaker against a database that was never
+  unhealthy. Regression tests cover both behaviours.
+
+- **Read-only diagnostics can open a database that was never
+  Franken-admitted.** Every read-only consumer (mailbox inventory, the
+  startup consistency probe, the integrity and schema-population verdicts,
+  the archive verifier, the reconstruction message-id inventory, the live
+  salvage export, `am doctor vacuum` statistics and the doctor integrity
+  classification probe) called the bound FrankenSQLite opener directly,
+  which requires the `-fsqlite-ns-gate`/`-fsqlite-ns-use` pair. A family
+  last written by canonical SQLite, restored from a `.bak`, or produced by
+  archive reconstruction has no such pair, so every one of those paths
+  failed with "a complete pre-existing namespace sidecar pair is required"
+  and, in particular, archive-ahead recovery of a reconstructed primary could
+  never reconcile. `pool::open_guarded_read_only_sqlite_file` now inspects
+  the namespace pair once and dispatches: complete pair → the same
+  FrankenSQLite opener, no pair → canonical SQLite's true read-only flags, a
+  half pair → an explicit refusal. Neither engine's own refusal paths are
+  bypassed, and a family that changes engines mid-admission gets exactly one
+  re-dispatch. The live-salvage materializer and the proactive-backup export
+  materialize a sidecar-less source through canonical SQLite (source bytes
+  untouched) instead of refusing it.
+- **A restored or reconstructed primary no longer carries the replaced
+  generation's FrankenSQLite namespace records.** Promotion quarantined the
+  old journal/WAL/SHM companions but left `-fsqlite-ns-gate`/`-fsqlite-ns-use`
+  beside the new bytes, so the strict read-only opener refused the promoted
+  family ("namespace record names a different database generation") and the
+  post-restore archive reconcile failed. The namespace pair is now retired by
+  rename with the quarantined generation (never unlinked); the runtime's next
+  writer-capable open re-admits the family. A salvage source whose main file
+  is shorter than the SQLite header is classified as corruption, so recovery
+  degrades to an archive-only rebuild instead of blocking on it.
+- **`am doctor` chooses its diagnostic source by namespace authority, and
+  `am doctor reconstruct` can salvage the current database.** A family
+  without a FrankenSQLite namespace pair is opened directly by the offline
+  canonical opener (a physical proof); only a Franken-admitted family goes
+  through the guarded logical snapshot, whose verdict is by design at most
+  "inconclusive" about the physical b-tree. The doctor's private `VACUUM
+  INTO` snapshot is neutralized (namespace records retired, WAL folded)
+  before the private-salvage validators see it, and the full-integrity
+  validator checks a Franken-admitted quarantined artifact through
+  FrankenSQLite instead of refusing a cross-engine open. The HTTP readiness
+  probe, the integrity-guard cross-count and the tool-metrics observer use
+  the same dispatching opener, so readiness after an archive-backed reconcile
+  no longer fails with the namespace-pair refusal. A symlinked storage root
+  is never archive authority for the pre-init reconcile, matching the
+  startup probe and reconstruct.
+- **The Config-level default-archive guard no longer panics under
+  cargo-nextest.** The refusal added for br-99aih fired whenever a test
+  merely constructed a `Config` from the ambient env under a harness marker,
+  which under nextest (the release gate, which exports `NEXTEST_RUN_ID` into
+  every test process) failed hundreds of unit tests that never touch the
+  archive. `Config::from_env` is back to a warning with guidance
+  (`AM_STRICT_HOME_STORAGE_GUARD=1` upgrades it to a panic); the fail-closed
+  protection is the storage crate's archive funnel, which still refuses to
+  initialize the operator's real archive from any test harness.
+- **`am doctor health` / `triage` no longer report a false P0 "cannot open
+  database, reconstruct" on a healthy live mailbox.** The doctor's canonical
+  diagnostic source had two branches: a `VACUUM INTO` snapshot through the
+  read-only FrankenSQLite connection, and a cross-engine canonical open that
+  is refused outright for any Franken-admitted family (the `-fsqlite-ns-*`
+  sidecars every live mailbox carries). When the snapshot failed on a hot WAL
+  the composite error was truncated to 160 characters and the verdict was
+  "reconstruct". The doctor now has a third source — the same byte-neutral
+  staged family copy `am robot health` already used for `db_file_sanity`,
+  opened read-write on the private copy so WAL frames recover — and the
+  refusal detail keeps both underlying causes readable. Verified on the
+  reference host: the P0 vanished and the doctor reported the mailbox's real
+  reservation-parity drift instead.
+- **Recovery no longer poisons itself (br-plksu).** Automatic recovery
+  admission arms the durable recovery breaker with a provisional failure
+  record before running the attempt; the attempt's own live-salvage
+  read-only open then refused itself because the breaker was "nonclean",
+  recorded a real failure, and readiness crash-looped a healthy database
+  until an operator hand-cleared the sidecar. The Franken read-only preflight
+  now recognizes an open issued from inside its own admitted recovery
+  attempt and proceeds (unrelated readers are still refused).
+- **`am doctor drain` / `locks` no longer count a transient read-only CLI
+  reader as a second mailbox owner.** Ownership is now decided by an
+  exclusive activity lock or a `serve-*` command line; processes that merely
+  have the database file open are reported as readers. Previously a
+  concurrent `am robot handoff` flipped the verdict to split-brain /
+  unsafe-to-touch and blocked every supervised repair.
+- **Workspace tests can no longer write into the live default mailbox
+  archive (br-99aih).** Thirteen tests overrode only `XDG_DATA_HOME` while
+  the legacy `$HOME/.mcp_agent_mail_git_mailbox_repo` branch wins whenever it
+  exists, so on any host that has run the daemon they wrote junk projects
+  into production and later triggered an archive-ahead reconcile. The
+  storage crate's archive-root funnel (every archive write passes through
+  it) now refuses to initialize the default root from any cargo / nextest /
+  insta harness (escape hatch `AM_ALLOW_HOME_STORAGE_ROOT=1`),
+  `Config::from_env` warns with guidance under the same predicate, a shared
+  `with_isolated_default_storage_root_for_test` helper redirects
+  `HOME`/`XDG_DATA_HOME`, and the leaking tests use it.
+- **`am robot metrics` no longer prints zeros from the CLI's own process
+  counters.** It reads `resource://tooling/metrics` from the running server
+  (which now carries per-tool latency) and labels the payload
+  `source: "live-server"`; without a reachable server it reports
+  `source: "local-process"` with an explicit alert instead of fabricated
+  numbers.
+- **Archive-ahead recovery could never promote a live-salvaged candidate.**
+  `materialize_live_franken_salvage` ran `VACUUM INTO` through the guarded
+  FrankenSQLite source connection, which left `-fsqlite-ns-gate` /
+  `-fsqlite-ns-use` namespace sidecars beside the process-private artifact;
+  every downstream validator opens that artifact through the guarded
+  canonical opener, which refuses any Franken-admitted path outright, so the
+  salvage always failed validation with `refusing an archive-only candidate
+  because DB-only coordination state could be lost`. The residue is now
+  retired (renamed, never deleted) inside the private snapshot directory
+  before validation. This is the single root cause behind ~23 deterministic
+  test failures on main (the `*_uses_archive_snapshot_when_live_db_is_stale`
+  and doctor-reconstruct salvage families).
+- **Recovery receipts no longer wedge on a source that cannot even be
+  staged.** When the primary is not a readable SQLite file — exactly the
+  shape recovery runs for — staging the source-neutral family copy fails with
+  a corruption verdict (`file is not a database`), and
+  `collect_recovery_receipt_evidence` turned that into a hard
+  `source generation health staging` refusal, so no backup or archive
+  candidate could ever promote. A corruption-class staging failure now
+  attests the source as unverified (the same outcome an unreadable source
+  already got when staging succeeded); environmental failures (ENOSPC,
+  EPERM, a non-regular family member) stay fail-closed. Root cause of ~20
+  deterministic `restore/staging/reconstruct` test failures on main.
+- **`search_index_generation.db_identity` no longer leaks the internal cache
+  namespace** (`utf8:<path>@<gen>`); operator surfaces show
+  `<path>@<generation>` while process-global caches keep the discriminator.
+- **Tool input-schema parity understands nullable type arrays.** fastmcp
+  0.7.1 deliberately publishes `Option<T>` parameters as
+  `{"type": ["T", "null"]}` (GH#255 Python parity, CHANGELOG v0.3.31); the
+  conformance comparator only read `type` as a string and reported 108
+  "lost" parameter types across 29 tools. The comparator now normalizes both
+  nullable spellings to the base type and still fails a property with no
+  non-null type at all. The Python fixture is untouched.
+- **The `mark_all_read` landing is finished:** the CLI mode matrix, the
+  conformance audit baseline (45 tools = 38 compatibility + 7 Rust-native),
+  the audit document table, and the error-code catalog (`AGENT_DEREGISTERED`,
+  `AGENT_RETIRED`, `AUTHENTICATION_REQUIRED`, `INVALID_TOPIC`, all shipped
+  in earlier releases) now agree with the live inventory.
+- **Source builds pin the frankensearch sibling to the release commit.** The
+  live `../frankensearch` checkout moved to asupersync 0.4.10
+  (`Cx::is_cancelled` in frankensearch-quill) while fastmcp — including 0.8.1
+  — still pins asupersync =0.4.9, which made the whole workspace uncompilable
+  from a live sibling. `Cargo.toml`, `dist.yml`, `Dockerfile`, and
+  `install.sh --from-source` now use a gated `../frankensearch-rel-0332`
+  checkout at `FRANKENSEARCH_COMMIT`.
+- **`deploy-pages.yml` no longer watches a leaked rch temp path**; it is
+  dispatch-only with a `bundle_dir` input.
+- **Docs match the binary:** AGENTS.md's doctor examples used flags the
+  binary rejects (`am doctor --fix`, `--dry-run --fix`, `--json`); its
+  dependency table named crates that are not in the workspace and a
+  `DATABASE_URL` default that is not the default; README's family table
+  listed 8 of 28 doctor verbs, 17 of 19 robot subcommands, and 5 of 42
+  themes, and claimed hybrid search for release binaries that ship the
+  lexical tier only. VISION.md carries dated reality notes for the two
+  claims the code contradicts (C SQLite is statically bundled for
+  verification cross-checks; tool-prose parity is Rust-owned, not gated).
+
+- **Doctor advice consults the recovery breaker before recommending
+  reconstruct (GH#287).** `triage` recommended `am doctor reconstruct
+  --dry-run` while the recovery-breaker sidecar `am` itself wrote recorded
+  that reconstruct fails deterministically on this mailbox. The reconstruct
+  finding (and its planned action) now carries `blocked`, `blocked_reason`,
+  and `blocked_since` from the breaker record, and `am doctor health` prints
+  the recorded failure next to the advice, so operators and agents stop
+  looping on a known-failing command.
+
+- **Integrity guard fingerprints standing defects and backs off repeat WARNs
+  (GH#288).** The background guard re-warned the identical defect on every
+  cycle (~23x/day for days) with no dedup, saturating journal-based alerting.
+  Both the guard's detection WARN and the pool's "integrity probe and
+  canonical SQLite both rejected the file" WARN now log the transition once,
+  a "still standing since <ts>, N observations" reminder on a 6-hourly
+  cadence, and everything in between at debug; a fingerprint change or a
+  passing cycle re-arms the fresh WARN. When the recovery breaker records
+  that the promised reconstruct is blocked, the guard message now says
+  "recovery unavailable: …" with the recorded reason instead of promising a
+  recovery that never runs.
+
+## [v0.3.32](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.32) — 2026-09-01 **[Release]**
+
+Recovery-operability release: the promotion guards learned to explain
+themselves and to offer supported ways out, closing the operator dead-ends
+reported in GH#271, GH#283, GH#284, and GH#285. The reservation stable-key
+promotion fix was verified live: it promoted a real 2.7 GB cross-linked
+production mailbox (16 projects / 658 agents / 40,386 messages, 0 parse
+errors) that v0.3.31 refused.
+
+### Added
+
+- **`am doctor reconstruct --reseed-receipt-chain` (GH#283).** A structurally
+  broken recovery-receipt chain (zero or multiple roots, broken link, fork,
+  cycle, invalid self-hash) used to deterministically refuse every future
+  promotion — including a fully valid archive candidate — with no supported
+  way out, forcing operators into manual DB swaps that bypass every guard.
+  The new flag (requires `--yes`; `--dry-run` previews the chain verdict
+  read-only) quarantines the entire receipts directory by rename — never
+  deletion — and lets the next promotion seed a fresh root. Refused when the
+  chain verifies cleanly or an unfinalized promotion intent exists.
+
+### Fixed
+
+- **CLI no longer queues durable UNSENT artifacts for definitive server
+  refusals (GH#285).** A daemon-proxied tool rejection arrives as the full
+  legacy error envelope; the queueing classifier ran substring heuristics
+  over that raw JSON, where a suggested recipient name or task description
+  could satisfy the WAL-sidecar-corruption pattern — so an
+  `INVALID_ARGUMENT` (bad recipient name) was recorded as
+  `wal_sidecar_corruption` / `blocks_edits: true` and queued as an UNSENT
+  artifact that could never replay successfully. Client-refusal codes
+  (`INVALID_*`, `*_NOT_FOUND`, policy/cursor/token refusals) now never
+  queue, and server-fault envelopes classify on the tool's own message text
+  instead of the envelope payload.
+- **Reconstruct promotion refusals now name the colliding reservations
+  (GH#271).** "reservations produced N rows but only M unique stable keys"
+  now appends the colliding stable keys (project, agent, path, lifecycle
+  fields; up to 5 samples) so operators no longer have to inspect the
+  refused candidate database by hand.
+- **A corrupt source that cannot even be opened no longer vetoes promotion
+  of a healthy archive candidate (GH#283 outage family).** The promotion
+  gate's full-integrity probe ran against the settled private staging copy
+  through a read-only canonical open; when the damaged main-file header
+  still demanded WAL recovery, every probe form failed with "unable to open
+  database file" and promotion refused because the source could not be
+  classified at all. The probe now opens the private throwaway copy
+  writable, letting canonical SQLite run recovery and return a real
+  corrupt/healthy verdict (the authority path stays byte-untouched).
+- **Robot snapshot caches now survive real poller cadences (GH#274).** The
+  status/inbox/reservations/overview/agents caches required both a matching
+  generation fingerprint AND an age under 500ms, so every poll on a
+  seconds-to-minutes cadence paid the full multi-query rebuild even when
+  the fingerprint proved nothing had changed. Generation-verified entries
+  now live 30s by default (`AM_ROBOT_SNAPSHOT_TTL_MS` overrides); counts
+  stay exact because the fingerprint is recomputed on every call.
+
+## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-31 **[Release]**
 
 Durability-diagnostics release: the database layer learned to explain itself.
 A dedicated corruption-forensics engine, connection-pool lease tracking, and
@@ -19,6 +1200,34 @@ mode with reports that name the page, the lease, and the checkpoint that went
 wrong. Also lands first-class Oh My Pi support and verifiable pane-identity
 bindings (GH#252), and unsticks the container image, which had been frozen at
 v0.3.13 and amd64-only since June (GH#256).
+
+This is also the first release under the new installer trust model: releases
+are authenticated by a minisign signature over `SHA256SUMS` made with a
+maintainer-held key, replacing the GitHub-Actions Sigstore identity that no
+new release could satisfy (GH#269 in the Python repo; acfs#365). See the
+Security section below.
+
+### Security
+
+- **Installer trust model: mandatory minisign for v0.3.31 and later.**
+  Releases are no longer built by GitHub Actions, so the installers' previous
+  requirement — a keyless Sigstore bundle certified for the
+  `dist.yml@refs/tags/<tag>` Actions workflow identity — had become
+  unsatisfiable: v0.3.30 shipped without bundles and `install.sh` correctly
+  failed closed on every host. For releases >= v0.3.31, `install.sh` and
+  `install.ps1` instead require (a) the per-archive SHA-256 resolved from the
+  release `SHA256SUMS` manifest AND (b) a valid detached minisign signature
+  (`SHA256SUMS.minisig`) over the exact manifest bytes, verified against the
+  maintainer release key pinned in the script (epoch 2, key id
+  `1BBD79B28BF718D0`, shared with the frankensqlite release line). A missing
+  `minisign` binary, manifest, signature, or checksum entry aborts the
+  install; verification never degrades to checksum-only, and `--no-verify`
+  semantics are unchanged. The Sigstore/cosign path is preserved intact for
+  installing releases older than v0.3.31 — `cosign` is no longer required for
+  current releases (which also sidesteps the unrelated Ubuntu 26.04
+  packaged-cosign breakage). The trust anchor moved from "GitHub's CI
+  identity for this repository" to "a signing key the maintainer controls";
+  the model stays fail-closed. Details in `SECURITY.md`.
 
 ### Added
 
@@ -103,6 +1312,35 @@ v0.3.13 and amd64-only since June (GH#256).
   metadata recorded alongside the snapshot.
 
 ### Fixed
+
+- **`am check-inbox` matches the daemon's view of the inbox (GH#269)** and the
+  CLI gains an `am agents reap` verb (GH#275) for reclaiming dead agent
+  identities without hand-editing state.
+
+- **Backpressure health is classified from rolling queue-wait windows
+  (GH#272)** instead of instantaneous samples, so a single slow acquisition
+  can no longer flap the health verdict, and the KPI/metrics surfaces report
+  the same windowed classification.
+
+- **Reservation-scan SQL is computed in Rust and guarded against ledger
+  anti-join regressions (GH#274).** The TUI poller's release-ledger joins no
+  longer depend on SQLite schema variations, the duplicated reservation
+  helpers were de-duplicated, and a regression test pins the anti-join shape.
+
+- **`get_project_by_human_key` falls back to the stable slug (GH#267)** when
+  the human key lookup misses, so renamed projects resolve consistently.
+
+- **macOS builds compile again**: `rustix::fs::RawMode` is `u16` on Apple
+  targets (libc `mode_t`) but `u32` on Linux, and the setup-file permission
+  helper passed a `u32` straight through — Apple-target builds failed with
+  E0308 after the rustix 1.1.x refresh. The permission bits are now narrowed
+  explicitly (always <= `0o7777`, so the cast is lossless).
+
+- **Archive reconstruction no longer lets salvage rows collide with archive
+  identities.** Reconstruction and live WAL readiness were hardened, archive
+  reservation identity now wins over a salvaged local row id, and
+  archive+salvage lease dedup is pinned by test — this disproved the salvage
+  hypothesis for the 881/873 reservation-parity field outage.
 
 - **ATC hydration is bounded and fair for large recent populations (GH#258).**
   Liveness evaluation drains at most eight scheduled or policy-dirty agents per

@@ -11,9 +11,9 @@
 # fails the build for both architectures at once. Building linux/arm64 that way
 # additionally means a full Rust workspace compile under QEMU, which is hours.
 #
-# This file takes the other route: it packages the *exact binaries that the
-# tag-triggered dist workflow publishes in the GitHub release* into the same
-# runtime image. Two consequences worth stating plainly:
+# This file packages the exact DSR/fleet-built binaries published in the
+# GitHub release into the same runtime image. GitHub Actions are not used
+# for the release. Two consequences worth stating plainly:
 #
 #   * The image and the release tarballs are bit-identical binaries. A user who
 #     pulls the container and a user who curl|bash-installs run the same code.
@@ -32,9 +32,9 @@
 # -----
 #   docker buildx build -f Dockerfile.release \
 #       --platform linux/amd64,linux/arm64 \
-#       --build-arg AM_VERSION=0.3.31 \
+#       --build-arg AM_VERSION=0.3.35 \
 #       --build-arg AM_REVISION=<full-tag-commit-sha> \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.31 \
+#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.35 \
 #       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest \
 #       --push .
 #
@@ -45,15 +45,15 @@
 #   * mcp-agent-mail (the server, ENTRYPOINT)
 #   * am             (the operator CLI)
 
-# The dist matrix builds both GNU artifacts natively: x86_64 on
-# `ubuntu-latest` and aarch64 on `ubuntu-24.04-arm`. Neither lane currently
-# targets an explicitly older glibc baseline, so this file does not promise a
-# minimum glibc version inferred from a runner label. The executable checks
-# below are the fail-closed compatibility gate for the exact release binaries
-# packaged on each architecture.
+# The DSR/fleet release builds both GNU artifacts with cargo-zigbuild and a
+# glibc 2.28 target, then inspects their actual symbol versions. Linux ARM64
+# executable checks use QEMU user emulation. The checks below additionally
+# verify that each exact release binary runs in this runtime image.
 FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+ARG TARGETARCH
 
 # Runtime needs:
 #   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
@@ -65,14 +65,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 #                       work correctly when running under Docker/Kubernetes
 # `adduser` is explicit because Debian trixie's slim image no longer ships it
 # (bookworm did); without it this layer fails with exit 127 after apt succeeds.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,id=am-release-apt-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
         adduser \
         ca-certificates \
         curl \
         git \
         libsqlite3-0 \
         tini \
-    && rm -rf /var/lib/apt/lists/* \
     && adduser --system --group --home /home/appuser --uid 10001 appuser \
     && mkdir -p /data/mailbox \
     && chown -R appuser:appuser /data /home/appuser \
@@ -90,7 +90,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # which pre-built release binary lands in this architecture's layer, which is
 # what makes a single `--platform linux/amd64,linux/arm64` invocation produce a
 # correct multi-arch index instead of two copies of the host architecture.
-ARG TARGETARCH
 COPY dist/${TARGETARCH}/mcp-agent-mail /usr/local/bin/mcp-agent-mail
 COPY dist/${TARGETARCH}/am             /usr/local/bin/am
 RUN chmod 0755 /usr/local/bin/mcp-agent-mail /usr/local/bin/am
@@ -104,8 +103,7 @@ RUN /usr/local/bin/mcp-agent-mail --help > /tmp/server.help \
     && /usr/local/bin/am --help          > /tmp/cli.help \
     && grep -qE '^Usage: mcp-agent-mail ' /tmp/server.help \
     && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' /tmp/server.help \
-    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help \
-    && rm -f /tmp/server.help /tmp/cli.help
+    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help
 
 # Pin the packaged release version and source revision into the image so
 # `docker inspect`, both binaries, the GitHub release tag, and the GHCR page

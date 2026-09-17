@@ -637,11 +637,9 @@ fn schema_invariants_detect_ack_before_read_and_bad_reservation_ttl() {
 
     let conn = fresh_conn(&pool);
     allow_corruption_fixture(&conn);
-    // fsqlite 0.3.4 (via sqlmodel-frankensqlite): an UPDATE whose WHERE clause
-    // carries MORE THAN ONE bound parameter matches zero rows on this table,
-    // while the identical literal SQL — and the same two params on a SELECT —
-    // match correctly (br-fsq2p). Seed the drift with literal SQL until the
-    // upstream binding bug is fixed; the assert keeps the seed honest.
+    // br-orjjt: SET and composite-key WHERE placeholders must retain their
+    // original binding order. Keep both the affected-row assertion and the
+    // invariant checks below so a zero-row update cannot silently pass.
     let drift_rows = conn
         .execute_sync(
             "UPDATE message_recipients SET read_ts = ?, ack_ts = ? \

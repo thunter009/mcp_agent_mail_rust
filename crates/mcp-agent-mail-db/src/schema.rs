@@ -92,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(proje
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
+CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
 CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages(reply_to);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts);
@@ -456,6 +457,46 @@ pub fn init_schema_sql_base() -> String {
     base.to_string()
 }
 
+/// Base-DDL index statements that depend on a column a later migration adds.
+///
+/// `messages.topic` arrives with v27, `agents.retired_at` with v28 and the
+/// fork's `messages.reply_to` with v29.
+/// [`schema_migrations`] defers these ids behind their column migrations; an
+/// init path that executes the base DDL as one blob before migrations must
+/// skip them the same way, or a pre-v27/v28/v29 database fails with
+/// "no such column".
+pub const COLUMN_DEPENDENT_INDEX_MIGRATION_IDS: &[&str] = &[
+    "v1_create_index_idx_agents_project_active",
+    "v1_create_index_idx_messages_project_topic",
+    "v1_create_index_ix_messages_reply_to",
+];
+
+/// [`init_schema_sql_base`] without the column-dependent index statements.
+///
+/// For init paths that run the base DDL directly and then apply
+/// [`schema_migrations`]: the deferred index migrations recreate those
+/// indexes once their columns exist, so nothing is lost on a fresh database
+/// and a legacy database no longer fails base init.
+#[must_use]
+pub fn init_schema_sql_base_deferring_column_dependent_indexes() -> String {
+    let base = init_schema_sql_base();
+    let mut kept = Vec::new();
+    for chunk in base.split(';') {
+        let stmt = chunk.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let deferred = derive_migration_id_and_description(stmt)
+            .is_some_and(|(id, _)| COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.contains(&id.as_str()));
+        if !deferred {
+            kept.push(chunk.trim_end());
+        }
+    }
+    let mut sql = kept.join(";");
+    sql.push_str(";\n");
+    sql
+}
+
 /// Schema version for migrations
 pub const SCHEMA_VERSION: i32 = 1;
 
@@ -596,11 +637,7 @@ pub fn schema_migrations() -> Vec<Migration> {
         };
 
         let migration = Migration::new(id, desc, stmt.to_string(), String::new());
-        if matches!(
-            migration.id.as_str(),
-            "v1_create_index_idx_agents_project_active"
-                | "v1_create_index_idx_messages_project_topic"
-        ) {
+        if COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.contains(&migration.id.as_str()) {
             deferred_column_dependent_indexes.push(migration);
         } else {
             migrations.push(migration);
@@ -2400,6 +2437,45 @@ pub fn schema_migrations() -> Vec<Migration> {
     // databases. Imported Python databases already have them with
     // SQLAlchemy DATETIME/TEXT values, so normalize those timestamps to the
     // integer-microsecond convention used by every Rust query.
+    //
+    // Upstream's own migration tests install every `v29_*` migration on a
+    // bare mailbox that never ran the generated v1 DDL, so each fix-up is
+    // preceded by an idempotent CREATE TABLE IF NOT EXISTS of the table it
+    // touches (mirrors the base DDL) instead of assuming the table exists.
+    migrations.push(Migration::new(
+        "v29_ensure_window_identities_table".to_string(),
+        "create the persistent window identity table when the base DDL never ran".to_string(),
+        "CREATE TABLE IF NOT EXISTS window_identities (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL REFERENCES projects(id),\
+            window_uuid TEXT NOT NULL,\
+            display_name TEXT NOT NULL,\
+            created_ts INTEGER NOT NULL,\
+            last_active_ts INTEGER NOT NULL,\
+            expires_ts INTEGER,\
+            UNIQUE(project_id, window_uuid)\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v29_ensure_message_summaries_table".to_string(),
+        "create the message summary table when the base DDL never ran".to_string(),
+        "CREATE TABLE IF NOT EXISTS message_summaries (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL REFERENCES projects(id),\
+            summary_text TEXT NOT NULL,\
+            start_ts INTEGER NOT NULL,\
+            end_ts INTEGER NOT NULL,\
+            source_message_count INTEGER NOT NULL DEFAULT 0,\
+            source_thread_ids TEXT NOT NULL DEFAULT '[]',\
+            llm_model TEXT,\
+            cost_usd REAL,\
+            created_ts INTEGER NOT NULL\
+        )"
+        .to_string(),
+        String::new(),
+    ));
     migrations.push(Migration::new(
         "v29_fix_window_identities_text_timestamps".to_string(),
         "convert imported window identity timestamps to integer microseconds".to_string(),
@@ -2432,6 +2508,55 @@ pub fn schema_migrations() -> Vec<Migration> {
         ),
         String::new(),
     ));
+
+    // A row count and the highest message ID cannot detect edits to an older
+    // message. These counters move in the source transaction, including writes
+    // made outside the Agent Mail query helpers. Rollback restores the counters
+    // along with the rows. The separate rewrite counter preserves incremental
+    // indexing for an append-only tail.
+    migrations.push(Migration::new(
+        "v29_create_lexical_change_clock".to_string(),
+        "track committed changes to lexical source documents".to_string(),
+        "CREATE TABLE IF NOT EXISTS lexical_change_clock (\
+            id INTEGER PRIMARY KEY CHECK (id = 1),\
+            revision INTEGER NOT NULL,\
+            rewrite_revision INTEGER NOT NULL\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v29_seed_lexical_change_clock".to_string(),
+        "initialize lexical source counters without resetting existing state".to_string(),
+        "INSERT OR IGNORE INTO lexical_change_clock (id, revision, rewrite_revision) \
+         VALUES (1, 0, 0)"
+            .to_string(),
+        String::new(),
+    ));
+    for (table, event, suffix, rewrite) in [
+        ("messages", "INSERT", "insert", false),
+        ("messages", "UPDATE", "update", true),
+        ("messages", "DELETE", "delete", true),
+        ("agents", "INSERT", "insert", true),
+        ("agents", "UPDATE OF id, name", "update", true),
+        ("agents", "DELETE", "delete", true),
+        ("projects", "INSERT", "insert", true),
+        ("projects", "UPDATE OF id, slug", "update", true),
+        ("projects", "DELETE", "delete", true),
+    ] {
+        let rewrite_increment = i32::from(rewrite);
+        migrations.push(Migration::new(
+            format!("v29_lexical_clock_{table}_{suffix}"),
+            format!("invalidate lexical documents after {table} {suffix}"),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS trg_lexical_clock_{table}_{suffix} \
+                 AFTER {event} ON {table} BEGIN \
+                 UPDATE lexical_change_clock SET revision = revision + 1, \
+                 rewrite_revision = rewrite_revision + {rewrite_increment} WHERE id = 1; END"
+            ),
+            String::new(),
+        ));
+    }
 
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
@@ -4691,6 +4816,21 @@ mod tests {
             "fresh DB should apply at least one migration"
         );
 
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('clock-test', '/clock-test', 1)",
+            &[],
+        )
+        .expect("exercise the installed projection trigger");
+        let revision_before = conn
+            .query_sync(
+                "SELECT revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("revision")
+            .unwrap();
+        assert!(revision_before > 0, "the native trigger must actually fire");
+
         // Second run is a no-op (already applied).
         let applied2 = block_on({
             let conn = &conn;
@@ -4699,6 +4839,18 @@ mod tests {
         assert!(
             applied2.is_empty(),
             "second migrate call should be idempotent"
+        );
+        let revision_after = conn
+            .query_sync(
+                "SELECT revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("revision")
+            .unwrap();
+        assert_eq!(
+            revision_after, revision_before,
+            "migration cannot reset a live clock"
         );
     }
 
@@ -5039,6 +5191,115 @@ mod tests {
                 "{column_migration_id} must precede {index_migration_id}"
             );
         }
+    }
+
+    #[test]
+    fn deferring_base_sql_initializes_a_legacy_canonical_db_before_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite3");
+        let path = path.to_string_lossy().to_string();
+        let conn = crate::CanonicalDbConn::open_file(&path).expect("open canonical connection");
+        // The Python-era shapes of the two tables: every column the base DDL
+        // indexes except `messages.topic` (v27) and `agents.retired_at` (v28).
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \
+             human_key TEXT NOT NULL, created_at DATETIME NOT NULL); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, \
+             task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, \
+             last_active_ts DATETIME NOT NULL, \
+             attachments_policy TEXT NOT NULL DEFAULT 'auto', \
+             contact_policy TEXT NOT NULL DEFAULT 'auto', \
+             reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, \
+             body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, \
+             created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]');",
+        )
+        .expect("legacy tables");
+
+        // Planted negative: the whole base blob trips over the missing columns.
+        let full = conn
+            .execute_raw(&init_schema_sql_base())
+            .expect_err("full base DDL must fail on a pre-v27 schema")
+            .to_string();
+        assert!(full.contains("no such column"), "unexpected error: {full}");
+
+        let deferred = init_schema_sql_base_deferring_column_dependent_indexes();
+        assert!(!deferred.contains("idx_messages_project_topic"));
+        assert!(!deferred.contains("idx_agents_project_active"));
+        let statements = |sql: &str| sql.split(';').filter(|s| !s.trim().is_empty()).count();
+        assert_eq!(
+            statements(&init_schema_sql_base()),
+            statements(&deferred) + COLUMN_DEPENDENT_INDEX_MIGRATION_IDS.len(),
+            "only the column-dependent indexes may be dropped from the blob"
+        );
+        conn.execute_raw(&deferred)
+            .expect("deferring base DDL initializes a legacy database");
+
+        // The column migrations run first and the deferred index migrations follow.
+        for migration in schema_migrations_base() {
+            if let Err(error) = conn.execute_raw(&migration.up) {
+                let text = error.to_string().to_ascii_lowercase();
+                assert!(
+                    text.contains("already exists")
+                        || text.contains("duplicate column name")
+                        || text.contains("duplicate trigger name"),
+                    "migration {} failed: {text}",
+                    migration.id
+                );
+            }
+        }
+        let indexes = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_messages_project_topic', 'idx_agents_project_active')",
+                &[],
+            )
+            .expect("list indexes");
+        assert_eq!(
+            indexes.len(),
+            2,
+            "both deferred indexes exist after migrations"
+        );
+    }
+
+    /// Canonical `ALTER TABLE ... ADD COLUMN` splices the new column into the
+    /// stored `CREATE TABLE` text at an offset computed from the canonical
+    /// prefix. Earlier FrankenSQLite versions retained `IF NOT EXISTS`,
+    /// causing canonical SQLite to splice at the wrong offset. Keep this
+    /// native-create/canonical-alter contract in the normal suite (br-ivf5p).
+    #[test]
+    fn runtime_engine_created_table_text_is_alterable_by_canonical_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engine-ddl.sqlite3");
+        let path = path.to_string_lossy().to_string();
+        let engine = crate::DbConn::open_file(&path).expect("open runtime engine connection");
+        engine
+            .execute_raw(
+                "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, \
+                 project_id INTEGER NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            )
+            .expect("create table through the runtime engine");
+        drop(engine);
+
+        let conn = crate::CanonicalDbConn::open_file(&path).expect("open canonical connection");
+        let rows = conn
+            .query_sync(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                &[],
+            )
+            .expect("read stored table text");
+        let stored: String = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("sql").ok())
+            .expect("stored CREATE TABLE text");
+        assert!(
+            stored.starts_with("CREATE TABLE messages"),
+            "stored table text must use the canonical prefix, got: {stored}"
+        );
+        conn.execute_raw("ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE")
+            .expect("canonical ADD COLUMN on a runtime-engine-created table");
     }
 
     #[test]

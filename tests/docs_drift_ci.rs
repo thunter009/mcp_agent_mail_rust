@@ -1,3 +1,7 @@
+// Integration scenarios are long and quote user-facing strings by design;
+// these pedantic style lints add nothing in a test harness.
+#![allow(clippy::too_many_lines, clippy::literal_string_with_formatting_args)]
+
 #[path = "../crates/mcp-agent-mail-conformance/tests/doc_consistency.rs"]
 mod doc_consistency;
 
@@ -114,7 +118,16 @@ mod container_release_contract {
             require_exactly_once(source_dockerfile, needle)?;
         }
 
+        let release_instructions = release_dockerfile
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
         for needle in [
+            "ARG TARGETARCH",
+            "COPY dist/${TARGETARCH}/mcp-agent-mail ",
+            "COPY dist/${TARGETARCH}/am ",
             "ARG AM_VERSION",
             "ARG AM_REVISION",
             "test \"${#AM_REVISION}\" -eq 40",
@@ -123,20 +136,59 @@ mod container_release_contract {
             "org.opencontainers.image.version=\"${AM_VERSION}\"",
             "org.opencontainers.image.revision=\"${AM_REVISION}\"",
         ] {
-            require_exactly_once(release_dockerfile, needle)?;
-        }
-        require_exactly_once(
-            release_dockerfile,
-            "The dist matrix builds both GNU artifacts natively",
-        )?;
-        if release_dockerfile.contains("GLIBC_2.28")
-            || release_dockerfile.contains("cargo zigbuild")
-            || release_dockerfile.contains("dsr already cross-builds and signs")
-        {
-            return Err("release Dockerfile claims stale release artifact provenance".to_string());
+            require_exactly_once(&release_instructions, needle)?;
         }
 
         Ok(())
+    }
+
+    /// Extract the value assigned on the first line starting with `prefix`.
+    ///
+    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
+    /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
+    fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
+        text.lines().map(str::trim).find_map(|line| {
+            line.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(separator))
+                .map(str::trim)
+        })
+    }
+
+    /// The source Dockerfile must build against the frankensearch revision
+    /// dist.yml pins.
+    ///
+    /// Cloning the sibling at a floating ref broke
+    /// every `docker build` once the live frankensearch tree moved to a
+    /// newer asupersync than the rest of the workspace can follow.
+    #[test]
+    fn source_dockerfile_pins_frankensearch_to_the_dist_commit() {
+        let dist = read(".github/workflows/dist.yml");
+        let dockerfile = read("Dockerfile");
+
+        let dist_commit = assigned_value(&dist, "FRANKENSEARCH_COMMIT", ':')
+            .expect("dist.yml declares FRANKENSEARCH_COMMIT");
+        let dockerfile_commit = assigned_value(&dockerfile, "ARG FRANKENSEARCH_COMMIT", '=')
+            .expect("Dockerfile declares ARG FRANKENSEARCH_COMMIT");
+
+        assert_eq!(dist_commit.len(), 40, "dist.yml commit must be a full SHA");
+        assert!(
+            dist_commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "dist.yml commit must be hex"
+        );
+        assert_eq!(
+            dockerfile_commit, dist_commit,
+            "Dockerfile ARG FRANKENSEARCH_COMMIT drifted from dist.yml"
+        );
+        assert!(
+            dockerfile.contains(
+                "frankensearch.git \"${FRANKENSEARCH_COMMIT}\" /build/frankensearch-rel-0332"
+            ),
+            "Dockerfile must clone frankensearch at FRANKENSEARCH_COMMIT, not a sibling ref"
+        );
+        assert!(
+            !dockerfile.contains("frankensearch.git \"${SIBLING_REF}\""),
+            "frankensearch must not float with SIBLING_REF"
+        );
     }
 
     #[test]
@@ -153,6 +205,8 @@ mod container_release_contract {
         let workflow = read(".github/workflows/docker.yml");
         let release_dockerfile = read("Dockerfile.release");
         let source_dockerfile = read("Dockerfile");
+        validate(&workflow, &release_dockerfile, &source_dockerfile)
+            .expect("unmodified release contract must pass before testing mutations");
 
         let workflow_mutations = [
             workflow.replacen(
@@ -210,6 +264,7 @@ mod container_release_contract {
             ),
         ];
         for mutation in workflow_mutations {
+            assert_ne!(mutation, workflow, "workflow mutation anchor must exist");
             assert!(
                 validate(&mutation, &release_dockerfile, &source_dockerfile).is_err(),
                 "workflow contract mutation unexpectedly passed"
@@ -225,12 +280,22 @@ mod container_release_contract {
                 1,
             ),
             release_dockerfile.replacen(
-                "The dist matrix builds both GNU artifacts natively",
-                "linux/arm64 needs GLIBC_2.28 because cargo zigbuild is used",
+                "COPY dist/${TARGETARCH}/mcp-agent-mail ",
+                "COPY dist/amd64/mcp-agent-mail ",
+                1,
+            ),
+            release_dockerfile.replacen("COPY dist/${TARGETARCH}/am ", "COPY dist/amd64/am ", 1),
+            release_dockerfile.replacen(
+                "COPY dist/${TARGETARCH}/am ",
+                "# COPY dist/${TARGETARCH}/am ",
                 1,
             ),
         ];
         for mutation in release_dockerfile_mutations {
+            assert_ne!(
+                mutation, release_dockerfile,
+                "release Dockerfile mutation anchor must exist"
+            );
             assert!(
                 validate(&workflow, &mutation, &source_dockerfile).is_err(),
                 "release Dockerfile contract mutation unexpectedly passed"
@@ -239,6 +304,10 @@ mod container_release_contract {
 
         let source_dockerfile_mutation =
             source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
+        assert_ne!(
+            source_dockerfile_mutation, source_dockerfile,
+            "source Dockerfile mutation anchor must exist"
+        );
         assert!(
             validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
             "source Dockerfile checkout mutation unexpectedly passed"
@@ -257,8 +326,10 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
-    const FRANKENSEARCH_COMMIT: &str = "e2d24118b06e4a1a4bbff16968f70767f35d5bb3";
+    const FRANKENSEARCH_COMMIT: &str = "3bbfd8c664062f8304e7a790c51794671f9214dc";
     const FAST_CMAES_COMMIT: &str = "3bf11b7601b54a08ffabb55821289ecb235a504d";
+    // Must match the `BEADS_RUST_COMMIT` env pin in .github/workflows/dist.yml
+    // (beads_rust 0.5.4 source, pinned in 4e8c661a).
     const BEADS_RUST_COMMIT: &str = "ba6ff75da25529c8cad8395352f5c5fc2162ee95";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
@@ -811,7 +882,7 @@ mod dist_release_contract {
         require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
         require_exactly(
             workflow,
-            "# Cargo.lock resolves beads_rust 0.5.4, so the workspace patch",
+            "# Retain this pin for the installer's source-receipt contract.",
             3,
         )?;
         require_exactly(
@@ -1019,7 +1090,7 @@ mod dist_release_contract {
             mutate(
                 &workflow,
                 FRANKENSEARCH_COMMIT,
-                "3bbfd8c664062f8304e7a790c51794671f9214dc",
+                "1111111111111111111111111111111111111111",
             ),
             mutate(
                 &workflow,

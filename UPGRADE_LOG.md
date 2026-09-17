@@ -1,5 +1,158 @@
 # Dependency Upgrade Log
 
+## September 16, 2026 — release qualification update
+
+Version remains 0.3.35; the next application release is not published. This
+section supersedes the current-status statements in the historical September 12
+notes below.
+
+- The original WAL/doctor failures were repaired. The final September 12
+  workspace run at `0259279b` passed **17,510 tests, zero failures, 39 skipped**.
+  That result includes Comrak 0.55.0 and ChaCha20 0.10.2, but does not qualify
+  the subsequent September 15–16 changes.
+- FastMCP remains 0.7.1 with all eight packages pinned to immutable revision
+  `c14d26b49f132625f4141b72669b157467b9aac2`. This backports protocol negotiation
+  for GH #321 while preserving the exact Asupersync 0.4.9 runtime family.
+  The fresh consumer passed 18 stdio assertions and real HTTP initialization
+  for four proposed protocol versions, including subsequent tool discovery.
+- FrankenSQLite remains 0.3.18 with all 20 packages pinned to immutable revision
+  `2633b38a26bde68db23172b12aa402ed698cc309`, published as
+  `am-sql-compat-20260916`. It retains the SQL/WAL compatibility corrections
+  and fixes a Windows namespace probe that compared a file identity with its
+  mutex. Native Windows namespace tests passed 42/42; Linux generation tests
+  passed 3/3 and strict VFS Clippy passed. Adoption changed only the 20 engine
+  source revisions in Cargo.lock; unrelated package versions and edges were
+  preserved.
+- Windows consumer qualification subsequently exposed Unix-only imports in
+  archive recovery test helpers (br-dlurv). The helpers are corrected, but the
+  rebuilt consumer and native recovery tests remain pending. Engine tests alone
+  do not qualify the application.
+- The current Linux full run selects 17,540 tests across 149 binaries and is
+  still running. Current-pin rollback tests, final compiler gates, macOS native
+  qualification, six-platform release binaries, signatures, installation, and
+  venue publication remain open. The retained logs are under
+  `/data/projects/am-release-20260912/`.
+- The unadopted dependency candidates below remain deferred while release bugs
+  are fixed. Their September 12 version research is historical, not a claim
+  that every listed package is still latest or has been individually validated.
+
+## September 12, 2026 — next release (br-xql74)
+
+Status: in progress; no new version, tag, or publication yet. Baseline source
+`5d2f6af863de1d021fb6ee862fb5f928f6168d0e`, version 0.3.35.
+The older June entries below are historical evidence, not current release gates.
+
+Live registry research covered 89 direct packages: 54 already current and 35
+newer packages grouped into 18 coherent upgrade units. Preserve Tantivy's git
+revision and the gated FrankenSearch path dependencies. FrankenSQLite 0.3.18
+is already latest stable.
+
+- Updated: Comrak 0.54.0 → 0.55.0. Fixes two autolink denial-of-service
+  issues ([GHSA-xg9p-p4jc-c46g](https://github.com/kivikakk/comrak/security/advisories/GHSA-xg9p-p4jc-c46g)).
+  No use of its deprecated `tagfilter` option was found. Strict-RCH Markdown
+  regression selection passed 152 tests (5008 unselected), remote exit 0 on
+  `am-release-css` at 2026-09-12 01:15:04 UTC. Full workspace nextest then
+  started at source `046976941fa4933b8209decc591975c454713518` and finished
+  with 17,484 passed, 19 failed and 39 skipped. Remote nextest exited 100;
+  the outer RCH exited 103 because its post-run source receipt detected local
+  changes and generated artifacts. This baseline has no frozen-source verdict.
+- Pending, individually tested: indexmap 2.14.2; plist 1.10.1; smallvec 1.16.1;
+  toml_edit 0.25.15; tru 0.2.4; franken-agent-detection 0.2.4;
+  tokenizers 0.23.2; wide 1.7.0; blake2 0.11.0; dirs 7.0.0;
+  winsafe 0.0.29; beads_rust 0.5.12; SQLModel family 0.4.3; FTUI family 0.7.0.
+- Updated, whole-workspace validation pending: ChaCha20 0.10.1 → 0.10.2, replacing
+  the yanked version and fixing an SSE2 portability defect. Only that package's
+  version/checksum changes in Cargo.lock; an unrelated resolver change to
+  tempfile's getrandom edge was manually restored, and `cargo tree --locked`
+  accepted the preserved graph. The dependency is used through Asupersync and
+  FrankenSQLite, not the share module's external `age` executable.
+  The queued DB/conformance gate refused after the baseline exceeded the
+  ten-failure circuit breaker; that queue ran no tests. After the user's
+  instruction to fix the bugs, focused DB/search/cursor/load validation passed
+  135 tests with this lockfile. The complete fixture-router test subsequently
+  passed in the 14-test portability selection.
+- Constrained: latest FastMCP 0.9.0 requires asupersync exactly 0.4.10 and
+  Rust 1.100, while even latest beads_rust requires asupersync exactly 0.4.9.
+  The workspace's Rust minimum was corrected to 1.100 as described below.
+  Latest asupersync 0.4.11 satisfies neither exact pin. Keep the coherent
+  existing runtime family; do not substitute mutable sibling checkouts.
+- Compatible FastMCP candidate: 0.8.1 keeps asupersync exactly 0.4.9 and
+  isolates `block_on` runtimes per thread, directly relevant to AM dispatch.
+  The installed nightly is Rust 1.100.0-nightly and satisfies its floor.
+  Existing explicit-context runner calls appear compatible; compile and real
+  transport tests are pending. Both current and candidate FastMCP clients pin
+  TOML exactly 1.1.4, preventing a standalone upgrade to TOML 1.1.6.
+- Release gates pending: complete workspace tests, check, strict Clippy,
+  formatting, security audit, six-platform portable builds, signed artifacts,
+  installation/update checks, and applicable distribution venue verification.
+- Corrected the workspace Rust minimum from 1.95 to 1.100, matching the
+  already-selected FastMCP 0.7.1 manifest. The pinned nightly is unchanged.
+  `cargo metadata --locked --no-deps` confirms all 12 active members inherit
+  1.100; this is a metadata check, not a compiler or runtime test result.
+- Remaining release failures include WAL-only CHECK violation setup, WAL-only
+  schema-version visibility, structural-corruption authority with a live owner,
+  live physical-copy admission, canonical-reader close/checkpoint visibility,
+  and reconstructed-mailbox search freshness (repair validation below). The physical-copy guard preserves
+  process-wide file locks. Existing assertions and that guard remain unchanged.
+- Guarded live-search refresh repair: native live sources use namespace-bound
+  read-only opens for the scan, all reopen retries and the final publication
+  seal. Private snapshots remain query authority. Canonical/archive fallback
+  sources cannot publish live index state. Failed refreshes retain private
+  results with an explicit warning and actual bootstrap-error health; cached
+  failure requires revalidation before success can be recorded.
+  The original recovery test and guarded source-preservation tests passed in
+  an 87-test remote selection. The new real writer-lock regression then caught
+  false fresh health (88/89 passed); recording the actual refresh error passed
+  all 89 tests. A separate stale-binary rerun omitted the two new tests despite
+  synchronized source hashes and is excluded as final-candidate evidence.
+  Final retry/recovery additions and the broader search-service selection
+  passed all 232 tests through strict RCH (6796 unselected, remote exit 0).
+  Source hashes match the frozen candidate. Workspace/all-target check and
+  strict Clippy passed remotely at 13:50:16 and 13:52:22 UTC; formatting and
+  diff checks passed. UBS remains reviewed nonzero: 119 critical, 4597 warnings
+  and 1324 informational findings, with no suppression. Five other runtime
+  failures still block release. Logs and SHA-256 receipts are retained under
+  `/data/projects/am-release-20260912/live-refresh-*`.
+- Fixed source-change retry and relevance cursor behavior passed 135 focused
+  tests through strict RCH, including the real mutation-during-scan and
+  pagination-under-writes regressions (3808 tests unselected, remote exit 0).
+  The first repair run retained one pagination failure out of 99 tests before
+  the cursor correction. Logs are in `/data/projects/am-release-20260912/`.
+  The conformance/server/share portability selection passed all 14 tests
+  (5959 unselected, remote exit 0), including the eight previously failing
+  environment-sensitive tests. Its first build failed because the new fixture
+  helper assumed SHA-1's digest implemented LowerHex; explicit byte encoding
+  corrected that compile error. The rerun used the normal remote checkout,
+  not a relocated source-content checkout. Publication remains blocked.
+- The repaired candidate passed strict-RCH workspace/all-target `cargo check`
+  and Clippy with `-D warnings` (remote exits 0 at 03:39:27 and 03:41:32 UTC).
+  `cargo fmt --check` and `git diff --check` also passed. UBS remains a reviewed
+  nonzero scan under the previously approved exception: 131 critical findings,
+  1789 warnings and 436 informational findings; no suppression or clean-scan
+  claim. The final digest-encoding correction was manually reviewed.
+- Initial post-Comrak `cargo audit --json` completed with zero vulnerabilities.
+  Audit success is separate from the focused Markdown test result above and
+  does not establish whole-workspace runtime compatibility.
+  This is not a clean security audit: separate warnings include unsound
+  `lru 0.16.4` (RUSTSEC-2026-0253) through the gated FrankenSearch lexical
+  crate's registry Tantivy 0.26.1, unmaintained `paste` and `rustls-pemfile`,
+  and yanked `chacha20 0.10.1`. Compatible remediation is under investigation.
+  Follow-up: ChaCha20 0.10.2 is compatible and fixes an SSE2 portability bug;
+  its isolated update/test is pending. LRU's patched range is >=0.18.2;
+  even Tantivy 0.26.2 retains `lru ^0.16.3`, and the gated source pins
+  Tantivy exactly 0.26.1. Its sole `LruCache<usize, Block>` does not supply
+  the advisory's panicking-key destructor trigger, but it remains unpatched.
+  Preserve that constraint and warning rather than suppressing it or dropping
+  the production lexical backend. A fix needs a separately reviewed immutable
+  sibling revision or backport.
+- Venue preflight: GitHub Actions permissions report `enabled=false`.
+  Homebrew is already at 0.3.35 with four platform hashes. GHCR `latest` has
+  amd64/arm64 images labelled 0.3.34 at source `0125f0505fa0ba604dbbbb580fad56d283e46488`.
+  The three probed Agent Mail package names return crates.io 404 and every
+  active workspace member remains `publish=false`; gated path/git dependencies
+  still prevent treating this as an existing crates.io publication stream.
+
+
 **Date:** 2026-06-11 | **Project:** mcp_agent_mail_rust | **Language:** Rust
 
 ## Summary

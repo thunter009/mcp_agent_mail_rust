@@ -130,15 +130,15 @@ pub(crate) fn enqueue_message_semantic_index(
 /// Index a message into the Tantivy lexical search index (fire-and-forget).
 ///
 /// Runs synchronously but is best-effort: failures are logged, never propagated.
-pub(crate) fn enqueue_message_lexical_index(msg: &mcp_agent_mail_db::search_v3::IndexableMessage) {
-    match mcp_agent_mail_db::search_v3::index_message(msg) {
+pub(crate) fn enqueue_message_lexical_index(db_path: &str, message_id: i64) {
+    match mcp_agent_mail_db::search_v3::index_message(db_path, message_id) {
         Ok(true) => {
-            tracing::debug!(message_id = msg.id, "indexed message in Tantivy");
+            tracing::debug!(message_id, "indexed message in Tantivy");
         }
         Ok(false) => {} // bridge not initialized, silent skip
         Err(e) => {
             tracing::warn!(
-                message_id = msg.id,
+                message_id,
                 error = %e,
                 "failed to index message in Tantivy (non-fatal)"
             );
@@ -573,74 +573,94 @@ async fn resolve_or_register_agent(
     let agent_name_norm = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
 
-    let agent =
-        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
-            .await
+    let agent = match mcp_agent_mail_db::queries::get_agent(
+        ctx.cx(),
+        pool,
+        project_id,
+        &agent_name_norm,
+    )
+    .await
+    {
+        Outcome::Ok(agent) => Ok(agent),
+        Outcome::Err(DbError::NotFound { .. })
+            if config.messaging_auto_register_recipients
+                && !config.messaging_fail_closed_send_profile =>
         {
-            Outcome::Ok(agent) => Ok(agent),
-            Outcome::Err(DbError::NotFound { .. })
-                if config.messaging_auto_register_recipients
-                    && !config.messaging_fail_closed_send_profile =>
+            // Proof gate (fail-closed): auto-registering an unknown recipient
+            // here cannot carry a signed `registration_proof` bundle, so when
+            // the gate is enabled we refuse instead of minting an unproven
+            // identity (program/model="unknown"). Without this, `send_message`
+            // to a non-existent recipient was a side door around the gate.
+            // Disabled gate = no-op, so default auto-register behavior is
+            // preserved exactly.
+            crate::proof_gate::reject_auto_registration_if_enabled(
+                "send_message auto-registration of recipient",
+            )?;
+            match mcp_agent_mail_db::queries::register_agent(
+                ctx.cx(),
+                pool,
+                project_id,
+                &agent_name_norm,
+                "unknown",
+                "unknown",
+                None,
+                None,
+                None,
+            )
+            .await
             {
-                // Proof gate (fail-closed): auto-registering an unknown recipient
-                // here cannot carry a signed `registration_proof` bundle, so when
-                // the gate is enabled we refuse instead of minting an unproven
-                // identity (program/model="unknown"). Without this, `send_message`
-                // to a non-existent recipient was a side door around the gate.
-                // Disabled gate = no-op, so default auto-register behavior is
-                // preserved exactly.
-                crate::proof_gate::reject_auto_registration_if_enabled(
-                    "send_message auto-registration of recipient",
-                )?;
-                match mcp_agent_mail_db::queries::register_agent(
-                    ctx.cx(),
-                    pool,
-                    project_id,
-                    &agent_name_norm,
-                    "unknown",
-                    "unknown",
-                    None,
-                    None,
-                    None,
-                )
-                .await
+                Outcome::Ok(_) => {}
+                Outcome::Err(DbError::Sqlite(message))
+                    if is_agent_unique_constraint_error(&message) =>
                 {
-                    Outcome::Ok(_) => {}
-                    Outcome::Err(DbError::Sqlite(message))
-                        if is_agent_unique_constraint_error(&message) =>
-                    {
-                        tracing::debug!(
-                            project_id,
-                            agent = %agent_name,
-                            "auto-register race detected; loading existing agent row"
-                        );
-                    }
-                    Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
-                    Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                    Outcome::Panicked(p) => {
-                        return Err(McpError::internal_error(format!(
-                            "Internal panic: {}",
-                            p.message()
-                        )));
-                    }
-                }
-                db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::get_agent(
-                        ctx.cx(),
-                        pool,
+                    tracing::debug!(
                         project_id,
-                        &agent_name_norm,
-                    )
-                    .await,
-                )
+                        agent = %agent_name,
+                        "auto-register race detected; loading existing agent row"
+                    );
+                }
+                Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(p) => {
+                    return Err(McpError::internal_error(format!(
+                        "Internal panic: {}",
+                        p.message()
+                    )));
+                }
             }
-            Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
-            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-            Outcome::Panicked(p) => Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            ))),
-        }?;
+            let row = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
+                    .await,
+            )?;
+            // GH#301: an implicitly registered recipient must exist in the
+            // archive too, or DB and archive identity inventories drift
+            // (db agents = archive agents + 1) and a reconstruct cannot
+            // recreate the placeholder. Archive the same profile shape
+            // register_agent writes (best-effort, write-behind).
+            if let Outcome::Ok(project) =
+                mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), pool, project_id).await
+            {
+                crate::identity::try_write_agent_profile(
+                    config,
+                    &project.slug,
+                    &crate::identity::agent_archive_profile_json(&row, None),
+                );
+            } else {
+                tracing::warn!(
+                    project_id,
+                    agent = %row.name,
+                    "auto-registered recipient: project row unavailable; archive profile not written"
+                );
+            }
+            Ok(row)
+        }
+        Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            p.message()
+        ))),
+    }?;
     enqueue_agent_semantic_index(&agent);
     Ok(agent)
 }
@@ -1817,7 +1837,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -2571,17 +2591,7 @@ effective_free_bytes={free}"
     // them exactly once. This is the at-most-once archive-dispatch guarantee.
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: message_id,
-            project_id,
-            project_slug: project.slug.clone(),
-            sender_name: sender.name.clone(),
-            subject: message.subject.clone(),
-            body_md: message.body_md.clone(),
-            thread_id: message.thread_id.clone(),
-            importance: message.importance.clone(),
-            created_ts: message.created_ts,
-        });
+        enqueue_message_lexical_index(pool.sqlite_path(), message_id);
 
         // Emit notification signals for to/cc recipients only (never bcc).
         //
@@ -3533,17 +3543,7 @@ effective_free_bytes={free}"
     // exactly once (at-most-once archive dispatch).
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: reply_id,
-            project_id,
-            project_slug: project.slug.clone(),
-            sender_name: sender.name.clone(),
-            subject: reply.subject.clone(),
-            body_md: reply.body_md.clone(),
-            thread_id: Some(thread_id.clone()),
-            importance: reply.importance.clone(),
-            created_ts: reply.created_ts,
-        });
+        enqueue_message_lexical_index(pool.sqlite_path(), reply_id);
 
         // Emit notification signals for to/cc recipients only (never bcc).
         // Mirrors the send_message notification logic for parity with Python.
@@ -3810,11 +3810,16 @@ pub async fn fetch_topic(
             )
             .await,
         )?;
+        // Fork-only viewer auth on fetch_topic (upstream fetch_topic has none). The
+        // tool exposes no tmux_socket_path/call_transport params, so it keeps the
+        // pre-merge stdio policy: pane context from the default tmux server.
         crate::identity::authenticate_lifecycle_agent(
             &project,
             &viewer,
             registration_token.as_deref(),
             pane_id.as_deref(),
+            mcp_agent_mail_core::TmuxServer::from_validated(None),
+            mcp_agent_mail_core::CallTransport::Stdio,
             "fetch_topic",
         )?;
         let viewer_id = viewer
@@ -3971,11 +3976,29 @@ pub async fn fetch_inbox(
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
-    // Fetching must return from the live query-only lane without waiting for
-    // archive reconstruction or the write-behind coalescer.  The optional
-    // read-receipt update below targets the live SQLite path directly after
-    // this bounded read has completed.
-    let read_pool = get_coalescer_bypass_read_db_pool()?;
+    // Keep healthy reads on the live query-only lane without waiting for
+    // archive reconstruction or the coalescer. If that pool cannot open,
+    // reuse the verified archive fallback so retained mail stays readable.
+    let live_pool: McpResult<_> = async {
+        let pool = get_coalescer_bypass_read_db_pool()?;
+        // Pool construction is lazy: only acquire proves its file can open.
+        // Return this query-only connection to the pool for scope resolution.
+        let conn = db_outcome_to_mcp_result(
+            pool.acquire(ctx.cx())
+                .await
+                .map_err(|error| mcp_agent_mail_db::DbError::Sqlite(error.to_string())),
+        )?;
+        drop(conn);
+        Ok(pool)
+    }
+    .await;
+    let read_pool = match live_pool {
+        Ok(pool) => crate::tool_util::ToolReadPool::live(pool),
+        Err(error) => {
+            tracing::warn!(error = %error, "live inbox unavailable; trying archive snapshot");
+            crate::tool_util::get_read_db_pool(ctx.cx()).await?
+        }
+    };
     let project = resolve_existing_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -4103,16 +4126,15 @@ pub async fn fetch_inbox(
     // mark_message_read calls — ~80% latency reduction for typical 20-message
     // inbox fetches.
     //
-    // The write-back MUST target the live DB, not the archive snapshot,
-    // because snapshot pools are read-only reconstructions. If the live DB
-    // is degraded the write will fail gracefully (already best-effort).
+    // Only a live read can authorize write-back. Archive snapshots remain
+    // immutable, and their reconstructed IDs may identify different rows in
+    // the live DB. A snapshot read therefore cannot produce a read receipt.
     //
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        let write_path = Some(read_pool.sqlite_path().to_string());
-        if let Some(ref live_sqlite_path) = write_path {
+        if let Some(live_sqlite_path) = read_pool.live_sqlite_path() {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
@@ -4140,7 +4162,7 @@ pub async fn fetch_inbox(
             tracing::warn!(
                 agent_id = agent_id,
                 count = ids.len(),
-                "skipping auto-mark-read because the live DB pool is unavailable (degraded mode)"
+                "skipping auto-mark-read for an archive snapshot inbox"
             );
         }
     }
@@ -4548,6 +4570,118 @@ pub async fn mark_message_read(
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+/// Default number of messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_DEFAULT_LIMIT: usize = 500;
+
+/// Hard cap on messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_MAX_LIMIT: usize = 1000;
+
+/// Bulk mark-read for one agent's inbox in one project (GH#273).
+///
+/// # Parameters
+/// - `project_key`: Project identifier (must already exist; never auto-created)
+/// - `agent_name`: Agent whose unread inbox rows transition to read
+/// - `older_than_days`: Only mark messages created at least this many days ago
+/// - `limit`: Max messages per call (default 500, capped at 1000)
+///
+/// # Returns
+/// `{ agent, marked_count, more, limit, older_than_days }` — `more=true` means
+/// eligible unread messages remain and the caller should call again.
+///
+/// # Conformance
+/// Rust-native (the legacy Python server only exposed bulk mark-read through
+/// the web dashboard).
+#[tool(
+    description = "Mark every unread message in an agent's project inbox as read, in bounded batches.\n\nWhat this does\n--------------\n- Sets read_ts for up to `limit` unread (agent, message) recipient rows in the project, oldest first\n- Acknowledgement state is never touched; ack_required mail still needs `acknowledge_message`\n- Does NOT delete anything; pair with MESSAGES_RETENTION_DAYS retention to bound old mail\n\nWhen to use\n-----------\n- Clearing the backlog of a departed/finished agent so its inbox stops counting as unread\n- Draining stale coordination or ATC liveness mail after a swarm winds down\n- Before enabling message retention pruning (only read+acked mail is ever pruned)\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`). The project must\n    already exist; a typo'd key is an error, never a newly minted project.\nagent_name : str\n    Agent whose inbox is being cleared. Any caller may clear any agent's backlog (operator tool).\nolder_than_days : Optional[int]\n    Only mark messages created at least this many days ago (default: no age filter).\n    Use this to keep fresh mail unread while draining aged backlog.\nlimit : Optional[int]\n    Maximum messages to transition in this call. Default 500, hard cap 1000 (larger values are\n    clamped). The response's `more` flag tells you whether another call is needed.\n\nReturns\n-------\ndict\n    { \"agent\": str, \"marked_count\": int, \"more\": bool, \"limit\": int, \"older_than_days\": int | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"8b\",\"method\":\"tools/call\",\"params\":{\"name\":\"mark_all_read\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"older_than_days\":7\n}}}\n```\n\nDo / Don't\n----------\nDo:\n- Loop while `more` is true to fully drain a large backlog (each call is bounded by design).\n- Use `older_than_days` when the agent is still active and fresh mail should stay unread.\nDon't:\n- Use this as a substitute for reading coordination mail an active agent still needs.\n- Expect acks: ack_required messages remain unacknowledged until `acknowledge_message`."
+)]
+pub async fn mark_all_read(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    older_than_days: Option<i64>,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let agent_name = normalize_agent_name_or_original(agent_name);
+
+    let effective_limit = match limit {
+        None => MARK_ALL_READ_DEFAULT_LIMIT,
+        Some(value) if value < 1 => {
+            return Err(legacy_tool_error(
+                "INVALID_LIMIT",
+                format!("limit must be at least 1, got {value}. Use a positive integer."),
+                true,
+                json!({ "provided": value, "min": 1, "max": MARK_ALL_READ_MAX_LIMIT }),
+            ));
+        }
+        Some(value) => usize::try_from(value)
+            .unwrap_or(MARK_ALL_READ_MAX_LIMIT)
+            .min(MARK_ALL_READ_MAX_LIMIT),
+    };
+
+    let older_than_us = match older_than_days {
+        None => None,
+        Some(days) if days < 0 => {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!("older_than_days must be >= 0, got {days}."),
+                true,
+                json!({ "field": "older_than_days", "provided": days }),
+            ));
+        }
+        Some(days) => Some(
+            mcp_agent_mail_db::now_micros()
+                .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000)),
+        ),
+    };
+
+    let pool = get_db_pool()?;
+    // Bulk mark-read is an operator/cleanup action: the project must already
+    // exist — a typo'd key must never mint a project.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let outcome = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    tracing::info!(
+        project = %project.slug,
+        agent = %agent_name,
+        marked = outcome.marked,
+        more = outcome.more,
+        limit = effective_limit,
+        older_than_days = ?older_than_days,
+        "mark_all_read: bulk-marked inbox messages read"
+    );
+
+    serde_json::to_string(&json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
 // ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
 //
 // When `acknowledge_message` cannot reach the live mailbox (DB corrupt / busy /
@@ -4944,11 +5078,13 @@ mod tests {
             ..DbPoolConfig::default()
         };
         let pool = DbPool::new(&cfg).expect("messaging test pool");
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx, pool));
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs messaging test context");
+            f(cx, pool).await;
+        });
     }
 
     async fn ensure_project_row(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
@@ -4978,6 +5114,104 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
+        let temp = tempfile::tempdir().expect("inbox receipt tempdir");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
+        let storage_root = temp.path().join("archive");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs inbox receipt test context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = DbPool::new(&DbPoolConfig {
+                        database_url: database_url.clone(),
+                        ..DbPoolConfig::default()
+                    })
+                    .expect("live database pool");
+                    let project = ensure_project_row(&cx, &pool, "/live-inbox-receipts").await;
+                    let recipient =
+                        register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                    let message = match queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project.id.unwrap(),
+                        recipient.id.unwrap(),
+                        "live inbox receipt",
+                        "persistent body",
+                        None,
+                        "normal",
+                        true,
+                        "[]",
+                        &[(recipient.id.unwrap(), "to")],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(message) => message,
+                        outcome => panic!("seed live message: {outcome:?}"),
+                    };
+                    let mut first_read_ts = None;
+                    for mark_read in [Some(false), None, Some(false), Some(true)] {
+                        let response = fetch_inbox(
+                            &ctx,
+                            project.human_key.clone(),
+                            recipient.name.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            None,
+                            None,
+                            None,
+                            mark_read,
+                        )
+                        .await
+                        .expect("fetch live inbox");
+                        let messages: serde_json::Value =
+                            serde_json::from_str(&response).expect("inbox JSON");
+                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                        assert_eq!(messages[0]["id"].as_i64(), message.id);
+                        assert_eq!(messages[0]["body_md"], "persistent body");
+                        let conn = mcp_agent_mail_db::DbConn::open_file(
+                            database_path.to_str().expect("database path"),
+                        )
+                        .expect("independent live database connection");
+                        let rows = conn
+                            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                            .expect("read durable receipt");
+                        assert_eq!(rows.len(), 1);
+                        let read_ts = rows[0].get_named::<Option<i64>>("read_ts").unwrap();
+                        let ack_ts = rows[0].get_named::<Option<i64>>("ack_ts").unwrap();
+                        if mark_read.unwrap_or(true) {
+                            assert!(
+                                read_ts.is_some(),
+                                "live fetch must persist its read receipt"
+                            );
+                            first_read_ts = first_read_ts.or(read_ts);
+                        }
+                        assert_eq!(
+                            read_ts, first_read_ts,
+                            "peek and repeated reads preserve the first receipt"
+                        );
+                        assert_eq!(
+                            messages[0]["read_ts"],
+                            serde_json::to_value(read_ts.map(micros_to_iso)).unwrap()
+                        );
+                        assert!(ack_ts.is_none(), "reading must not acknowledge a message");
+                        assert!(messages[0]["ack_ts"].is_null());
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
     fn send_message_reply_is_bounded_and_db_durable_with_async_archive() {
         // br-ack-fast-storage-commit-reply-3ac88 acceptance (a)+(b): the tool reply
         // returns as soon as the SQLite row is durable; git-archive materialization is
@@ -5002,11 +5236,11 @@ mod tests {
             ],
             || {
                 Config::reset_cached();
-                let cx = Cx::for_testing();
                 let rt = RuntimeBuilder::current_thread()
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs durable reply test context");
                     let ctx = McpContext::new(cx.clone(), 1);
                     let project_key = format!(
                         "/data/projects/ack-fast-{}",
@@ -5026,6 +5260,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register sender");
@@ -5037,6 +5272,7 @@ mod tests {
                         Some("GreenStone".to_string()),
                         Some("recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5140,11 +5376,11 @@ mod tests {
             ],
             || {
                 Config::reset_cached();
-                let cx = Cx::for_testing();
                 let rt = RuntimeBuilder::current_thread()
                     .build()
                     .expect("build runtime");
                 rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs recipient replacement context");
                     let ctx = McpContext::new(cx.clone(), 1);
                     let project_key = format!(
                         "/data/projects/messaging-upsert-{}",
@@ -5165,6 +5401,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register sender");
@@ -5176,6 +5413,7 @@ mod tests {
                         Some("GreenStone".to_string()),
                         Some("stable recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5193,6 +5431,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register replaceable recipient");
@@ -5207,6 +5446,7 @@ mod tests {
                         Some("AzureCanyon".to_string()),
                         Some("recipient activity refresh".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -5238,6 +5478,7 @@ mod tests {
                         Some("AzureCanyon".to_string()),
                         Some("replacement recipient".to_string()),
                         Some("auto".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -8199,47 +8440,17 @@ mod tests {
     fn enqueue_lexical_index_does_not_panic() {
         // When the global Tantivy bridge is not initialized,
         // enqueue_message_lexical_index should silently no-op.
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 1,
-            project_id: 1,
-            project_slug: "test-project".into(),
-            sender_name: "TestAgent".into(),
-            subject: "Test Subject".into(),
-            body_md: "Test body".into(),
-            thread_id: Some("thread-1".into()),
-            importance: "normal".into(),
-            created_ts: 1_000_000,
-        });
+        enqueue_message_lexical_index(":memory:", 1);
         // If we reach here, the function didn't panic.
     }
 
     #[test]
-    fn enqueue_lexical_index_none_thread_id_does_not_panic() {
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 2,
-            project_id: 1,
-            project_slug: "proj".into(),
-            sender_name: "Agent".into(),
-            subject: "Subject".into(),
-            body_md: "Body".into(),
-            thread_id: None,
-            importance: "high".into(),
-            created_ts: 0,
-        });
+    fn enqueue_lexical_index_missing_source_does_not_panic() {
+        enqueue_message_lexical_index("", 2);
     }
 
     #[test]
-    fn enqueue_lexical_index_empty_fields_does_not_panic() {
-        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-            id: 0,
-            project_id: 0,
-            project_slug: String::new(),
-            sender_name: String::new(),
-            subject: String::new(),
-            body_md: String::new(),
-            thread_id: None,
-            importance: String::new(),
-            created_ts: 0,
-        });
+    fn enqueue_lexical_index_zero_id_does_not_panic() {
+        enqueue_message_lexical_index(":memory:", 0);
     }
 }

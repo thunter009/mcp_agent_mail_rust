@@ -152,21 +152,35 @@ e2e_assert_contains "help lists agents subcommand" "$AM_HELP_OUT" "agents"
 # ===========================================================================
 # Case 7: am doctor check runs without hard failure on fresh system
 # ===========================================================================
-e2e_case_banner "am doctor check exits cleanly on fresh system"
+e2e_case_banner "am doctor check reports health or findings without crashing"
 
 set +e
-DOCTOR_OUT="$("$FAKE_DEST/am" doctor check 2>&1)"
+DOCTOR_OUT="$(env -i HOME="$FAKE_HOME" PATH="$PATH" NO_COLOR=1 \
+  AM_INTERFACE_MODE=cli STORAGE_ROOT="$STORAGE_ROOT" \
+  DATABASE_URL="sqlite:///${FAKE_HOME}/doctor-uninitialized.sqlite3" \
+  HTTP_HOST=127.0.0.1 HTTP_PORT=1 "$FAKE_DEST/am" doctor check 2>&1)"
 DOCTOR_RC=$?
 set -e
 
 e2e_save_artifact "case_07_doctor_check.txt" "$DOCTOR_OUT"
 # Doctor may return non-zero if no storage exists yet, but should not crash
-# Accept exit codes 0 (all green) or 1 (warnings) — NOT segfault/panic
-if [ "$DOCTOR_RC" -le 1 ]; then
-  e2e_assert_exit_code "am doctor check (0 or 1)" "0" "0"
+# Accept exit codes 0 (healthy) or 1 (findings) — NOT segfault/panic.
+e2e_assert_exit_code_in "am doctor check accepts health or findings" "$DOCTOR_RC" 0 1
+DOCTOR_STATE="invalid_output"
+if grep -Eiq 'panicked at|fatal runtime error|segmentation fault' <<< "$DOCTOR_OUT"; then
+  DOCTOR_STATE="crash_output"
+  e2e_fail "doctor output reports a crash despite its exit code"
+elif [ "$DOCTOR_RC" -eq 0 ] && grep -Fq 'All checks passed.' <<< "$DOCTOR_OUT"; then
+  DOCTOR_STATE="healthy"
+  e2e_pass "doctor reports healthy checks"
+elif [ "$DOCTOR_RC" -eq 1 ] && grep -Fq 'Some checks failed.' <<< "$DOCTOR_OUT"; then
+  DOCTOR_STATE="findings_on_fresh_system"
+  e2e_pass "doctor reports findings on the uninitialized system; not a healthy verdict"
 else
-  e2e_assert_exit_code "am doctor check should not panic" "0" "$DOCTOR_RC"
+  e2e_fail "doctor output does not match its observed exit code $DOCTOR_RC"
 fi
+e2e_save_artifact "case_07_doctor_exit.json" \
+  "{\"actual_exit_code\":$DOCTOR_RC,\"expected_exit_codes\":[0,1],\"state\":\"$DOCTOR_STATE\"}"
 
 # ===========================================================================
 # Case 8: mcp-agent-mail serve-stdio responds to MCP initialize
@@ -515,6 +529,39 @@ CREATE TABLE IF NOT EXISTS projects (
   human_key TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  program TEXT NOT NULL,
+  model TEXT NOT NULL,
+  task_description TEXT NOT NULL DEFAULT '',
+  inception_ts DATETIME NOT NULL,
+  last_active_ts DATETIME NOT NULL,
+  attachments_policy TEXT NOT NULL DEFAULT 'auto',
+  contact_policy TEXT NOT NULL DEFAULT 'auto',
+  UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  thread_id TEXT,
+  subject TEXT NOT NULL,
+  body_md TEXT NOT NULL,
+  importance TEXT NOT NULL DEFAULT 'normal',
+  ack_required INTEGER NOT NULL DEFAULT 0,
+  created_ts DATETIME NOT NULL,
+  attachments TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS message_recipients (
+  message_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'to',
+  read_ts DATETIME,
+  ack_ts DATETIME,
+  PRIMARY KEY(message_id, agent_id)
+);
 INSERT INTO projects (id, slug, human_key, created_at)
 VALUES (1, 'legacy-install-smoke', '/tmp/legacy-install-smoke', '2026-03-01 12:34:56.123456');
 SQL
@@ -773,6 +820,358 @@ PY
     fi
   fi
 
+  # br-kx4u4: credential-bearing shell writers must never mutate a tracked
+  # project file through a hard-link alias, follow a leaf symlink, or write
+  # through a symlinked parent. Rename-based writers detach the alias; the
+  # external Claude CLI seam defers to native setup on aliased targets.
+  BRKX4U4_DIR="${FAKE_HOME}/br-kx4u4-contract"
+  mkdir -p "${BRKX4U4_DIR}/repo" \
+    "${BRKX4U4_DIR}/home/.opencode" \
+    "${BRKX4U4_DIR}/home/.codex"
+
+  OPENCODE_LIB="${BRKX4U4_DIR}/opencode-writer.sh"
+  sed -n '/^setup_single_opencode_json_config() {/,/^setup_single_mcp_config() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${OPENCODE_LIB}"
+  GENERIC_LIB="${BRKX4U4_DIR}/generic-writer.sh"
+  sed -n '/^setup_single_mcp_config() {/,/^setup_claude_code_mcp_via_cli() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${GENERIC_LIB}"
+  TOML_LIB="${BRKX4U4_DIR}/toml-writer.sh"
+  {
+    # The TOML writer shares the installer's private backup/publication path.
+    # Import those real helpers; only their logging adapters are test-local.
+    cat <<'TOML_LOGGING'
+warn() { printf '%s\n' "$*" >&2; }
+info() { printf '%s\n' "$*"; }
+TOML_LOGGING
+    sed -n '/^private_file_identity() {/,/^migrate_env_config() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+    sed -n '/^ensure_real_directory_tree() {/,/^write_launchd_service_plist() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+    sed -n '/^setup_single_toml_config() {/,/^setup_single_standard_http_json_config() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+  } > "${TOML_LIB}"
+  ALIAS_LIB="${BRKX4U4_DIR}/alias-guard.sh"
+  sed -n '/^config_target_is_hardlink_aliased() {/,/^mcp_config_must_skip_shell_write() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${ALIAS_LIB}"
+
+  if [ -s "${OPENCODE_LIB}" ] && [ -s "${GENERIC_LIB}" ] && [ -s "${TOML_LIB}" ] && [ -s "${ALIAS_LIB}" ]; then
+    for lib in "${OPENCODE_LIB}" "${GENERIC_LIB}"; do
+      if grep -Fq 'open(config_path' "${lib}"; then
+        e2e_fail "JSON writer avoids in-place pathname opens ($(basename "${lib}"))" \
+          "no through-pathname config opens" "$(grep -Fc 'open(config_path' "${lib}") found"
+      else
+        e2e_pass "JSON writer avoids in-place pathname opens ($(basename "${lib}"))"
+      fi
+      if grep -Fq 'shutil' "${lib}"; then
+        e2e_fail "JSON writer avoids follow-the-link copies ($(basename "${lib}"))" \
+          "no shutil use" "shutil found"
+      else
+        e2e_pass "JSON writer avoids follow-the-link copies ($(basename "${lib}"))"
+      fi
+    done
+    if grep -Fq 'cat > "$config_path"' "${TOML_LIB}"; then
+      e2e_fail "TOML writer avoids redirection create seam" \
+        "atomic replacement" "cat > found"
+    else
+      e2e_pass "TOML writer avoids redirection create seam"
+    fi
+    if grep -Fq 'os.replace' "${OPENCODE_LIB}" \
+      && grep -Fq 'os.replace' "${GENERIC_LIB}" \
+      && grep -Fq 'os.replace' "${TOML_LIB}"; then
+      e2e_pass "JSON/TOML writers replace via rename, not in-place truncation"
+    else
+      e2e_fail "JSON/TOML writers replace via rename, not in-place truncation" \
+        "os.replace in every writer" "missing"
+    fi
+    if grep -Fq 'config_target_is_hardlink_aliased "$claude_code_config_path"' "${INSTALL_SH}"; then
+      e2e_pass "Claude CLI seam defers to native setup on aliased targets"
+    else
+      e2e_fail "Claude CLI seam defers to native setup on aliased targets" \
+        "hard-link guard wired" "missing"
+    fi
+
+    OPENCODE_REPO_FILE="${BRKX4U4_DIR}/repo/opencode.json"
+    OPENCODE_OUTSIDE="${BRKX4U4_DIR}/home/.opencode/opencode.json"
+    printf '%s\n' '{"keep":"tracked-project-bytes"}' > "${OPENCODE_REPO_FILE}"
+    ln "${OPENCODE_REPO_FILE}" "${OPENCODE_OUTSIDE}"
+    OPENCODE_ALIASED_INO="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${OPENCODE_REPO_FILE}")"
+    set +e
+    (
+      # These stubs are invoked by the sourced installer helper.
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'alias-fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${OPENCODE_LIB}"
+      setup_single_opencode_json_config opencode "${OPENCODE_OUTSIDE}"
+    )
+    OPENCODE_ALIAS_RC=$?
+    set -e
+    e2e_assert_exit_code "OpenCode writer updates an outside hard-linked config" \
+      "0" "${OPENCODE_ALIAS_RC}"
+    e2e_assert_eq "OpenCode writer keeps hard-linked project bytes untouched" \
+      '{"keep":"tracked-project-bytes"}' "$(cat "${OPENCODE_REPO_FILE}")"
+    e2e_assert_eq "OpenCode writer keeps hard-linked project inode stable" \
+      "${OPENCODE_ALIASED_INO}" \
+      "$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${OPENCODE_REPO_FILE}")"
+    if grep -q 'alias-fresh-token' "${OPENCODE_REPO_FILE}"; then
+      e2e_fail "OpenCode writer keeps the bearer token out of the tracked project file" \
+        "no token" "token found"
+    else
+      e2e_pass "OpenCode writer keeps the bearer token out of the tracked project file"
+    fi
+    OPENCODE_ENTRY_CHECK="$(python3 - "${OPENCODE_OUTSIDE}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    entry = json.load(handle)["mcp"]["mcp-agent-mail"]
+assert entry["type"] == "remote"
+assert entry["headers"]["Authorization"] == "Bearer alias-fresh-token"
+print("valid")
+PY
+)"
+    e2e_assert_eq "ordinary outside config still receives the OpenCode credential update" \
+      "valid" "${OPENCODE_ENTRY_CHECK}"
+
+    OPENCODE_LINK_TARGET="${BRKX4U4_DIR}/opencode-symlink-target.json"
+    OPENCODE_LINKED="${BRKX4U4_DIR}/home/.opencode/linked-opencode.json"
+    printf '%s\n' '{"sentinel":"must-not-change"}' > "${OPENCODE_LINK_TARGET}"
+    ln -s "${OPENCODE_LINK_TARGET}" "${OPENCODE_LINKED}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'alias-fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${OPENCODE_LIB}"
+      setup_single_opencode_json_config opencode "${OPENCODE_LINKED}"
+    )
+    OPENCODE_LINK_RC=$?
+    set -e
+    e2e_assert_exit_code "OpenCode writer refuses symlinked config targets" \
+      "2" "${OPENCODE_LINK_RC}"
+    e2e_assert_eq "OpenCode writer leaves symlink target untouched" \
+      '{"sentinel":"must-not-change"}' "$(cat "${OPENCODE_LINK_TARGET}")"
+
+    GENERIC_REPO_FILE="${BRKX4U4_DIR}/repo/claude_desktop_config.json"
+    GENERIC_OUTSIDE="${BRKX4U4_DIR}/home/claude_desktop_config.json"
+    printf '%s\n' '{"mcpServers":{"sibling":{"command":"keep-cmd"}}}' > "${GENERIC_REPO_FILE}"
+    ln "${GENERIC_REPO_FILE}" "${GENERIC_OUTSIDE}"
+    GENERIC_ALIASED_INO="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${GENERIC_REPO_FILE}")"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${GENERIC_LIB}"
+      setup_single_mcp_config cursor "${GENERIC_OUTSIDE}" /bin/false generic-fresh-token ""
+    )
+    GENERIC_ALIAS_RC=$?
+    set -e
+    e2e_assert_exit_code "generic JSON writer inserts into an outside hard-linked config" \
+      "0" "${GENERIC_ALIAS_RC}"
+    e2e_assert_eq "generic JSON writer keeps hard-linked project bytes untouched" \
+      '{"mcpServers":{"sibling":{"command":"keep-cmd"}}}' "$(cat "${GENERIC_REPO_FILE}")"
+    e2e_assert_eq "generic JSON writer keeps hard-linked project inode stable" \
+      "${GENERIC_ALIASED_INO}" \
+      "$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${GENERIC_REPO_FILE}")"
+    if grep -q 'generic-fresh-token' "${GENERIC_REPO_FILE}"; then
+      e2e_fail "generic JSON writer keeps the bearer token out of the tracked project file" \
+        "no token" "token found"
+    else
+      e2e_pass "generic JSON writer keeps the bearer token out of the tracked project file"
+    fi
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${GENERIC_LIB}"
+      setup_single_mcp_config cursor "${GENERIC_OUTSIDE}" /bin/false generic-fresh-token ""
+    )
+    GENERIC_SECOND_RC=$?
+    set -e
+    e2e_assert_exit_code "generic JSON writer skips an already-present entry" \
+      "1" "${GENERIC_SECOND_RC}"
+
+    GENERIC_DANGLING="${BRKX4U4_DIR}/home/dangling.json"
+    ln -s "${BRKX4U4_DIR}/repo/absent-target.json" "${GENERIC_DANGLING}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${GENERIC_LIB}"
+      setup_single_mcp_config cursor "${GENERIC_DANGLING}" /bin/false generic-create-token ""
+    )
+    GENERIC_DANGLING_RC=$?
+    set -e
+    e2e_assert_exit_code "generic JSON writer refuses a dangling symlink create target" \
+      "2" "${GENERIC_DANGLING_RC}"
+    if [ -e "${BRKX4U4_DIR}/repo/absent-target.json" ]; then
+      e2e_fail "generic dangling symlink refusal leaves the target absent" \
+        "absent" "created"
+    else
+      e2e_pass "generic dangling symlink refusal leaves the target absent"
+    fi
+
+    GENERIC_PARENT_REAL="${BRKX4U4_DIR}/parent-real"
+    GENERIC_PARENT_LINK="${BRKX4U4_DIR}/home/parent-link"
+    mkdir -p "${GENERIC_PARENT_REAL}"
+    ln -s "${GENERIC_PARENT_REAL}" "${GENERIC_PARENT_LINK}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${GENERIC_LIB}"
+      setup_single_mcp_config cursor "${GENERIC_PARENT_LINK}/new.json" /bin/false generic-create-token ""
+    )
+    GENERIC_PARENT_RC=$?
+    set -e
+    e2e_assert_exit_code "generic JSON writer refuses a symlinked config parent" \
+      "2" "${GENERIC_PARENT_RC}"
+    if [ -e "${GENERIC_PARENT_REAL}/new.json" ]; then
+      e2e_fail "generic symlinked-parent refusal leaves the destination absent" \
+        "absent" "created"
+    else
+      e2e_pass "generic symlinked-parent refusal leaves the destination absent"
+    fi
+
+    GENERIC_FRESH_DIR="${BRKX4U4_DIR}/home/fresh-tool"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${GENERIC_LIB}"
+      setup_single_mcp_config cursor "${GENERIC_FRESH_DIR}/config.json" /bin/false generic-create-token ""
+    )
+    GENERIC_FRESH_RC=$?
+    set -e
+    e2e_assert_exit_code "generic JSON writer still creates an ordinary fresh config" \
+      "0" "${GENERIC_FRESH_RC}"
+
+    TOML_REPO_FILE="${BRKX4U4_DIR}/repo/config.toml"
+    TOML_OUTSIDE="${BRKX4U4_DIR}/home/.codex/config.toml"
+    printf '%s\n' '# tracked sentinel' 'other_section = true' > "${TOML_REPO_FILE}"
+    ln "${TOML_REPO_FILE}" "${TOML_OUTSIDE}"
+    TOML_ALIASED_INO="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${TOML_REPO_FILE}")"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'toml-fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${TOML_LIB}"
+      setup_single_toml_config codex "${TOML_OUTSIDE}" /bin/false
+    )
+    TOML_ALIAS_RC=$?
+    set -e
+    e2e_assert_exit_code "TOML writer updates an outside hard-linked config" \
+      "0" "${TOML_ALIAS_RC}"
+    e2e_assert_eq "TOML writer keeps hard-linked project bytes untouched" \
+      $'# tracked sentinel\nother_section = true' "$(cat "${TOML_REPO_FILE}")"
+    e2e_assert_eq "TOML writer keeps hard-linked project inode stable" \
+      "${TOML_ALIASED_INO}" \
+      "$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "${TOML_REPO_FILE}")"
+    if grep -q 'toml-fresh-token' "${TOML_REPO_FILE}"; then
+      e2e_fail "TOML writer keeps the bearer token out of the tracked project file" \
+        "no token" "token found"
+    else
+      e2e_pass "TOML writer keeps the bearer token out of the tracked project file"
+    fi
+    if grep -q 'toml-fresh-token' "${TOML_OUTSIDE}"; then
+      e2e_pass "TOML writer writes the bearer token only to the outside config"
+    else
+      e2e_fail "TOML writer writes the bearer token only to the outside config" \
+        "token present" "missing"
+    fi
+
+    TOML_DANGLING="${BRKX4U4_DIR}/home/.codex/dangling.toml"
+    ln -s "${BRKX4U4_DIR}/repo/absent.toml" "${TOML_DANGLING}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'toml-fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${TOML_LIB}"
+      setup_single_toml_config codex "${TOML_DANGLING}" /bin/false
+    )
+    TOML_DANGLING_RC=$?
+    set -e
+    e2e_assert_exit_code "TOML writer refuses a dangling symlink create target" \
+      "2" "${TOML_DANGLING_RC}"
+    if [ -e "${BRKX4U4_DIR}/repo/absent.toml" ]; then
+      e2e_fail "TOML dangling symlink refusal leaves the target absent" \
+        "absent" "created"
+    else
+      e2e_pass "TOML dangling symlink refusal leaves the target absent"
+    fi
+
+    TOML_FRESH_DIR="${BRKX4U4_DIR}/home/.codex-fresh"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'toml-fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${TOML_LIB}"
+      setup_single_toml_config codex "${TOML_FRESH_DIR}/config.toml" /bin/false
+    )
+    TOML_FRESH_RC=$?
+    set -e
+    e2e_assert_exit_code "TOML writer still creates an ordinary fresh config" \
+      "0" "${TOML_FRESH_RC}"
+    if grep -Fq '[mcp_servers.mcp_agent_mail]' "${TOML_FRESH_DIR}/config.toml"; then
+      e2e_pass "TOML fresh create emits the canonical section"
+    else
+      e2e_fail "TOML fresh create emits the canonical section" \
+        "section present" "missing"
+    fi
+
+    # The writers above detach their aliases via rename, so the probe gets
+    # a fresh hard link to a tracked project file.
+    ALIAS_PROBE_LINK="${BRKX4U4_DIR}/home/probe-link.json"
+    ln "${GENERIC_REPO_FILE}" "${ALIAS_PROBE_LINK}"
+    ALIAS_PROBE="$(set +e
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${ALIAS_LIB}"
+      config_target_is_hardlink_aliased "${ALIAS_PROBE_LINK}"
+      echo "rc=$?"
+      config_target_is_hardlink_aliased "${OPENCODE_OUTSIDE}"
+      echo "rc=$?"
+      config_target_is_hardlink_aliased "${BRKX4U4_DIR}/home/absent.json"
+      echo "rc=$?"
+    )"
+    e2e_assert_eq "alias guard flags a hard-linked external target" \
+      "rc=0" "$(printf '%s\n' "${ALIAS_PROBE}" | sed -n 1p)"
+    e2e_assert_eq "alias guard passes a detached single-link target" \
+      "rc=1" "$(printf '%s\n' "${ALIAS_PROBE}" | sed -n 2p)"
+    e2e_assert_eq "alias guard passes a missing target" \
+      "rc=1" "$(printf '%s\n' "${ALIAS_PROBE}" | sed -n 3p)"
+  else
+    e2e_fail "extract br-kx4u4 writer libraries" "four function bodies" "missing"
+  fi
   OMP_DETECT_LIBRARY="${MCP_DETECT_LIBRARY}"
   if [ ! -s "${OMP_DETECT_LIBRARY}" ]; then
     e2e_fail "extract OMP installer detector" "function body" "missing"
@@ -1465,7 +1864,15 @@ EOF
 
     legacy_private_mode() {
       local path="$1"
-      stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path" 2>/dev/null
+      local mode
+      # Branch, never concatenate: on GNU coreutils the BSD probe exits
+      # nonzero while still printing a filesystem-status block, so an
+      # `A || B` capture would yield multi-line garbage instead of a mode.
+      if mode=$(stat -f '%Lp' "$path" 2>/dev/null); then
+        printf '%s' "$mode"
+      elif mode=$(stat -c '%a' "$path" 2>/dev/null); then
+        printf '%s' "$mode"
+      fi
     }
     e2e_assert_eq "outside canonical env is private" \
       "600" "$(legacy_private_mode "${LEGACY_OUTSIDE_CONFIG}")"
