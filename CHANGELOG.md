@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-The latest review covers [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
-and the installer correction on `main`. Entries use git diffs, tag targets,
+Scope window: [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -26,6 +26,93 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+These changes are not a published release. Dependency upgrades and the full
+release validation remain in progress; selected passing tests do not establish
+release readiness.
+
+- **Recover small archive deltas containing empty projects in place.** Missing
+  project records no longer force a full mailbox reconstruction merely because
+  they have no messages. Project and message limits apply independently;
+  malformed metadata and conflicting message IDs roll back the transaction
+  (`br-lwx55`, GH #284).
+- **Restore valid backups when live health probing finds a truncated primary.**
+  Proven header truncation now reaches recovery instead of aborting before
+  backup selection. Other namespace and file-access refusals remain errors
+  (`br-7o04e`).
+- **Update WinSafe to 0.0.29.** Windows kernel API integration passes the
+  native core suite: 1,873 tests, including no-clobber moves and setup
+  replacement-race regressions.
+- **Refuse mixed database generations during health probes.** Idle staging
+  retains each database and recovery-sidecar identity, presence and content
+  digest, then verifies the copied bytes and rechecks the source family.
+  A concurrent replacement, rewrite, arrival or disappearance causes a retry
+  instead of a verdict on mismatched files. Thirty-four focused staging,
+  health and backup regressions pass (`br-zchj0`).
+- **Update the terminal UI to FrankenTUI 0.7.0.** Console capability detection
+  uses the new color-depth API and keeps monochrome, ANSI16 and ANSI256
+  terminals from advertising true-color support. Platform backend selection
+  remains explicit. All 3,392 selected console, TUI and golden tests pass
+  without snapshot changes.
+- **Keep Beads queries on the selected workspace and show current list results.**
+  Commands clear the inherited `BEADS_DB` override, which could redirect a
+  validated workspace query to another database. List decoding recognizes
+  the current `issues` envelope instead of silently reporting no matches;
+  ready-command arrays remain supported. Real Beads 0.6.0 integration tests
+  cover both fixes.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dc856b33); `br-8nski`, `br-q0b1m`)
+- **Update embedded Beads to 0.6.0.** Workspace discovery and real CLI
+  integration pass 24 selected tests. Optional self-update features remain
+  disabled, and the separate older SQLite engine keeps its existing patches.
+- **Repair native Windows file and path handling.** Evidence-ledger writes
+  no longer probe an incomplete drive prefix, file-lock contention uses the
+  platform's actual error code, and setup status redacts native home paths.
+  Free-space queries consistently reject missing paths on Windows and Unix.
+  Native Windows core qualification passes 1,873 tests; Linux passes 1,960.
+  ([repairs](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4532724b))
+- **Setup honors Claude Code's active configuration profile.**
+  `CLAUDE_CONFIG_DIR` now selects the user and project-local MCP configuration
+  authority, including relative overrides resolved from the launch directory.
+  Invalid overrides fail before writes, and status checks inspect the exact
+  project scope instead of allowing a healthy global entry to hide local drift.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/360bf6f55aac553d6f5cc0e7dce8eb8f4cd685ac); `br-vcwkm`)
+- **Antigravity setup writes a working HTTP transport configuration.**
+  Generated entries use `serverUrl`, as required by the current `agy` CLI;
+  the previous `httpUrl` field was interpreted as an incomplete stdio entry.
+  Status checks recognize that mismatch and setup repairs existing entries.
+  Gemini's separate `httpUrl` configuration remains supported.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/038a7d18); `br-tip25`)
+- **Mailbox dependencies move to FrankenSQLite 0.4.4.** SQLModel 0.5.0,
+  Asupersync 0.5.0, FastMCP 0.10.0 and FrankenSearch 0.6.0 move together so
+  database and reranker contexts remain compatible. FastMCP stays pinned to
+  the upstream negotiation repair, preserving newer clients' initialization
+  proposals. Embedded Beads retains its separate patched 0.3.18 engine.
+  The 0.4.4 engine revision carries forward prepared-DML binding and stored
+  CREATE-prefix fixes omitted from the published release. Migration tracking
+  gains SQLModel's checksum column while preserving existing records.
+  Upgrade qualification is tracked in `UPGRADE_LOG.md` and `br-5lgwn`.
+- **Preserve parameters when replaying `INSERT ... SELECT` with UPSERT.**
+  The pinned engine resolves original UPSERT and RETURNING bindings before
+  replaying materialized rows, including attached-database targets. This
+  repairs the out-of-range binding error exposed by sibling-discovery
+  persistence. Six SQLite differential tests and all twelve application
+  sibling-discovery regressions pass; broader release validation remains open.
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/24ae22dafad39b8e0333f7e4c1719efa55813d2b))
+- **Bound retained database descriptors on Linux.** Repeated opens reuse an
+  existing lock-domain descriptor after inode and access checks. Regression
+  tests verify the descriptor bound, foreign-process lock exclusion, permission
+  revocation, replacement paths and exclusive creation. Other operating
+  systems retain their existing descriptor implementation.
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/db458bfba780e79d099d9f8986da5a1f7b360901))
+- **Update rustls to 0.23.45**, addressing `RUSTSEC-2026-0285` in the
+  previous 0.23.43 dependency. Transport regression validation is tracked
+  with the dependency upgrade above.
+- **Update HTML sanitization to Ammonia 4.2.0**, including its HTML5ever
+  0.40 and CSS parser 0.38 dependencies. Existing Markdown, XSS rejection,
+  transport, and ACK-TTL regressions pass with the updated sanitizer.
+- **Source builds pin FrankenSearch directly to an immutable git revision.**
+  Cargo no longer reads a mutable sibling checkout, so updating that checkout
+  cannot break this workspace. Package versions and features are unchanged;
+  manual builds no longer require FrankenSearch or fast_cmaes siblings. (#325)
 - **CLI commands discover a mailbox daemon's nondefault port.** Mail, inbox,
   registration and other proxy commands use verified listener hints for the
   mailbox's sole exclusive owner when no endpoint was explicitly configured.
@@ -50,6 +137,106 @@ Recent releases; the earlier version history continues below.
   files, while rejecting unexpected paths, duplicate entries, missing binaries,
   and links. This correction follows the v0.3.36 tag: use the documented
   installer URL on `main`, not the installer script frozen at that tag.
+- **Proactive exports use SQLite-compatible NOCASE ordering; automatic backup
+  staging and retries are bounded.** With `INTEGRITY_CHECK_ON_STARTUP=true`, a live mailbox that
+  passes canonical `integrity_check` could still fail `create_proactive_backup` every
+  quick cycle, because the exported copy writes `COLLATE NOCASE` indexes in the primary
+  engine's key order and canonical SQLite reads that ordering as corruption. Each failed
+  cycle also preserved a ~24 MB staging directory with no sweeper. The pinned
+  [engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/dbcc7adb5d2491504af4c07a38a58378522f5a07)
+  corrects ASCII case folding, punctuation ordering and embedded-NUL comparisons;
+  canonical full-integrity validation remains strict. Four real export and
+  public-backup regressions pass with this pin. Staging is now
+  admission-controlled and descriptor-bound, retry admission persists across restarts,
+  rotation can no longer overwrite quarantine evidence, and reclaim never touches a live
+  database whose name carries a recovery marker.
+  ([GH #326](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/326))
+- **Installer cleanup preserves the original exit status.** The EXIT handler
+  disables ERR-trap re-entry, avoiding a second generic error reported at line 1,
+  and successful completion explicitly exits zero. An explicit completion marker
+  prevents Bash 3.2 from masking fatal unset-variable errors. Expected GNU/BSD
+  `stat` fallbacks and Git discovery probes no longer emit spurious ERR diagnostics
+  on macOS. Full signed v0.3.36 installs pass through both file and stdin entry
+  points on Linux and native macOS Bash 3.2; 22 exit controls preserve required
+  client-setup failures. The reporter-specific environment in #327 remains under
+  investigation.
+  ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9686e9b47c797d15c742585470f47e3bdb739488),
+  [native-shell hardening](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4d181f8a),
+  [GH #327](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/327))
+- **`am robot overview` is much cheaper at multi-project scale.** Per-project counting
+  no longer issues a query loop: recipient counts come from one grouped query, a single
+  reservation candidate scan supplies both counts and orphan-project visibility, and
+  completed project history is skipped during inventory. The main enumeration work drops
+  from `2 + 4 x project_count` statements to a small constant.
+  ([GH #274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
+- **ATC no longer stalls MCP under large agent populations.** Recency hydration runs in
+  bounded slices before inference, notification admission is bounded before durable
+  effects are written, and routine liveness sampling no longer appends ordinary messages
+  to durable mail. Scheduling stays fair across deferred dispatch instead of reordering
+  critical effects.
+  ([GH #258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/258),
+  [GH #264](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/264))
+- **Integrity gating requires fresh, complete evidence before writes are released.**
+  Corruption-recovery authorization is bound to a fresh observation epoch, the server
+  refuses writes after a reconciled integrity failure, migrations are checksummed and
+  drift is refused before pending work runs, and `am doctor` keeps complete hash-witnessed
+  ref backups before any destructive recovery, failing closed on unowned or failed
+  orphan-ref repair.
+- **Message archives reconcile against verified Git objects, without clobbering.**
+  Live mailbox rows reconcile with bounded catch-up and backfill against the configured
+  live database rather than a snapshot, threaded archive bundles can be recovered from
+  surviving inboxes, and the maintenance worker runs bounded archive healing. (`br-8j6cb`)
+- **Search response caches preserve query identity and fail closed.** Cache generation
+  changes are atomic with respect to reads and writes, query identity and grammar are part
+  of the cache key so distinct queries cannot alias, and search fails closed when the
+  sender visibility policy is unavailable rather than answering without it.
+- **New: sibling-project suggestions.** The database can generate bounded sibling-project
+  suggestions from live mailbox metadata, and the CLI exposes explicit task-informed
+  sibling discovery with durable write reporting.
+- **Further dependency updates.** Clap 4.6.7 (after parser and help regression tests),
+  IndexMap 2.14.2, smallvec 1.16.1, and jsonwebtoken 11.1.0.
+- **Lint gate repairs in `mcp-agent-mail-db`.** `SearchResponseCache::bump_epoch` no longer
+  holds the entries write guard while acquiring the metrics lock — the epoch bump and the
+  clear remain atomic with respect to `get`/`put`, which is what that function documents,
+  but metrics bookkeeping now happens after the guard is released. A score blend uses
+  `mul_add`, and two test assertions now report the offending value on failure. These were
+  caught by `cargo clippy --all-targets -- -D warnings`; `cargo check` and a plain
+  `cargo test` both passed with them present.
+- **The test suite builds again.** Two separate refactors in this window left test-only code
+  that no longer compiled, which `cargo check` and a plain `cargo test` could not surface:
+  fixtures in `cleanup.rs` debug-formatted an `Outcome` whose success type is a pooled
+  connection (Asupersync's `Outcome<T, E>` derives `Debug`, so it only *has* `Debug` when
+  `T: Debug`), and `tests/atc_notification_admission.rs` still constructed `Config` with an
+  `atc_executor_mode` field that had moved to the `AM_ATC_EXECUTOR_MODE` environment variable
+  and the server layer. Both are fixed, and the failing fixtures now report which outcome
+  variant they actually got instead of printing the whole value.
+- **ATC fails closed after a population refresh failure**, keeping the last good roster
+  snapshot for retries rather than proceeding against a partially-loaded population, and the
+  wider ATC reliability series is folded in.
+- **`am robot overview --counts` skips more history.** Recipient counting no longer walks read
+  non-acknowledged history, and counts-only mode skips known-project reservation history
+  entirely, on top of the earlier per-project query-loop removal.
+  ([GH #274](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/274))
+- **Lint gate repairs in `mcp-agent-mail-server`.** Assertions that checked emptiness now print
+  the offending value, a constant-size chunk walk uses `as_chunks`, a retry-window computation
+  uses `Duration::saturating_sub` instead of an unchecked `Instant - Duration`, and two
+  `#[allow]`s are recorded deliberately: `redundant_pub_crate` on items that `atc.rs` re-exports
+  through `pub use engine::*` from a `pub mod atc` — widening them to `pub` would enlarge the
+  crate's public API — and `dead_code` on two engine-local duplicates of
+  `atc_sync_population_from_db`/`atc_tick` that the canonical re-exports shadow, kept rather
+  than deleted while the ATC work tracked in GH #264 is still in flight.
+
+### Build and compatibility notes
+- **Toolchain unchanged and load-bearing:** the pinned `nightly-2026-08-31` in
+  `rust-toolchain.toml` and the declared `rust-version = "1.100"` are what the lint gate is
+  calibrated against. Building with a different nightly can change which lints fire.
+- **crates.io is not a distribution channel for this project.** Every workspace member sets
+  `publish = false` ("Workspace depends on unpublished sibling path crates, so cargo publish is
+  not viable"), so the Asupersync `Outcome<T, E>` change described above cannot affect
+  downstream crate consumers of this repo — there are none. It matters only when building this
+  workspace from source, and to other projects that depend on Asupersync directly. Anyone
+  moving to Asupersync 0.5 should expect `{value:?}` on an `Outcome` to stop compiling wherever
+  the success type is not itself `Debug`, and it will surface only under `--all-targets`.
 
 ## v0.3.36 — 2026-09-16 [Release]
 

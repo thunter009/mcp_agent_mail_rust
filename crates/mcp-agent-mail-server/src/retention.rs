@@ -10,10 +10,25 @@
 //! `MESSAGES_RETENTION_DAYS` > 0, each cycle hard-deletes settled messages
 //! (read by every recipient, acknowledged by every recipient where the
 //! message requires it) older than the horizon from the live SQLite tables in
-//! bounded batches — the per-project git archive retains the durable history,
+//! bounded batches after verifying their complete committed archive — the
+//! per-project git archive retains the durable history,
 //! following the `prune_released_file_reservations` precedent (GH#154). When
 //! the knob is off, the phase stays report-only and logs what WOULD be pruned
 //! at the `retention_max_age_days` horizon.
+//!
+//! br-8j6cb adds non-destructive message archive healing on this same worker.
+//! File-backed mailboxes enable it by default; set
+//! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
+//! catch-up and rotating history passes run once per minute in steady state;
+//! while a pass exhausts its repair budget the next pass follows after one
+//! second until the backlog clears. Neither accelerates the configured
+//! reporting/pruning cadence. Repair never sends
+//! another message or changes read/ack state. Its per-pass result is not a
+//! whole-mailbox or attachment-durability certificate.
+//!
+//! Terminal reservation releases also converge without another client read.
+//! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
+//! default-on pass. It preserves foreign-generation and conflicting artifacts.
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
@@ -24,23 +39,19 @@ use asupersync::Cx;
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, create_pool, now_micros,
-    queries::{MessagePruneReport, count_prunable_messages, prune_settled_messages},
+    DbPool, DbPoolConfig, create_pool, now_micros, queries::count_prunable_messages,
 };
+use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
+use mcp_agent_mail_storage::recovery::message_reconcile::database::{
+    self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
+};
+use mcp_agent_mail_storage::recovery::reservation_reconcile::{self, ReservationReconcileCursor};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
-
-/// Maximum messages removed per delete transaction (GH#273). Bounded so a
-/// single prune transaction never holds a large write set (fsqlite-friendly).
-const MESSAGE_PRUNE_BATCH_SIZE: usize = 500;
-
-/// Maximum messages removed per retention sweep (GH#273). A backlog larger
-/// than this drains across successive cycles instead of monopolizing the
-/// writer; the sweep logs `more=true` when it leaves eligible backlog behind.
-const MESSAGE_PRUNE_MAX_PER_SWEEP: usize = 5_000;
 
 const ARTIFACT_REPORT_SCHEMA_VERSION: u32 = 1;
 const LARGE_ARTIFACT_ROOT_WARN_BYTES: u64 = 512 * 1024 * 1024;
@@ -53,14 +64,64 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
-/// Start the retention/quota report worker (if enabled).
+/// Wall-clock µs after which this process may have accepted writes
+/// (br-kp1in.14): messages created earlier cannot be in its write-behind queue.
+static SETTLED_BEFORE_US: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Record, once per process, that startup recovery has finished and the server
+/// is about to accept writes. Call on every serving path before serving; the
+/// first worker start is the fallback anchor.
+pub fn anchor_settled_writes() {
+    let _ = SETTLED_BEFORE_US.get_or_init(mcp_agent_mail_db::now_micros);
+}
+
+const fn maintenance_worker_enabled(config: &Config, repair_enabled: bool) -> bool {
+    config.retention_report_enabled
+        || config.quota_enabled
+        || config.messages_retention_days > 0
+        || repair_enabled
+}
+
+fn maintenance_poll_interval(report_interval: Duration, repair_enabled: bool) -> Duration {
+    if repair_enabled {
+        report_interval.min(Duration::from_secs(60))
+    } else {
+        report_interval
+    }
+}
+
+fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
+    elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
+/// Pause before the next message-repair pass while a pass keeps exhausting its
+/// repair budget (a real DB-ahead backlog, e.g. archive writes that were still
+/// queued when the process was killed).
+const REPAIR_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Sleep before the next worker pass. A pass that exhausted its repair budget
+/// left known work behind, so the next one follows after
+/// [`REPAIR_CATCH_UP_POLL_INTERVAL`] instead of the steady-state poll: at 4
+/// repairs per pass, a once-per-minute cadence healed ~20 messages in five
+/// minutes, so a crash that lost a busy queue's archive writes stayed
+/// DB-ahead for tens of minutes. Reporting and pruning keep their own
+/// `report_is_due` schedule.
+fn next_poll_interval(poll_interval: Duration, repair_backlog: bool) -> Duration {
+    if repair_backlog {
+        REPAIR_CATCH_UP_POLL_INTERVAL.min(poll_interval)
+    } else {
+        poll_interval
+    }
+}
+
+/// Start the retention/quota/message-reconciliation worker when needed.
 ///
 /// Must be called at most once. Subsequent calls are no-ops.
 pub fn start(config: &Config) {
-    if !config.retention_report_enabled
-        && !config.quota_enabled
-        && config.messages_retention_days == 0
-    {
+    if !maintenance_worker_enabled(
+        config,
+        message_archive_reconcile::enabled(config) || reservation_reconcile::enabled(config),
+    ) {
         return;
     }
 
@@ -76,12 +137,17 @@ pub fn start(config: &Config) {
     }
     if worker.is_none() {
         let config = config.clone();
+        // Anchored before this process serves any write and kept for its life
+        // (a restarted worker does not restart the write-behind queue): older
+        // rows cannot be in flight here, so crash-lost mail is repairable on
+        // the first pass.
+        let settled_before_us = *SETTLED_BEFORE_US.get_or_init(mcp_agent_mail_db::now_micros);
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("retention-quota".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                retention_loop(&config);
+                retention_loop(&config, settled_before_us);
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -110,44 +176,47 @@ pub fn shutdown() {
     }
 }
 
-/// Whether this configuration needs a DB pool in the retention worker: either
-/// real message pruning (GH#273) or the report-only would-prune counter.
+/// Whether retention needs a DB pool: either real message pruning (GH#273)
+/// or the report-only would-prune counter. Archive repair is independent.
 const fn message_retention_needs_db(config: &Config) -> bool {
     config.messages_retention_days > 0
         || (config.retention_report_enabled && config.retention_max_age_days > 0)
 }
 
-fn retention_loop(config: &Config) {
-    let interval = std::time::Duration::from_secs(config.retention_report_interval_seconds.max(60));
-    let startup_delay = interval.min(std::time::Duration::from_secs(10));
+fn retention_pool_config(config: &Config) -> DbPoolConfig {
+    let mut pool_config = DbPoolConfig::from_env();
+    pool_config.database_url.clone_from(&config.database_url);
+    // Never rediscover an ambient archive root after the server has resolved
+    // its mailbox. Reconciliation verifies this exact source/root binding.
+    pool_config.storage_root = Some(config.storage_root.clone());
+    pool_config.min_connections = 1;
+    pool_config.max_connections = 1;
+    pool_config.warmup_connections = 0;
+    // Startup already ran readiness_check with migrations before workers.
+    pool_config.run_migrations = false;
+    pool_config
+}
 
-    // GH#273: the message retention phase reads/writes the live DB. Pool
-    // creation failure downgrades to filesystem-only reporting (never crash
-    // the server over a worker-side pool).
-    let pool: Option<DbPool> = if message_retention_needs_db(config) {
-        let mut pool_config = DbPoolConfig::from_env();
-        pool_config.database_url.clone_from(&config.database_url);
-        pool_config.min_connections = 1;
-        pool_config.max_connections = 1;
-        pool_config.warmup_connections = 0;
-        // Startup already ran readiness_check with migrations before workers.
-        pool_config.run_migrations = false;
-        match create_pool(&pool_config) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "retention worker: failed to create DB pool; message retention phase disabled this run"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+fn retention_loop(config: &Config, settled_before_us: i64) {
+    let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
+    let message_repair_enabled = message_archive_reconcile::enabled(config);
+    let reservation_repair_enabled = reservation_reconcile::enabled(config);
+    let repair_enabled = message_repair_enabled || reservation_repair_enabled;
+    let poll_interval = maintenance_poll_interval(interval, repair_enabled);
+    let startup_delay = poll_interval.min(Duration::from_secs(10));
+    let needs_db = message_retention_needs_db(config) || repair_enabled;
+    let mut pool: Option<DbPool> = None;
+    let mut cursor = ReconcileCursor::settled_before(settled_before_us);
+    let mut agent_cursor = AgentReconcileCursor::default();
+    let mut reservation_cursor = ReservationReconcileCursor::default();
+    let mut prune_cursor = ArchivePruneCursor::default();
+    let mut last_report: Option<Instant> = None;
 
     info!(
         interval_secs = interval.as_secs(),
+        poll_interval_secs = poll_interval.as_secs(),
+        archive_reconcile_enabled = repair_enabled,
+        reservation_release_reconcile_enabled = reservation_repair_enabled,
         retention_enabled = config.retention_report_enabled,
         quota_enabled = config.quota_enabled,
         messages_retention_days = config.messages_retention_days,
@@ -155,7 +224,7 @@ fn retention_loop(config: &Config) {
         "retention/quota report worker started"
     );
 
-    if startup_delay > std::time::Duration::ZERO {
+    if startup_delay > Duration::ZERO {
         info!(
             startup_delay_secs = startup_delay.as_secs(),
             "retention/quota worker startup delay engaged"
@@ -171,34 +240,164 @@ fn retention_loop(config: &Config) {
             return;
         }
 
-        // The filesystem walk only serves the report/quota surfaces; skip it
-        // when the worker is running solely for message retention (GH#273).
-        if config.retention_report_enabled || config.quota_enabled {
-            match run_retention_cycle(config) {
-                Ok(report) => {
-                    info!(
-                        target: "maintenance",
-                        event = "retention_quota_report",
-                        projects_scanned = report.projects_scanned,
-                        total_attachment_bytes = report.total_attachment_bytes,
-                        total_inbox_count = report.total_inbox_count,
-                        warnings = report.warnings,
-                        "retention/quota report completed"
+        // Retry admission on a later tick instead of permanently disabling
+        // healing after a transient startup failure or a retired pool.
+        if needs_db && pool.is_none() {
+            match create_pool(&retention_pool_config(config)) {
+                Ok(created) => pool = Some(created),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "maintenance DB pool unavailable; retrying on the next scheduled cycle"
                     );
-                }
-                Err(e) => {
-                    warn!(error = %e, "retention/quota report cycle failed");
                 }
             }
         }
 
-        // GH#273: message retention phase (prune when the knob is on,
-        // would-prune report when it is off).
-        if let Some(pool) = pool.as_ref() {
-            run_message_retention_phase(config, pool);
+        let mut message_repair_backlog = false;
+        if message_repair_enabled {
+            let mut retire_pool = false;
+            if let Some(live_pool) = pool.as_ref() {
+                let cx = worker_cx();
+                match message_archive_reconcile::reconcile_message_batch(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut cursor,
+                    &SHUTDOWN,
+                ) {
+                    Ok(report) => {
+                        message_repair_backlog = report.budget_exhausted;
+                        if report.scanned > 0 || report.interrupted {
+                            info!(
+                                target: "maintenance",
+                                event = "message_archive_reconcile",
+                                scanned = report.scanned,
+                                unchanged = report.unchanged,
+                                repaired = report.repaired,
+                                files_created = report.files_created,
+                                deferred = report.deferred,
+                                payload_bytes = report.payload_bytes,
+                                interrupted = report.interrupted,
+                                budget_exhausted = report.budget_exhausted,
+                                "bounded message archive reconciliation pass completed"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "maintenance",
+                            event = "message_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "message archive reconciliation refused; preserving source and retrying next cycle"
+                        );
+                        retire_pool = true;
+                    }
+                }
+            }
+            if !retire_pool && let Some(live_pool) = pool.as_ref() {
+                let cx = worker_cx();
+                match agent_reconcile::reconcile_agent_batch(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut agent_cursor,
+                    &SHUTDOWN,
+                ) {
+                    Ok(report) => {
+                        if report.scanned > 0 || report.interrupted {
+                            info!(
+                                target: "maintenance",
+                                event = "agent_archive_reconcile",
+                                scanned = report.scanned,
+                                unchanged = report.unchanged,
+                                repaired = report.repaired,
+                                deferred = report.deferred,
+                                interrupted = report.interrupted,
+                                budget_exhausted = report.budget_exhausted,
+                                "bounded agent profile reconciliation pass completed"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "maintenance",
+                            event = "agent_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "agent profile reconciliation refused; retrying next cycle"
+                        );
+                        retire_pool = true;
+                    }
+                }
+            }
+            if retire_pool {
+                // A verified recovery may have replaced the live generation.
+                // Reacquire through ordinary pool admission on the next tick.
+                pool = None;
+            }
         }
 
-        if sleep_with_shutdown(interval) {
+        if reservation_repair_enabled && let Some(live_pool) = pool.as_ref() {
+            let cx = worker_cx();
+            match reservation_reconcile::reconcile_reservation_releases(
+                &cx,
+                live_pool,
+                config,
+                &mut reservation_cursor,
+                &SHUTDOWN,
+            ) {
+                Ok(report) => {
+                    if report.scanned > 0 || report.interrupted {
+                        info!(target: "maintenance", event = "reservation_release_archive_reconcile",
+                            scanned = report.scanned, unchanged = report.unchanged,
+                            attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
+                            interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
+                            "bounded terminal reservation release reconciliation pass completed");
+                    }
+                }
+                Err(error) => {
+                    warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
+                        error = %error, "reservation release reconciliation refused; retrying next cycle");
+                    pool = None;
+                }
+            }
+        }
+
+        if SHUTDOWN.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Archive catch-up does not turn a long-interval filesystem inventory
+        // or destructive retention sweep into a once-per-minute operation.
+        if report_is_due(last_report.map(|last| last.elapsed()), interval) {
+            if config.retention_report_enabled || config.quota_enabled {
+                match run_retention_cycle(config) {
+                    Ok(report) => {
+                        info!(
+                            target: "maintenance",
+                            event = "retention_quota_report",
+                            projects_scanned = report.projects_scanned,
+                            total_attachment_bytes = report.total_attachment_bytes,
+                            total_inbox_count = report.total_inbox_count,
+                            warnings = report.warnings,
+                            "retention/quota report completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "retention/quota report cycle failed");
+                    }
+                }
+            }
+
+            // GH#273: keep the explicitly opted-in retention behavior separate
+            // from the non-destructive, per-message archive repair result.
+            if let Some(pool) = pool.as_ref() {
+                run_message_retention_phase(config, pool, &mut prune_cursor);
+            }
+            last_report = Some(Instant::now());
+        }
+
+        if sleep_with_shutdown(next_poll_interval(poll_interval, message_repair_backlog)) {
             return;
         }
     }
@@ -207,28 +406,31 @@ fn retention_loop(config: &Config) {
 /// Run the per-cycle message retention phase against the live DB (GH#273).
 ///
 /// - `messages_retention_days > 0`: hard-delete settled messages older than
-///   the horizon in bounded batches (up to [`MESSAGE_PRUNE_MAX_PER_SWEEP`]
-///   messages per sweep, [`MESSAGE_PRUNE_BATCH_SIZE`] per transaction) and
-///   log the pruned counts.
+///   the horizon after complete archive verification, inspecting at most 32
+///   candidates per sweep, one source-rechecked deletion per transaction.
 /// - knob off, `retention_report_enabled` with `retention_max_age_days > 0`:
-///   report-only — count what a prune at the report horizon WOULD delete.
+///   report-only — count age/receipt-eligible messages at the report horizon.
+///   Archive verification is still required before any deletion.
 ///
 /// Errors are logged and swallowed (legacy worker contract: never crash).
-fn run_message_retention_phase(config: &Config, pool: &DbPool) {
+fn run_message_retention_phase(config: &Config, pool: &DbPool, cursor: &mut ArchivePruneCursor) {
     if config.messages_retention_days > 0 {
-        match message_retention_prune(config, pool) {
+        match message_retention_prune(config, pool, cursor) {
             Ok(report) => {
-                if report.deleted_messages > 0 || report.more {
+                if report.scanned > 0 || report.pruned.more || report.interrupted {
                     info!(
                         target: "maintenance",
                         event = "messages_retention_prune",
-                        deleted_messages = report.deleted_messages,
-                        deleted_recipients = report.deleted_recipients,
-                        more = report.more,
+                        deleted_messages = report.pruned.deleted_messages,
+                        deleted_recipients = report.pruned.deleted_recipients,
+                        more = report.pruned.more,
+                        scanned = report.scanned,
+                        archive_deferred = report.deferred,
+                        archive_bytes = report.archive_bytes,
+                        interrupted = report.interrupted,
+                        budget_exhausted = report.budget_exhausted,
                         retention_days = config.messages_retention_days,
-                        batch_size = MESSAGE_PRUNE_BATCH_SIZE,
-                        per_sweep_cap = MESSAGE_PRUNE_MAX_PER_SWEEP,
-                        "pruned settled messages past retention horizon (git archive retains history)"
+                        "pruned archive-verified settled messages; incomplete archive evidence remains in SQLite"
                     );
                 }
             }
@@ -245,8 +447,9 @@ fn run_message_retention_phase(config: &Config, pool: &DbPool) {
                         event = "messages_retention_report",
                         would_prune,
                         report_horizon_days = config.retention_max_age_days,
-                        "settled messages past the report horizon would be pruned; \
-                         set MESSAGES_RETENTION_DAYS > 0 to enable pruning"
+                        "settled messages meet the report age/receipt criteria; \
+                         complete archive verification is required before pruning; \
+                         set MESSAGES_RETENTION_DAYS > 0 to enable verified pruning"
                     );
                 }
             }
@@ -275,30 +478,26 @@ fn worker_cx() -> Cx {
     })
 }
 
-/// Prune settled messages past the `messages_retention_days` horizon.
-fn message_retention_prune(config: &Config, pool: &DbPool) -> Result<MessagePruneReport, String> {
-    // Message prune DELETEs hit the live mailbox; hold the in-process write
-    // lease so a recovery promotion cannot swap the database mid-write (#219).
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+/// Verify durable archive copies before pruning each age-eligible message.
+fn message_retention_prune(
+    config: &Config,
+    pool: &DbPool,
+    cursor: &mut ArchivePruneCursor,
+) -> Result<ArchivePruneReport, String> {
     let cx = worker_cx();
     let older_than_us = horizon_older_than_us(config.messages_retention_days);
-    match block_on(async {
-        prune_settled_messages(
-            &cx,
-            pool,
-            older_than_us,
-            MESSAGE_PRUNE_BATCH_SIZE,
-            MESSAGE_PRUNE_MAX_PER_SWEEP,
-        )
-        .await
-    }) {
-        asupersync::Outcome::Ok(report) => Ok(report),
-        other => Err(format!("prune_settled_messages failed: {other:?}")),
-    }
+    message_archive_reconcile::prune_archived_message_batch(
+        &cx,
+        pool,
+        config,
+        older_than_us,
+        cursor,
+        &SHUTDOWN,
+    )
 }
 
-/// Count what a prune at the `retention_max_age_days` report horizon WOULD
-/// delete (report-only path when `MESSAGES_RETENTION_DAYS` is off).
+/// Count age/receipt eligibility at the report horizon without archive reads.
+/// This report-only count does not establish that deletion can proceed.
 fn message_retention_would_prune(config: &Config, pool: &DbPool) -> Result<u64, String> {
     let cx = worker_cx();
     let older_than_us = horizon_older_than_us(config.retention_max_age_days);
@@ -1139,6 +1338,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_repair_starts_without_enabling_destructive_retention() {
+        let config = Config::default();
+        assert!(maintenance_worker_enabled(&config, true));
+        assert!(!maintenance_worker_enabled(&config, false));
+        assert!(!message_retention_needs_db(&config));
+        let selected = retention_pool_config(&config);
+        assert_eq!(selected.database_url, config.database_url);
+        assert_eq!(
+            selected.storage_root.as_deref(),
+            Some(config.storage_root.as_path())
+        );
+        assert_eq!(selected.max_connections, 1);
+        assert!(!selected.run_migrations);
+    }
+
+    #[test]
+    fn repair_backlog_shortens_only_the_next_pass_pause() {
+        let poll = maintenance_poll_interval(Duration::from_secs(3600), true);
+        // Steady state keeps the once-per-minute cadence.
+        assert_eq!(next_poll_interval(poll, false), Duration::from_secs(60));
+        // A pass that exhausted its repair budget is followed within a second.
+        assert_eq!(next_poll_interval(poll, true), Duration::from_secs(1));
+        // Never longer than the configured poll.
+        let fast_poll = Duration::from_millis(250);
+        assert_eq!(next_poll_interval(fast_poll, true), fast_poll);
+        // Reporting stays on its own interval regardless of catch-up passes.
+        assert!(!report_is_due(
+            Some(REPAIR_CATCH_UP_POLL_INTERVAL),
+            Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn repair_polling_does_not_accelerate_reporting_or_pruning() {
+        let interval = Duration::from_secs(3600);
+        assert_eq!(
+            maintenance_poll_interval(interval, true),
+            Duration::from_secs(60)
+        );
+        assert_eq!(maintenance_poll_interval(interval, false), interval);
+        assert!(report_is_due(None, interval));
+        for seconds in [0, 60, 3599] {
+            assert!(!report_is_due(Some(Duration::from_secs(seconds)), interval));
+        }
+        assert!(report_is_due(Some(interval), interval));
+        assert!(report_is_due(
+            Some(interval + Duration::from_secs(1)),
+            interval
+        ));
+    }
+
+    #[test]
     fn should_ignore_exact_match() {
         let patterns = vec!["demo".to_string(), "test*".to_string()];
         assert!(should_ignore("demo", &patterns));
@@ -1262,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_disabled_by_default() {
+    fn destructive_retention_disabled_by_default() {
         let config = Config::from_env();
         assert!(!config.retention_report_enabled);
         assert!(!config.quota_enabled);
@@ -1302,6 +1553,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("retention-messages.sqlite3");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir_all(&storage_root).unwrap();
         let pool_config = DbPoolConfig {
             database_url: format!(
                 "sqlite:////{}",
@@ -1309,6 +1562,7 @@ mod tests {
             ),
             min_connections: 1,
             max_connections: 1,
+            storage_root: Some(storage_root.clone()),
             ..Default::default()
         };
         let pool = create_pool(&pool_config).expect("create pool");
@@ -1348,14 +1602,15 @@ mod tests {
         let read_ts = now - day_us;
         let seed_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open seed conn");
-        // Message 1: old + read by its only recipient → prunable.
+        // Message 1: old + read by its only recipient → age/receipt eligible,
+        // but its archive has not survived and must be repaired before pruning.
         // Message 2: old + unread → must survive any prune.
         for (id, read_expr) in [(9001_i64, format!("{read_ts}")), (9002, "NULL".to_string())] {
             seed_conn
                 .execute_raw(&format!(
                     "INSERT INTO messages \
-                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', 0, {old_ts}, '[]')"
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, archive_metadata_json) \
+                     VALUES ({id}, {project_id}, {sender_id}, 'ret', 's{id}', 'b', 'normal', 0, {old_ts}, '[]', '{{}}')"
                 ))
                 .expect("insert message");
             seed_conn
@@ -1367,8 +1622,10 @@ mod tests {
         }
         drop(seed_conn);
 
-        // Knob off + report enabled: counts what WOULD be pruned, deletes nothing.
+        // Knob off + report enabled: counts age/receipt eligibility without deletion.
         let mut config = Config {
+            database_url: pool_config.database_url,
+            storage_root,
             retention_report_enabled: true,
             retention_max_age_days: 30,
             messages_retention_days: 0,
@@ -1377,7 +1634,8 @@ mod tests {
         let would_prune = message_retention_would_prune(&config, &pool).expect("would-prune count");
         assert_eq!(would_prune, 1, "only the settled old message is eligible");
 
-        run_message_retention_phase(&config, &pool);
+        let mut cursor = ArchivePruneCursor::default();
+        run_message_retention_phase(&config, &pool, &mut cursor);
         let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open check conn");
         let count = check_conn
@@ -1390,9 +1648,25 @@ mod tests {
         );
         drop(check_conn);
 
-        // Knob on: the settled message is pruned; unread mail survives.
+        // Knob on cannot delete a DB-only message after a lost archive write.
         config.messages_retention_days = 30;
-        run_message_retention_phase(&config, &pool);
+        let deferred = message_retention_prune(&config, &pool, &mut cursor).unwrap();
+        assert_eq!(deferred.pruned.deleted_messages, 0);
+        assert_eq!(deferred.deferred, 1);
+        let repaired = message_archive_reconcile::reconcile_message_batch(
+            &cx,
+            &pool,
+            &config,
+            &mut ReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(repaired.repaired, 2);
+        assert_eq!(repaired.deferred, 0);
+
+        // Once real archive repair commits every copy, the settled message is
+        // pruned while the unread message remains in the live mailbox.
+        run_message_retention_phase(&config, &pool, &mut cursor);
         let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("reopen check conn");
         let rows = check_conn

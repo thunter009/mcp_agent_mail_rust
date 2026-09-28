@@ -29,14 +29,18 @@ pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 /// Deterministic cache key for hybrid search queries.
 ///
 /// The key incorporates all factors that affect search results:
-/// - Query text (normalized)
+/// - Query text (outer whitespace trimmed, case and syntax preserved)
 /// - Search mode (lexical/semantic/hybrid/auto)
 /// - Active filters (sender, project, date range, importance)
 /// - Index epoch (invalidated on index updates)
 /// - Pagination parameters (offset, limit)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryCacheKey {
-    /// Normalized query text (lowercased, trimmed).
+    /// Query text with outer whitespace trimmed, but otherwise unchanged.
+    ///
+    /// Case folding is not a valid query normalization: boolean operators,
+    /// quoted values and case-sensitive embedding inputs can change meaning.
+    /// Only the active query engine may decide which inputs are equivalent.
     pub query_normalized: String,
     /// Search mode.
     pub mode: SearchMode,
@@ -62,7 +66,7 @@ impl QueryCacheKey {
         limit: usize,
     ) -> Self {
         Self {
-            query_normalized: query.trim().to_lowercase(),
+            query_normalized: query.trim().to_owned(),
             mode,
             filter_hash: hash_filter(filter),
             index_epoch,
@@ -81,7 +85,7 @@ impl QueryCacheKey {
         limit: usize,
     ) -> Self {
         Self {
-            query_normalized: query.trim().to_lowercase(),
+            query_normalized: query.trim().to_owned(),
             mode,
             filter_hash: 0,
             index_epoch,
@@ -254,6 +258,8 @@ impl CacheConfig {
 /// Bounded LRU cache for search query results.
 ///
 /// Thread-safe via `RwLock` with interior mutability for metrics.
+/// Epoch transitions and entry access share the entries lock: a search begun
+/// before invalidation cannot insert into, or read from, a later generation.
 pub struct QueryCache<T> {
     config: CacheConfig,
     entries: RwLock<HashMap<QueryCacheKey, CacheEntry<T>>>,
@@ -286,15 +292,17 @@ impl<T: Clone> QueryCache<T> {
             return None;
         }
 
-        // Check epoch first (quick rejection)
+        let mut entries = self.entries.write().ok()?;
+        // Check while holding the same lock used by epoch transitions. A
+        // pre-lock check alone can pass and then wait across invalidation.
         if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
+            drop(entries);
             self.update_metrics(|metrics| {
                 metrics.misses += 1;
             });
             return None;
         }
 
-        let mut entries = self.entries.write().ok()?;
         let Some(entry) = entries.get_mut(key) else {
             // Key not found - miss
             drop(entries); // Release write lock before acquiring metrics lock
@@ -308,7 +316,8 @@ impl<T: Clone> QueryCache<T> {
         if entry.is_expired(self.config.ttl) {
             entries.remove(key);
             let current_entries = entries.len();
-            drop(entries);
+            // Publish the size before unlocking so a concurrent insertion or
+            // invalidation cannot have its newer count overwritten here.
             self.update_metrics(|metrics| {
                 metrics.misses += 1;
                 metrics.evictions_ttl += 1;
@@ -332,14 +341,15 @@ impl<T: Clone> QueryCache<T> {
             return;
         }
 
-        // Don't cache if epoch mismatch
-        if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
-            return;
-        }
-
         let Ok(mut entries) = self.entries.write() else {
             return;
         };
+
+        // Revalidate the query's generation inside the critical section,
+        // before it can evict a fresh entry or repopulate an invalidated cache.
+        if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
+            return;
+        }
 
         // Evict if at capacity
         if entries.len() >= self.config.max_entries && !entries.contains_key(&key) {
@@ -381,17 +391,7 @@ impl<T: Clone> QueryCache<T> {
     ///
     /// This is called when the index is updated, making all cached results stale.
     pub fn invalidate_all(&self) {
-        self.current_epoch.fetch_add(1, Ordering::Release);
-
-        if let Ok(mut entries) = self.entries.write() {
-            let count = entries.len();
-            entries.clear();
-
-            if let Ok(mut metrics) = self.metrics.write() {
-                metrics.evictions_epoch += count as u64;
-                metrics.current_entries = 0;
-            }
-        }
+        self.bump_epoch();
     }
 
     /// Get the current index epoch.
@@ -400,9 +400,34 @@ impl<T: Clone> QueryCache<T> {
         self.current_epoch.load(Ordering::Acquire)
     }
 
-    /// Bump the epoch (used when index is updated).
+    /// Advance the generation and reclaim all entries from the old generation.
+    ///
+    /// The transition is atomic with respect to `get` and `put`. Reclaiming
+    /// unreachable entries also prevents an epoch-only bump from retaining old
+    /// response bodies until TTL expiry or evicting useful new-generation data.
     pub fn bump_epoch(&self) -> u64 {
-        self.current_epoch.fetch_add(1, Ordering::Release) + 1
+        // The epoch bump and the clear are what must be atomic with respect to
+        // `get`/`put`; the metrics bookkeeping is not. Scope the write guard so
+        // it is released before `update_metrics` takes the metrics lock.
+        let (next_epoch, count) = {
+            let mut entries = self
+                .entries
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next_epoch = self
+                .current_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            let count = entries.len();
+            entries.clear();
+            drop(entries);
+            (next_epoch, count)
+        };
+        self.update_metrics(|metrics| {
+            metrics.evictions_epoch += count as u64;
+            metrics.current_entries = 0;
+        });
+        next_epoch
     }
 
     /// Get cache metrics snapshot.
@@ -593,6 +618,9 @@ impl WarmWorker {
 pub enum InvalidationTrigger {
     /// Index was updated with new documents.
     IndexUpdate,
+    /// A message was committed to the source database; the lexical index
+    /// catches up on the next query.
+    SourceIngest,
     /// Index was rebuilt from scratch.
     IndexRebuild,
     /// Embedding model changed.
@@ -680,10 +708,82 @@ mod tests {
     fn test_cache_key_normalization() {
         let filter = SearchFilter::default();
         let key1 = QueryCacheKey::new("  Hello World  ", SearchMode::Hybrid, &filter, 1, 0, 10);
-        let key2 = QueryCacheKey::new("hello world", SearchMode::Hybrid, &filter, 1, 0, 10);
+        let key2 = QueryCacheKey::new("Hello World", SearchMode::Hybrid, &filter, 1, 0, 10);
 
         assert_eq!(key1.query_normalized, key2.query_normalized);
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_preserves_boolean_operator_case() {
+        let filter = SearchFilter::default();
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+        ] {
+            for (left, right) in [
+                ("alpha OR beta", "alpha or beta"),
+                ("alpha AND beta", "alpha and beta"),
+                ("alpha NOT beta", "alpha not beta"),
+            ] {
+                assert_ne!(
+                    QueryCacheKey::new(left, mode, &filter, 0, 0, 10),
+                    QueryCacheKey::new(right, mode, &filter, 0, 0, 10),
+                    "the cache must not rewrite query grammar for {mode:?}"
+                );
+                assert_ne!(
+                    QueryCacheKey::without_filter(left, mode, 0, 0, 10),
+                    QueryCacheKey::without_filter(right, mode, 0, 0, 10)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_key_preserves_quoted_and_unicode_input() {
+        let filter = SearchFilter::default();
+        for (left, right) in [
+            (r#"thread:"Build-A""#, r#"thread:"build-a""#),
+            (r#""Case Sensitive""#, r#""case sensitive""#),
+            ("\u{212a}", "K"),
+            ("\u{130}", "i\u{307}"),
+        ] {
+            let left_key = QueryCacheKey::new(left, SearchMode::Hybrid, &filter, 0, 0, 10);
+            let right_key = QueryCacheKey::new(right, SearchMode::Hybrid, &filter, 0, 0, 10);
+            assert_eq!(left_key.query_normalized, left);
+            assert_eq!(right_key.query_normalized, right);
+            assert_ne!(left_key, right_key);
+        }
+    }
+
+    #[test]
+    fn test_cache_case_variants_do_not_replay_another_response() {
+        let cache: QueryCache<Vec<i64>> = QueryCache::with_defaults();
+        let operator =
+            QueryCacheKey::without_filter("alpha OR beta", SearchMode::Lexical, 0, 0, 10);
+        let literal = QueryCacheKey::without_filter("alpha or beta", SearchMode::Lexical, 0, 0, 10);
+
+        cache.put(operator.clone(), vec![1, 2]);
+        assert_eq!(cache.get(&literal), None);
+        cache.put(literal.clone(), vec![3]);
+        assert_eq!(cache.get(&operator), Some(vec![1, 2]));
+        assert_eq!(cache.get(&literal), Some(vec![3]));
+    }
+
+    #[test]
+    fn test_unfiltered_cache_key_trims_only_outer_whitespace() {
+        let key =
+            QueryCacheKey::without_filter(" \nAlpha OR  Beta\t ", SearchMode::Lexical, 0, 0, 10);
+        assert_eq!(key.query_normalized, "Alpha OR  Beta");
+        assert_eq!(
+            key,
+            QueryCacheKey::without_filter("Alpha OR  Beta", SearchMode::Lexical, 0, 0, 10)
+        );
+        assert_ne!(
+            key,
+            QueryCacheKey::without_filter("Alpha OR Beta", SearchMode::Lexical, 0, 0, 10)
+        );
     }
 
     #[test]
@@ -951,6 +1051,95 @@ mod tests {
         cache.put(stale_key, 42);
         let metrics = cache.metrics();
         assert_eq!(metrics.inserts, 0, "stale epoch put should be rejected");
+    }
+
+    #[test]
+    fn test_bump_epoch_reclaims_old_response_bodies() {
+        let cache = QueryCache::with_defaults();
+        let response = Arc::new(vec![1_i64, 2, 3]);
+        let old_key = QueryCacheKey::without_filter("old", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(old_key.clone(), Arc::clone(&response));
+        assert_eq!(Arc::strong_count(&response), 2);
+
+        assert_eq!(cache.bump_epoch(), 1);
+        assert_eq!(Arc::strong_count(&response), 1);
+        assert_eq!(cache.metrics().current_entries, 0);
+        assert_eq!(cache.metrics().evictions_epoch, 1);
+        assert!(cache.get(&old_key).is_none());
+    }
+
+    #[test]
+    fn test_stale_completion_cannot_evict_current_generation() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 1,
+            ..CacheConfig::default()
+        });
+        let old_key = QueryCacheKey::without_filter("old", SearchMode::Hybrid, 0, 0, 10);
+        cache.bump_epoch();
+        let new_key = QueryCacheKey::without_filter("new", SearchMode::Hybrid, 1, 0, 10);
+        cache.put(new_key.clone(), 7_i64);
+        cache.put(old_key.clone(), 99);
+
+        assert_eq!(cache.get(&new_key), Some(7));
+        assert_eq!(cache.get(&old_key), None);
+        assert_eq!(cache.metrics().inserts, 1);
+        assert_eq!(cache.metrics().evictions_capacity, 0);
+    }
+
+    #[test]
+    fn test_concurrent_epoch_transitions_and_queries_preserve_generation() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 8,
+            ..CacheConfig::default()
+        });
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let cache = &cache;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..250 {
+                        if worker % 2 == 0 {
+                            cache.bump_epoch();
+                        } else {
+                            let epoch = cache.current_epoch();
+                            let key = QueryCacheKey::without_filter(
+                                &format!("worker-{worker}-{iteration}"),
+                                SearchMode::Hybrid,
+                                epoch,
+                                0,
+                                10,
+                            );
+                            cache.put(key.clone(), epoch);
+                            if let Some(value) = cache.get(&key) {
+                                assert_eq!(value, epoch);
+                            }
+                        }
+                        // The epoch MUST be read while the entries guard is held. This
+                        // assertion is about entries and epoch being mutually consistent;
+                        // reading the epoch first lets a concurrent `bump_epoch` land in
+                        // between, after which `entries` legitimately holds keys from a
+                        // newer epoch and the check fails spuriously. Correctness outranks
+                        // the drop-tightening lint here.
+                        #[allow(clippy::significant_drop_tightening)]
+                        let (all_current_epoch, entry_count) = {
+                            let entries = cache.entries.read().unwrap();
+                            let epoch = cache.current_epoch();
+                            (
+                                entries.keys().all(|key| key.index_epoch == epoch),
+                                entries.len(),
+                            )
+                        };
+                        assert!(all_current_epoch);
+                        assert!(entry_count <= 8);
+                    }
+                });
+            }
+        });
+        assert_eq!(cache.current_epoch(), 500);
+        cache.invalidate_all();
+        assert_eq!(cache.metrics().current_entries, 0);
     }
 
     // ── Hit rate calculation ──────────────────────────────────────

@@ -1897,9 +1897,11 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88): replay any
     // archive writes journaled by a process killed after the DB commit but before
-    // materialization. Messages have no DB->archive reconcile-on-read, so this is
-    // their crash-safety path.
+    // materialization. The retention worker also reconciles DB-only messages
+    // without requiring a client read or retry, matching HTTP/TUI startup.
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
+    retention::start(config);
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -1934,6 +1936,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
+        retention::shutdown();
         maintenance::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
@@ -2403,6 +2406,31 @@ enum HttpHealthProbeFailure {
     Transport { error: String, elapsed_ms: u128 },
 }
 
+/// Request-scoped [`Cx`] for production code (br-kp1in.31).
+///
+/// Asupersync 0.5 made `Cx::for_request*` test-only (br-asupersync-ovztin):
+/// those constructors minted an ambient all-capability context with no
+/// runtime drivers. Production contexts must come from a runtime so they carry
+/// its drivers and capability mask. Inside a runtime (HTTP tasks,
+/// `Runtime::block_on` bodies) this uses the runtime driving the current
+/// thread. Elsewhere it mints from `fastmcp_core`'s per-thread runtime, which
+/// is exactly the runtime a subsequent `fastmcp_core::block_on` on this thread
+/// drives, so timers and I/O registered through the context stay live.
+/// The CLI uses it too; every production crate enables `test-internals` only
+/// as a dev-dependency, so this is the one sanctioned way to mint a context.
+pub fn runtime_request_cx(budget: Budget) -> Cx {
+    if let Some(cx) =
+        Runtime::current_handle().and_then(|handle| handle.try_request_cx_with_budget(budget).ok())
+    {
+        return cx;
+    }
+    block_on(async move {
+        Runtime::current_handle()
+            .expect("fastmcp_core::block_on installs its per-thread runtime as current")
+            .request_cx_with_budget(budget)
+    })
+}
+
 /// Synchronously probe whether a live Agent Mail HTTP server is answering
 /// `/healthz` on the configured `http_host:http_port`.
 ///
@@ -2424,8 +2452,8 @@ pub fn probe_http_healthz_blocking(config: &mcp_agent_mail_core::Config) -> bool
         // only for provably-dead holders elsewhere).
         return false;
     };
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
     rt.block_on(async {
-        let cx = Cx::for_request_with_budget(Budget::INFINITE);
         let client = build_probe_http_client();
         probe_http_healthz(&cx, config, &client).await.is_ok()
     })
@@ -4010,11 +4038,6 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
         return;
     }
     let path = dir.join("crash_markers.jsonl");
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > CRASH_MARKER_MAX_BYTES
-    {
-        return;
-    }
     let payload = info.payload();
     let message = payload
         .downcast_ref::<&'static str>()
@@ -4034,14 +4057,39 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
         "location": location,
         "backtrace": std::backtrace::Backtrace::force_capture().to_string(),
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    append_crash_marker(&path, &record);
+}
+
+/// Keep complete records within the cap, including simultaneous panics.
+/// Never wait for another writer while already handling a panic.
+fn append_crash_marker(path: &Path, record: &serde_json::Value) {
+    use std::io::Write as _;
+
+    let mut line = record.to_string();
+    line.push('\n');
+    let Ok(record_bytes) = u64::try_from(line.len()) else {
+        return;
+    };
+    if record_bytes > CRASH_MARKER_MAX_BYTES {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(file, "{record}");
+        .open(path)
+    else {
+        return;
+    };
+    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+        return;
     }
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if metadata.len() > CRASH_MARKER_MAX_BYTES - record_bytes {
+        return;
+    }
+    let _ = file.write_all(line.as_bytes());
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
@@ -4102,6 +4150,7 @@ fn run_http_supervised(
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -4194,6 +4243,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
     atc::init_global_atc(config);
     start_atc_operator_runtime(config);
 
@@ -4253,9 +4303,10 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // sequence below (WBQ flush, worker shutdown) and killing the MCP/HTTP
     // server that other agents were still using — the primary mechanism
     // behind "am eventually terminates after days/weeks". The crash-marker
-    // panic hook has already recorded the panic to
+    // panic hook has already attempted to record the panic to
     // `<storage_root>/doctor/crash_markers.jsonl` by the time we get the
-    // payload here; converting it into an `Err` routes the process through
+    // payload here. Recording is best effort and may fail or be skipped;
+    // converting the panic into an `Err` routes the process through
     // the same orderly shutdown as any other TUI failure. `Program`'s
     // terminal guard restores the TTY during the unwind.
     let tui_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4268,9 +4319,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("non-string panic payload");
         Err(std::io::Error::other(format!(
-            "TUI main thread panicked: {detail}. A crash marker with the full \
-             backtrace was appended to <storage_root>/doctor/crash_markers.jsonl; \
-             the server ran its graceful shutdown instead of aborting mid-frame."
+            "TUI main thread panicked: {detail}. Crash-marker recording is best effort; \
+             check <storage_root>/doctor/crash_markers.jsonl for a backtrace. \
+             The panic was caught; shutdown uses the normal cleanup path."
         )))
     });
     if let Some(watchdog) = startup_watchdog {
@@ -7004,7 +7055,7 @@ fn append_atc_experience_for_effect(
     };
     let stratum_key = atc_experience_stratum_key(&row);
     let feature_vector_size = atc_feature_vector_size(&row);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::append_atc_experience(
         &cx, pool, &row,
     )) {
@@ -7258,7 +7309,7 @@ fn capture_atc_execution_result(
     // Transition: Planned → Dispatched (effect was handed to executor).
     // If this fails, we still attempt the second transition because an
     // orphaned experience stuck in Planned is worse than skipping a step.
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
         pool,
@@ -7287,7 +7338,7 @@ fn capture_atc_execution_result(
 
     // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
     let context_patch = atc_execution_context_patch(&capture, execution_mode, status, ts_micros);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
         pool,
@@ -7403,16 +7454,20 @@ fn promote_executed_experience_to_open_for_resolution(
         return true;
     }
 
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-        &cx,
-        pool,
-        experience_id,
-        ExperienceState::Open,
-        now_micros,
-        None,
-        None,
-    )) {
+    // Reached from tool-handler post-processing (message outcomes) as well as
+    // the operator sweep, so it must not nest a bridge (br-3es3d).
+    match atc_ledger_block_on(|cx| async move {
+        mcp_agent_mail_db::queries::transition_atc_experience(
+            &cx,
+            pool,
+            experience_id,
+            ExperienceState::Open,
+            now_micros,
+            None,
+            None,
+        )
+        .await
+    }) {
         asupersync::Outcome::Ok(()) => true,
         asupersync::Outcome::Err(error) => {
             tracing::debug!(
@@ -7470,7 +7525,7 @@ fn sweep_open_experiences_for_resolution(
         return;
     }
 
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     let started_at = Instant::now();
     let mut rows_resolved = 0_u64;
     let mut ack_overdue_rows_resolved = 0_u64;
@@ -7752,7 +7807,7 @@ fn sweep_open_experiences_for_resolution(
             if let Some(outcome) =
                 resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
             {
-                let cx = Cx::for_request_with_budget(Budget::INFINITE);
+                let cx = runtime_request_cx(Budget::INFINITE);
                 match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                     &cx,
                     pool,
@@ -7798,7 +7853,7 @@ fn sweep_open_experiences_for_resolution(
         {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                 &cx,
                 pool,
@@ -7838,7 +7893,7 @@ fn sweep_open_experiences_for_resolution(
             }
         } else if age_micros > resolution_window_micros {
             // Resolution window elapsed without activity signal → expire.
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
                 &cx,
                 pool,
@@ -7984,7 +8039,7 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
     }
 
     let now_micros = mcp_agent_mail_db::now_micros();
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
 
     // Fetch up to 20 open conflict experiences for this agent.
     let open_experiences = match block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
@@ -8040,7 +8095,7 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             continue;
         }
 
-        let cx2 = Cx::for_request_with_budget(Budget::INFINITE);
+        let cx2 = runtime_request_cx(Budget::INFINITE);
         if let asupersync::Outcome::Err(error) =
             block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                 &cx2,
@@ -8068,7 +8123,7 @@ fn ensure_atc_executor_identity(
     if ensured_projects.contains(project_key) {
         return Ok(());
     }
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime.block_on(async {
         let pool =
@@ -8123,7 +8178,7 @@ fn execute_atc_advisory_effect(
     project_key: &str,
 ) -> Result<(), String> {
     ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8160,7 +8215,7 @@ fn execute_atc_probe_effect(
     project_key: &str,
 ) -> Result<(), String> {
     ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8195,7 +8250,7 @@ fn execute_atc_release_effect(
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8711,7 +8766,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             && let Some(pool) = atc_db_pool.as_ref()
             && now_micros >= next_rollup_refresh_micros
         {
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::atc_queries::refresh_rollups(
                 &cx,
                 pool,
@@ -12210,7 +12265,7 @@ impl HttpState {
             let deadline = wall_now() + Duration::from_secs(self.request_timeout_secs);
             Budget::new().with_deadline(deadline)
         };
-        Cx::for_request_with_budget(budget)
+        runtime_request_cx(budget)
     }
 
     async fn check_bearer_auth_with_cx(
@@ -12707,7 +12762,7 @@ to skip auth for local requests.</p>
             let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
             Budget::new().with_deadline(deadline)
         };
-        let cx = Cx::for_request_with_budget(budget);
+        let cx = runtime_request_cx(budget);
 
         let redis = self.rate_limit_redis_client(&cx).await;
         let has_redis = redis.is_some();
@@ -12887,9 +12942,20 @@ to skip auth for local requests.</p>
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
-            // self_ref not set or HttpState already dropped — fall back to inline sync.
+            // self_ref not set or HttpState already dropped — fall back to a
+            // synchronous dispatch. Run it on a scoped worker thread, as the
+            // normal path runs it on a dispatch thread: the router handlers
+            // are async and `dispatch_inner_with_cx` drives them with
+            // `fastmcp_core::block_on`, which refuses to nest inside a bridge
+            // that may already be polling this future.
             let id = request.id.clone();
-            return match self.dispatch_inner_with_auth(request, transport_auth) {
+            let outcome = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.dispatch_inner_with_auth(request, transport_auth))
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            });
+            return match outcome {
                 Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
                 Err(err) => {
                     id.map(|req_id| JsonRpcResponse::error(Some(req_id), JsonRpcError::from(err)))
@@ -13108,14 +13174,16 @@ to skip auth for local requests.</p>
                 // Request id and budget now travel inside `request_ctx`; the
                 // trailing options are the notification sender and the
                 // BidirectionalSenders handle, neither of which this custom
-                // dispatch layer drives.
-                let result = self.router.handle_tools_call(
+                // dispatch layer drives. FastMCP 03b52745 made the router
+                // handlers async (it no longer blocks inside the library);
+                // drive them here exactly as its former sync wrappers did.
+                let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
                     SessionState::new(),
                     None,
                     None,
-                );
+                ));
                 dispatch_checkpoint(cx, cancel)?;
 
                 let (queries, query_time_ms, per_table_sorted) =
@@ -13273,13 +13341,13 @@ to skip auth for local requests.</p>
                 // Extract format from resource URI query params (TOON support)
                 let format_value = extract_format_from_uri(&params.uri);
                 dispatch_checkpoint(cx, cancel)?;
-                let out = self.router.handle_resources_read(
+                let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
                     SessionState::new(),
                     None,
                     None,
-                )?;
+                ))?;
                 dispatch_checkpoint(cx, cancel)?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
                 apply_toon_to_content(
@@ -13301,13 +13369,13 @@ to skip auth for local requests.</p>
             }
             "prompts/get" => {
                 let params: fastmcp_protocol::GetPromptParams = parse_params(request.params)?;
-                let out = self.router.handle_prompts_get(
+                let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
                     SessionState::new(),
                     None,
                     None,
-                )?;
+                ))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tasks/list" | "tasks/get" | "tasks/cancel" | "tasks/submit" => {
@@ -13753,6 +13821,34 @@ fn reset_atc_build_slot_observation_cache_for_test() {
     guard.1.clear();
 }
 
+/// Drive an ATC ledger operation from the synchronous observation recorders.
+///
+/// The recorders run in tool-handler post-processing, which a
+/// `fastmcp_core::block_on` bridge is already polling on this thread, and a
+/// nested `block_on` panics ("nested fastmcp_core::runtime::block_on is not
+/// supported"): with ATC live writes enabled every `send_message` failed with an
+/// internal error (br-3es3d). Build and drive the future on a scoped worker
+/// thread instead, as `dispatch` does for the same constraint. The context is
+/// minted on that worker so its timers and I/O belong to the runtime the
+/// worker drives, not to the caller's runtime, which is parked in `join`.
+fn atc_ledger_block_on<T, F>(make_future: impl FnOnce(Cx) -> F + Send) -> T
+where
+    F: std::future::Future<Output = T>,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("atc-ledger".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn_scoped(scope, || {
+                block_on(make_future(runtime_request_cx(Budget::INFINITE)))
+            })
+            .expect("spawn ATC ledger thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
 fn append_atc_hot_path_observation_row(
     pool: &mcp_agent_mail_db::DbPool,
     row: &ExperienceRow,
@@ -13764,10 +13860,9 @@ fn append_atc_hot_path_observation_row(
     let started_at = Instant::now();
     let stratum_key = atc_experience_stratum_key(row);
     let feature_vector_size = atc_feature_vector_size(row);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::append_atc_experience(
-        &cx, pool, row,
-    )) {
+    match atc_ledger_block_on(|cx| async move {
+        mcp_agent_mail_db::queries::append_atc_experience(&cx, pool, row).await
+    }) {
         asupersync::Outcome::Ok(stored) => {
             let latency_micros = atc_elapsed_micros(started_at);
             mcp_agent_mail_core::global_metrics()
@@ -14734,12 +14829,12 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     }
 
     let started_at = Instant::now();
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
     let mut experience = None;
     for attempt in 1..=2_u8 {
-        match block_on(
-            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, pool, message_id),
-        ) {
+        match atc_ledger_block_on(|cx| async move {
+            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, pool, message_id)
+                .await
+        }) {
             asupersync::Outcome::Ok(Some(row)) => {
                 experience = Some(row);
                 break;
@@ -14807,9 +14902,9 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     }
 
     let Some(experience) = experience else {
-        match block_on(mcp_agent_mail_db::queries::get_message(
-            &cx, pool, message_id,
-        )) {
+        match atc_ledger_block_on(|cx| async move {
+            mcp_agent_mail_db::queries::get_message(&cx, pool, message_id).await
+        }) {
             asupersync::Outcome::Ok(_) => {
                 tracing::debug!(
                     event = "atc.hot_path.note_ack",
@@ -14906,12 +15001,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 return;
             }
             let outcome = apply_outcome("resolved_after_execute_promote");
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                &cx,
-                pool,
-                experience.experience_id,
-                &outcome,
-            )) {
+            let experience_id = experience.experience_id;
+            match atc_ledger_block_on(|cx| {
+                let outcome = &outcome;
+                async move {
+                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                        &cx,
+                        pool,
+                        experience_id,
+                        outcome,
+                    )
+                    .await
+                }
+            }) {
                 asupersync::Outcome::Ok(()) => {
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -14977,12 +15079,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         }
         ExperienceState::Open => {
             let outcome = apply_outcome("resolved_from_open");
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                &cx,
-                pool,
-                experience.experience_id,
-                &outcome,
-            )) {
+            let experience_id = experience.experience_id;
+            match atc_ledger_block_on(|cx| {
+                let outcome = &outcome;
+                async move {
+                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                        &cx,
+                        pool,
+                        experience_id,
+                        outcome,
+                    )
+                    .await
+                }
+            }) {
                 asupersync::Outcome::Ok(()) => {
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -15063,14 +15172,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                     )
                 };
                 let outcome = apply_outcome(note);
-                match block_on(
-                    mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
-                        &cx,
-                        pool,
-                        experience.experience_id,
-                        &outcome,
-                    ),
-                ) {
+                let experience_id = experience.experience_id;
+                match atc_ledger_block_on(|cx| {
+                    let outcome = &outcome;
+                    async move {
+                        mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
+                            &cx,
+                            pool,
+                            experience_id,
+                            outcome,
+                        )
+                        .await
+                    }
+                }) {
                     asupersync::Outcome::Ok(()) => {
                         mcp_agent_mail_core::global_metrics()
                             .atc
@@ -17982,9 +18096,198 @@ mod tests {
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Await one timer registered on `cx`'s own timer driver (not the ambient
+    /// one), completing only when that driver fires it.
+    fn await_timer_on_cx_driver(
+        cx: &Cx,
+        delay_nanos: u64,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        let driver = cx
+            .timer_driver()
+            .expect("runtime-backed context has a timer driver");
+        let deadline = driver.now().saturating_add_nanos(delay_nanos);
+        let mut timer = None;
+        std::future::poll_fn(move |task_cx| {
+            if driver.now() >= deadline {
+                return std::task::Poll::Ready(());
+            }
+            if timer.is_none() {
+                timer = Some(driver.register(deadline, task_cx.waker().clone()));
+            }
+            std::task::Poll::Pending
+        })
+    }
+
+    /// br-kp1in.31: production request contexts come from a runtime and carry
+    /// its drivers, outside a runtime (fastmcp's per-thread runtime) and inside
+    /// one (the runtime driving the thread), with the caller's budget intact,
+    /// and timers registered through them actually fire.
+    #[test]
+    fn runtime_request_cx_is_runtime_backed_and_keeps_its_budget() {
+        const TIMER_NANOS: u64 = 20_000_000;
+        let deadline_budget = Budget::INFINITE.with_deadline(asupersync::Time::from_secs(30));
+
+        assert!(
+            Runtime::current_handle().is_none(),
+            "precondition: test thread is not inside a runtime"
+        );
+        let outside = runtime_request_cx(deadline_budget);
+        assert_eq!(outside.budget().deadline, deadline_budget.deadline);
+        assert!(!outside.is_cancel_requested());
+        assert!(
+            outside.timer_driver().is_some(),
+            "a context minted outside a runtime must still carry live drivers"
+        );
+        let started = std::time::Instant::now();
+        block_on(await_timer_on_cx_driver(&outside, TIMER_NANOS));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_nanos(TIMER_NANOS),
+            "the timer completed only once its driver fired it"
+        );
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let started = std::time::Instant::now();
+        let inside = runtime.block_on(async {
+            assert!(Runtime::current_handle().is_some());
+            let inside = runtime_request_cx(Budget::INFINITE);
+            await_timer_on_cx_driver(&inside, TIMER_NANOS).await;
+            inside
+        });
+        assert!(started.elapsed() >= std::time::Duration::from_nanos(TIMER_NANOS));
+        assert_eq!(inside.budget().deadline, None);
+        assert!(inside.timer_driver().is_some());
+
+        // Contrast: the test-only ambient constructor the production code used
+        // to call is driverless (and absent from non-test builds entirely).
+        assert!(
+            Cx::for_request_with_budget(Budget::INFINITE)
+                .timer_driver()
+                .is_none()
+        );
+    }
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn crash_marker_hook_records_real_panic_in_isolated_process() {
+        const CHILD_ROOT: &str = "AM_TEST_CRASH_MARKER_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            install_crash_marker_panic_hook(PathBuf::from(root));
+            let caught = std::panic::catch_unwind(|| panic!("crash marker regression"));
+            assert!(caught.is_err());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::crash_marker_hook_records_real_panic_in_isolated_process",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .output()
+            .expect("run isolated panic hook");
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("crash marker regression"));
+        let bytes = std::fs::read(dir.path().join("doctor/crash_markers.jsonl"))
+            .expect("real panic marker");
+        let record: serde_json::Value = serde_json::from_slice(&bytes).expect("complete JSON");
+        assert_eq!(record["message"], "crash marker regression");
+        assert_eq!(record["version"], env!("CARGO_PKG_VERSION"));
+        assert!(record["location"].as_str().unwrap().contains("lib.rs:"));
+        assert_ne!(record["backtrace"].as_str().unwrap(), "");
+        assert_ne!(
+            record["pid"].as_u64().unwrap(),
+            u64::from(std::process::id())
+        );
+    }
+
+    #[test]
+    fn crash_marker_append_enforces_complete_record_byte_budget() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let overhead = serde_json::json!({"message": ""}).to_string().len() + 1;
+        let cap = usize::try_from(CRASH_MARKER_MAX_BYTES).unwrap();
+        let oversized = serde_json::json!({"message": "x".repeat(cap - overhead + 1)});
+        append_crash_marker(&path, &oversized);
+        assert!(
+            !path.exists(),
+            "oversized first record must not create a file"
+        );
+        let exact = serde_json::json!({"message": "x".repeat(cap - overhead)});
+        append_crash_marker(&path, &exact);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), cap);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap(),
+            exact
+        );
+        append_crash_marker(&path, &serde_json::json!({"message": "later"}));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn crash_marker_append_preserves_contended_and_overfull_files() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let first = serde_json::json!({"message": "first"});
+        append_crash_marker(&path, &first);
+        let before = std::fs::read(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        append_crash_marker(&path, &serde_json::json!({"message": "contended"}));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        append_crash_marker(&path, &first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2 * before.len() as u64
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(CRASH_MARKER_MAX_BYTES + 1).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        append_crash_marker(&path, &first);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // An invalid output path must not turn diagnostics into a second panic.
+        append_crash_marker(dir.path(), &first);
+    }
+
+    #[test]
+    fn crash_marker_append_serializes_concurrent_budget_checks() {
+        let dir = tempfile::tempdir().expect("private crash archive");
+        let path = dir.path().join("markers.jsonl");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for id in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let record =
+                        serde_json::json!({"id": id, "message": "x".repeat(2 * 1024 * 1024)});
+                    barrier.wait();
+                    append_crash_marker(path, &record);
+                });
+            }
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "at least one writer must append");
+        assert!(bytes.len() as u64 <= CRASH_MARKER_MAX_BYTES);
+        let text = String::from_utf8(bytes).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("non-interleaved JSON record"))
+            .collect();
+        assert!((1..=2).contains(&records.len()));
+        for record in records {
+            assert!(record["id"].as_u64().unwrap() < 8);
+            assert_eq!(record["message"].as_str().unwrap().len(), 2 * 1024 * 1024);
+        }
+    }
 
     #[test]
     fn shutdown_cleanup_preserves_sqlite_family_when_recovery_breaker_is_tripped() {
@@ -18390,19 +18693,18 @@ mod tests {
             .expect("failing test tool must be admitted");
 
         let cx = Cx::for_testing();
-        let result = router
-            .handle_tools_call(
-                &McpContext::new(cx, 1),
-                CallToolParams {
-                    name: "failing".to_string(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                SessionState::new(),
-                None,
-                None,
-            )
-            .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
+        let result = block_on(router.handle_tools_call(
+            &McpContext::new(cx, 1),
+            CallToolParams {
+                name: "failing".to_string(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            SessionState::new(),
+            None,
+            None,
+        ))
+        .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
 
         assert!(result.is_error);
         let LegacyContent::Text { text, .. } = &result.content[0] else {
@@ -28032,9 +28334,6 @@ first body
             http_request_log_enabled: true,
             log_json_enabled: true,
             log_rich_enabled: false,
-            http_otel_enabled: true,
-            http_otel_service_name: "mcp-agent-mail-test".to_string(),
-            http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
             ..Default::default()
         };
         let state = build_state(config);
@@ -29875,57 +30174,6 @@ first body
             "request logging disabled by default"
         );
         assert!(!config.log_json_enabled, "JSON logging disabled by default");
-        assert!(!config.http_otel_enabled, "OTEL disabled by default");
-        assert_eq!(config.http_otel_service_name, "mcp-agent-mail");
-        assert_eq!(config.http_otel_exporter_otlp_endpoint, "");
-    }
-
-    // -- OTEL config no-op parity (server-level) --
-
-    #[test]
-    fn otel_config_enabled_does_not_affect_logging_behavior() {
-        // Legacy parity: OTEL fields exist in config but the Rust port does not
-        // add spans/traces. We verify that enabling OTEL does not change the
-        // request logging output format or introduce crashes.
-        let _guard = STDIO_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config {
-            http_request_log_enabled: true,
-            log_json_enabled: true,
-            log_rich_enabled: false,
-            http_otel_enabled: true,
-            http_otel_service_name: "test-service".to_string(),
-            http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let capture = StdioCapture::install().expect("stdio capture install");
-        let req = make_request_with_peer_addr(
-            Http1Method::Get,
-            "/health/liveness",
-            &[],
-            Some("10.0.0.1:5555".parse().unwrap()),
-        );
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let out = capture.drain_to_string();
-
-        // JSON log line should exist and not contain OTEL-specific span/trace fields.
-        let json_line = out
-            .lines()
-            .find(|line| line.trim_start().starts_with('{') && line.trim_end().ends_with('}'))
-            .expect("expected JSON log line with OTEL enabled");
-        let v: serde_json::Value = serde_json::from_str(json_line).unwrap();
-        assert_eq!(v["event"], "request");
-        assert!(
-            v.get("trace_id").is_none(),
-            "no trace_id in output (OTEL is no-op)"
-        );
-        assert!(
-            v.get("span_id").is_none(),
-            "no span_id in output (OTEL is no-op)"
-        );
     }
 
     // -- Field derivation tests --

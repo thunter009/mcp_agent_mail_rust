@@ -89,15 +89,14 @@ fn seed_fixtures(fixtures: &Fixtures) {
 
                 // New fastmcp API: the request budget rides the ambient Cx
                 // inside McpContext (Budget::INFINITE here).
-                let _ = router
-                    .handle_tools_call(
-                        &McpContext::new(cx.clone(), req_id),
-                        params,
-                        SessionState::new(),
-                        None,
-                        None,
-                    )
-                    .expect("tool call should succeed during seeding");
+                let _ = block_on(router.handle_tools_call(
+                    &McpContext::new(cx.clone(), req_id),
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))
+                .expect("tool call should succeed during seeding");
                 req_id += 1;
             }
         }
@@ -176,15 +175,14 @@ fn bench_tools(c: &mut Criterion) {
             |b, params| {
                 let mut req_id: u64 = 1;
                 b.iter(|| {
-                    let out = router
-                        .handle_tools_call(
-                            &McpContext::new(cx.clone(), req_id),
-                            params.clone(),
-                            SessionState::new(),
-                            None,
-                            None,
-                        )
-                        .expect("tool call");
+                    let out = block_on(router.handle_tools_call(
+                        &McpContext::new(cx.clone(), req_id),
+                        params.clone(),
+                        SessionState::new(),
+                        None,
+                        None,
+                    ))
+                    .expect("tool call");
                     req_id = req_id.wrapping_add(1);
                     black_box(out);
                 });
@@ -1639,9 +1637,9 @@ fn write_archive_spans_report(report: &ArchivePerfReport) -> io::Result<()> {
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
-fn run_archive_perf_profile_once_inner(force: bool) {
+fn run_archive_perf_profile_once_inner(for_testing: bool) {
     static DID_RUN: Once = Once::new();
-    if !force && std::env::var_os("MCP_AGENT_MAIL_ARCHIVE_PROFILE").is_none() {
+    if !for_testing && std::env::var_os("MCP_AGENT_MAIL_ARCHIVE_PROFILE").is_none() {
         return;
     }
 
@@ -1682,16 +1680,17 @@ fn run_archive_perf_profile_once_inner(force: bool) {
 
         let mut comparison = Vec::new();
         let mut batch_100_spans = Vec::new();
-        let sample_counts = [
-            (1usize, 40usize),
-            (10usize, 25usize),
-            (50usize, 15usize),
-            (100usize, 12usize),
-            (500usize, 6usize),
-            (1000usize, 4usize),
-        ];
+        // The test checks the emitted artifacts, not the numbers: every batch
+        // size, fewer samples. The full table writes ~10,900 fsync'd message
+        // bundles: 326 s on a quiet host, past the 900 s gate kill under load
+        // (br-t31jg item 7). The profiling run keeps the full table.
+        let sample_counts: &[(usize, usize)] = if for_testing {
+            &[(1, 4), (10, 3), (50, 2), (100, 2), (500, 1), (1000, 1)]
+        } else {
+            &[(1, 40), (10, 25), (50, 15), (100, 12), (500, 6), (1000, 4)]
+        };
 
-        for (batch_size, sample_count) in sample_counts {
+        for &(batch_size, sample_count) in sample_counts {
             let tmp = benchmark_tempdir();
             let original_cwd = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(tmp.path()).expect("chdir");

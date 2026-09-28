@@ -809,6 +809,33 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
+fn archive_drain_stall_detail(
+    lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
+    critical_us: u64,
+) -> Option<String> {
+    (lag.wbq_inflight_execution_us >= critical_us
+        || lag.wbq_since_progress_us >= critical_us
+        || lag.coalescer_since_progress_us >= critical_us)
+        .then(|| {
+            // Preserve the publication-fence diagnosis for both the WBQ and
+            // coalescer: either worker can be blocked by the same holder.
+            let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder()
+                .map_or_else(String::new, |holder| {
+                    format!("; archive publication fence held by {holder}")
+                });
+            format!(
+                "wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; \
+                 coalescer pending {}, no committed request for {} ms; critical bound {} ms{fence_holder}",
+                lag.wbq_depth,
+                lag.wbq_inflight_execution_us / 1_000,
+                lag.wbq_since_progress_us / 1_000,
+                lag.coalescer_pending,
+                lag.coalescer_since_progress_us / 1_000,
+                critical_us / 1_000,
+            )
+        })
+}
+
 /// Decompose the bundled health signals into independent verdicts
 /// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
 /// prevents a green top-level result from coexisting with a broken write or
@@ -818,6 +845,7 @@ fn compute_health_verdicts(
     pool_present: bool,
     semantic: &SemanticReadinessResponse,
     integrity: &mcp_agent_mail_db::IntegrityMetrics,
+    archive_drain_stall: Option<&str>,
 ) -> HealthVerdicts {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
@@ -854,6 +882,19 @@ fn compute_health_verdicts(
 
     let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
         HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if let Some(stall) = archive_drain_stall {
+        // br-kp1in.23: write-behind lag is tolerable only while it converges.
+        // A drain that completes nothing leaves every queued write without an
+        // archive copy indefinitely, so parity is broken, not lagging.
+        HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "archive write-behind drain stalled ({stall}); queued archive writes will not \
+                 land until the drain recovers ({})",
+                semantic.detail
+            ),
+        )
     } else {
         // Never assert bare alignment: the git archive legitimately trails the
         // live SQLite index under write-behind flush, so a green parity verdict
@@ -1205,10 +1246,23 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
+    // br-kp1in.23: state the absolute gap. A DB far ahead of the archive is
+    // either archive writes still queued (see queues.archive_lag) or writes
+    // that never landed; it must not read as "aligned".
+    let db_ahead_by =
+        db_message_count.saturating_sub(u64::try_from(archive_message_count).unwrap_or(u64::MAX));
+    let alignment = if db_ahead_by == 0 {
+        "Archive and sqlite inventory are aligned".to_string()
+    } else {
+        format!(
+            "sqlite is ahead of the archive by {db_ahead_by} message(s) (queued archive writes or \
+             writes that never landed; compare queues.archive_lag)"
+        )
+    };
     semantic_readiness_response(
         "ok",
         format!(
-            "Archive and sqlite inventory are aligned enough for health_check: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
+            "{alignment}: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
             archive.projects,
             archive.agents,
             archive.unique_message_ids,
@@ -1320,6 +1374,11 @@ pub struct HealthCheckResponse {
     /// disk sample) so diagnostic clients can always bind their database and
     /// archive probes to the mailbox the daemon is actually serving.
     pub storage_root: String,
+    /// How writes outside an explicit transaction run on this process's
+    /// runtime connections (br-kp1in.16): `mvcc_concurrent`, `serialized`, or
+    /// `not_observed` before the first pooled write connection opened.
+    #[serde(default)]
+    pub sqlite_autocommit_write_mode: String,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -1366,6 +1425,47 @@ pub struct HealthLevelContributor {
     pub name: String,
     pub level: String,
     pub detail: String,
+}
+
+/// Descriptor pressure as a health level (br-kp1in.17): red at 90 % of the
+/// soft `RLIMIT_NOFILE`, yellow at 70 % or while the open-descriptor floor
+/// rises in every recent window (the leak signature).
+const fn descriptor_health_level(
+    utilization_pct: Option<u64>,
+    floor_rising: bool,
+) -> mcp_agent_mail_core::HealthLevel {
+    use mcp_agent_mail_core::HealthLevel;
+    match utilization_pct {
+        Some(pct) if pct >= 90 => HealthLevel::Red,
+        Some(pct) if pct >= 70 => HealthLevel::Yellow,
+        _ if floor_rising => HealthLevel::Yellow,
+        _ => HealthLevel::Green,
+    }
+}
+
+fn descriptor_health_detail(
+    descriptors: &mcp_agent_mail_core::FdMetricsSnapshot,
+    growth: Option<&mcp_agent_mail_core::DescriptorFloorGrowth>,
+) -> String {
+    let open = descriptors
+        .open_fds
+        .map_or_else(|| "unknown".to_string(), |n| n.to_string());
+    let soft = descriptors
+        .soft_limit
+        .map_or_else(|| "unlimited/unknown".to_string(), |n| n.to_string());
+    let pct = descriptors
+        .utilization_pct
+        .map_or_else(String::new, |p| format!(" ({p}%)"));
+    let floor = growth.map_or_else(
+        || "floor not rising".to_string(),
+        |growth| {
+            format!(
+                "floor rose in every window {:?} (+{}/h): possible descriptor leak",
+                growth.floors, growth.per_hour
+            )
+        },
+    );
+    format!("{open} open of soft limit {soft}{pct}; {floor}")
 }
 
 /// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
@@ -1527,6 +1627,10 @@ pub struct ArchiveLagHealthResponse {
     pub coalescer_pending: u64,
     /// Age of the oldest uncommitted coalescer request, milliseconds.
     pub coalescer_oldest_age_ms: u64,
+    /// Longest interval without a committed request among repositories with
+    /// queued or in-flight coalescer work, milliseconds.
+    #[serde(default)]
+    pub coalescer_since_progress_ms: u64,
     /// Age of the oldest unmaterialized archive write overall, milliseconds.
     pub oldest_unmaterialized_ms: u64,
     /// Lifetime totals for the retry backlog.
@@ -1543,6 +1647,23 @@ pub struct ArchiveLagHealthResponse {
     pub critical_threshold_ms: u64,
     /// True when the oldest-unmaterialized age is at/over the warn bound.
     pub warning: bool,
+    /// Ops waiting in the write-behind queue channel (br-kp1in.23).
+    #[serde(default)]
+    pub wbq_depth: u64,
+    /// Age of the oldest op in the batch the WBQ drain is executing, ms.
+    #[serde(default)]
+    pub wbq_inflight_oldest_age_ms: u64,
+    /// How long the WBQ drain has been executing its current batch, ms.
+    #[serde(default)]
+    pub wbq_inflight_execution_ms: u64,
+    /// How long queued WBQ work has waited without a completed op, ms.
+    #[serde(default)]
+    pub wbq_since_progress_ms: u64,
+    /// True when one WBQ batch has been executing past the critical bound, or
+    /// pending WBQ/coalescer work has seen no completed op for that long: the
+    /// drain is stuck, not merely behind.
+    #[serde(default)]
+    pub drain_stalled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1921,6 +2042,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let archive_lag_warn_us = mcp_agent_mail_storage::archive_lag_warn_threshold_us();
     let archive_lag_critical_us = mcp_agent_mail_storage::archive_lag_critical_threshold_us();
     let archive_lag_oldest_us = archive_lag.oldest_unmaterialized_us;
+    // br-kp1in.23: one batch executing past the critical bound, or queued work
+    // with no completed op for that long (e.g. a dead drain thread), means the
+    // drain is blocked (observed 2026-09-23: zero progress while thousands queued).
+    let archive_drain_stall = archive_drain_stall_detail(&archive_lag, archive_lag_critical_us);
+    let archive_drain_stalled = archive_drain_stall.is_some();
 
     // Refresh the cached health level (pressure-derived) from live metrics.
     let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
@@ -1935,6 +2061,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         pool.is_some(),
         &semantic_readiness,
         &integrity_metrics,
+        archive_drain_stall.as_deref(),
     );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
@@ -1949,7 +2076,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     }
     // Archive lag past the configured bounds degrades readiness (never green)
     // without flipping the top-level `status` to "error": a lagging archive is
-    // eventual-consistency degradation, not a down critical subsystem.
+    // eventual-consistency degradation, not a down critical subsystem. A
+    // stalled drain is not converging and is already red in archive_db_parity.
     if archive_lag_oldest_us >= archive_lag_critical_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Red);
     } else if archive_lag_oldest_us >= archive_lag_warn_us {
@@ -1959,6 +2087,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // consuming most of the fixed ecosystem client deadline. Treat that as
     // functional degradation so an all-zero pool snapshot cannot hide it.
     effective_level = effective_level.max(coalescer_latency_level);
+    // br-kp1in.17: descriptor exhaustion is what took v0.3.36 daemons down;
+    // name the headroom and a rising descriptor floor before it bites.
+    let descriptors = mcp_agent_mail_core::fd_metrics_snapshot();
+    let descriptor_growth = mcp_agent_mail_core::descriptor_floor_growth();
+    let descriptor_level =
+        descriptor_health_level(descriptors.utilization_pct, descriptor_growth.is_some());
+    effective_level = effective_level.max(descriptor_level);
     let failing_verdicts = verdicts.failing_names();
     // GH#300: name every input behind the effective level so a red or yellow
     // top level that no decomposed verdict explains (live pressure, archive
@@ -1990,10 +2125,20 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "archive_lag".to_string(),
             level: archive_lag_level.to_string(),
             detail: format!(
-                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms)",
+                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; coalescer pending {}, no committed request for {} ms{}",
                 archive_lag_oldest_us / 1_000,
                 archive_lag_warn_us / 1_000,
-                archive_lag_critical_us / 1_000
+                archive_lag_critical_us / 1_000,
+                archive_lag.wbq_depth,
+                archive_lag.wbq_inflight_execution_us / 1_000,
+                archive_lag.wbq_since_progress_us / 1_000,
+                archive_lag.coalescer_pending,
+                archive_lag.coalescer_since_progress_us / 1_000,
+                if archive_drain_stalled {
+                    " — DRAIN STALLED"
+                } else {
+                    ""
+                }
             ),
         },
         HealthLevelContributor {
@@ -2004,6 +2149,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 metrics.storage.commit_queue_latency_us.p99 / 1_000,
                 config.health_commit_coalescer_p99_degraded_ms
             ),
+        },
+        HealthLevelContributor {
+            name: "descriptors".to_string(),
+            level: descriptor_level.to_string(),
+            detail: descriptor_health_detail(&descriptors, descriptor_growth.as_ref()),
         },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
@@ -2026,6 +2176,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
         storage_root: config.storage_root.display().to_string(),
+        sqlite_autocommit_write_mode:
+            match mcp_agent_mail_db::pool::observed_autocommit_concurrent_mode() {
+                Some(true) => "mvcc_concurrent",
+                Some(false) => "serialized",
+                None => "not_observed",
+            }
+            .to_string(),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -2107,6 +2264,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     backlog_oldest_age_ms: us_to_ms_ceil(archive_lag.backlog_oldest_age_us),
                     coalescer_pending: archive_lag.coalescer_pending,
                     coalescer_oldest_age_ms: us_to_ms_ceil(archive_lag.coalescer_oldest_age_us),
+                    coalescer_since_progress_ms: us_to_ms_ceil(
+                        archive_lag.coalescer_since_progress_us,
+                    ),
                     oldest_unmaterialized_ms: us_to_ms_ceil(archive_lag_oldest_us),
                     backlog_enqueued_total: archive_lag.enqueued_total,
                     backlog_drained_total: archive_lag.drained_total,
@@ -2118,6 +2278,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     // durably journaled (ephemeral) warrants operator attention.
                     warning: archive_lag_oldest_us >= archive_lag_warn_us
                         || archive_lag.ephemeral_total > 0,
+                    wbq_depth: archive_lag.wbq_depth,
+                    wbq_inflight_oldest_age_ms: us_to_ms_ceil(
+                        archive_lag.wbq_inflight_oldest_age_us,
+                    ),
+                    wbq_inflight_execution_ms: us_to_ms_ceil(archive_lag.wbq_inflight_execution_us),
+                    wbq_since_progress_ms: us_to_ms_ceil(archive_lag.wbq_since_progress_us),
+                    drain_stalled: archive_drain_stalled,
                 },
             }
         }),
@@ -3957,6 +4124,7 @@ mod tests {
                 "sqlite schema missing required health_check tables: agents, messages",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
@@ -3982,6 +4150,7 @@ mod tests {
                 "sqlite connectivity probe failed during health_check: file is not a database",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4001,6 +4170,7 @@ mod tests {
                 "archive inventory is ahead of the sqlite index (archive projects=2 ...)",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert_eq!(
@@ -4017,6 +4187,7 @@ mod tests {
             false,
             &semantic("fail", "database pool bootstrap failed"),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4033,6 +4204,7 @@ mod tests {
             true,
             &semantic("ok", "aligned"),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "green");
         assert_eq!(verdicts.write_health.status, "green");
@@ -4062,6 +4234,7 @@ mod tests {
             true,
             &semantic("ok", drift_detail),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.archive_db_parity.status, "green");
         assert!(
@@ -4074,6 +4247,93 @@ mod tests {
         assert_ne!(
             verdicts.archive_db_parity.detail, "git archive and sqlite index are aligned",
             "must not assert bare alignment over visibly unequal counts"
+        );
+    }
+
+    #[test]
+    fn stalled_archive_drain_makes_parity_red_and_critical() {
+        // br-kp1in.23: 2026-09-23 instance A held 3,453 queued archive writes
+        // with zero drain progress while every critical verdict stayed green.
+        let config = Config::from_env();
+        let drift_detail = "sqlite is ahead of the archive by 3235 message(s)";
+        let stalled = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", drift_detail),
+            &healthy_integrity_metrics(),
+            Some("wbq depth 3453, no completed op for 900000 ms"),
+        );
+        assert_eq!(stalled.archive_db_parity.status, "red");
+        assert!(stalled.archive_db_parity.critical);
+        assert!(
+            stalled.archive_db_parity.detail.contains("drain stalled")
+                && stalled.archive_db_parity.detail.contains("wbq depth 3453")
+                && stalled.archive_db_parity.detail.contains(drift_detail),
+            "the stall verdict must name the stall and keep the inventory: {}",
+            stalled.archive_db_parity.detail
+        );
+        assert_eq!(
+            stalled.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+        assert!(
+            stalled
+                .failing_names()
+                .contains(&"archive_db_parity".to_string())
+        );
+
+        // The same inventory with a draining queue is tolerated write-behind lag.
+        let draining = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", drift_detail),
+            &healthy_integrity_metrics(),
+            None,
+        );
+        assert_eq!(draining.archive_db_parity.status, "green");
+        assert_eq!(
+            draining.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn stalled_coalescer_with_empty_wbq_makes_parity_red_and_critical() {
+        let lag = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            coalescer_pending: 1,
+            coalescer_oldest_age_us: 900_000_000,
+            coalescer_since_progress_us: 900_000_000,
+            ..Default::default()
+        };
+        let detail = archive_drain_stall_detail(&lag, 30_000_000)
+            .expect("a stuck Git commit is a stalled archive drain even with an empty WBQ");
+        let verdicts = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive files and sqlite messages are aligned"),
+            &healthy_integrity_metrics(),
+            Some(&detail),
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert!(verdicts.archive_db_parity.critical);
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("coalescer pending 1")
+        );
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+
+        let progressing = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            coalescer_since_progress_us: 1_000,
+            ..lag
+        };
+        assert!(
+            archive_drain_stall_detail(&progressing, 30_000_000).is_none(),
+            "old requests with recent commit progress remain ordinary catch-up lag"
         );
     }
 
@@ -4206,6 +4466,7 @@ mod tests {
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
             storage_root: "/data".into(),
+            sqlite_autocommit_write_mode: "mvcc_concurrent".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
@@ -4752,6 +5013,7 @@ mod tests {
             http_port: 8765,
             database_url: "sqlite:///:memory:".into(),
             storage_root: "/tmp/agent-mail-test".into(),
+            sqlite_autocommit_write_mode: "not_observed".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),
@@ -4790,6 +5052,41 @@ mod tests {
                 "optional null field {key} must be omitted"
             );
         }
+    }
+
+    /// br-kp1in.17: descriptor headroom and a rising floor raise `health_level`.
+    #[test]
+    fn descriptor_health_level_grades_headroom_and_a_rising_floor() {
+        use mcp_agent_mail_core::HealthLevel;
+        assert_eq!(descriptor_health_level(Some(95), false), HealthLevel::Red);
+        assert_eq!(descriptor_health_level(Some(90), true), HealthLevel::Red);
+        assert_eq!(
+            descriptor_health_level(Some(70), false),
+            HealthLevel::Yellow
+        );
+        assert_eq!(descriptor_health_level(Some(69), false), HealthLevel::Green);
+        assert_eq!(descriptor_health_level(Some(5), true), HealthLevel::Yellow);
+        assert_eq!(descriptor_health_level(None, false), HealthLevel::Green);
+        assert_eq!(descriptor_health_level(None, true), HealthLevel::Yellow);
+
+        let snapshot = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(2048),
+            hard_limit: Some(1_048_576),
+            open_fds: Some(1900),
+            utilization_pct: Some(92),
+        };
+        let growth = mcp_agent_mail_core::DescriptorFloorGrowth {
+            floors: vec![1500, 1600, 1700],
+            per_hour: 200,
+        };
+        let detail = descriptor_health_detail(&snapshot, Some(&growth));
+        assert!(
+            detail.starts_with("1900 open of soft limit 2048 (92%);"),
+            "{detail}"
+        );
+        assert!(detail.contains("possible descriptor leak"), "{detail}");
+        let steady = descriptor_health_detail(&snapshot, None);
+        assert!(steady.ends_with("floor not rising"), "{steady}");
     }
 
     #[test]
@@ -5015,6 +5312,14 @@ body
                         .is_some_and(|detail| !detail.contains("archive inventory is ahead")),
                     "health_check should not false-fail on metadata-only archive drift when the DB has newer messages: {value}"
                 );
+                // br-kp1in.23: the DB-ahead gap is stated as a number, never
+                // as "aligned".
+                let detail = value["semantic_readiness"]["detail"].as_str().unwrap_or("");
+                assert!(
+                    detail.contains("sqlite is ahead of the archive by 1 message(s)")
+                        && !detail.contains("aligned"),
+                    "health_check must report the absolute DB-archive gap: {value}"
+                );
                 assert!(
                     value.get("recovery").is_none(),
                     "DB-ahead archive parity drift alone should not advertise recovery: {value}"
@@ -5161,6 +5466,46 @@ body
                         }),
                     "health_check should surface missing archive project identity: {value}"
                 );
+            },
+        );
+    }
+
+    /// br-kp1in.17: every `health_check` names this process's descriptor
+    /// headroom among the inputs to `health_level`.
+    #[test]
+    fn health_check_reports_descriptor_headroom_as_a_level_contributor() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("descriptor-health.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                let contributors = value["health_level_contributors"]
+                    .as_array()
+                    .expect("contributors array");
+                let descriptors = contributors
+                    .iter()
+                    .find(|row| row["name"] == "descriptors")
+                    .unwrap_or_else(|| panic!("descriptors contributor missing: {value}"));
+                assert_eq!(descriptors["level"], "green", "{descriptors}");
+                let detail = descriptors["detail"].as_str().expect("detail");
+                assert!(detail.contains(" open of soft limit "), "{detail}");
+                assert!(detail.ends_with("floor not rising"), "{detail}");
             },
         );
     }

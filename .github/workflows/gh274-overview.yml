@@ -1,0 +1,38 @@
+name: Native overview regression and benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/mcp-agent-mail-cli/src/robot.rs
+      - crates/mcp-agent-mail-cli/src/robot_commands.rs
+      - crates/mcp-agent-mail-cli/src/robot/**
+      - .github/workflows/gh274-overview.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Clone workspace sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live collector correctness and work bounds
+        run: cargo test --release -p mcp-agent-mail-cli --lib robot::overview::tests -- --nocapture
+      - name: Actual CLI cold-process mutation regression
+        run: cargo test --release -p mcp-agent-mail-cli --test it integration_runs::robot_overview_cold_processes -- --nocapture
+      - name: Native collector comparison (not CLI startup)
+        env:
+          AM_OVERVIEW_BENCH_MESSAGES_PER_PROJECT: '48'
+        run: cargo test --release -p mcp-agent-mail-cli --lib benchmark_linear_overview_against_current_main -- --ignored --nocapture

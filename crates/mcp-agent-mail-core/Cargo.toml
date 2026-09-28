@@ -10,19 +10,27 @@ description = "Core types, models, and configuration for MCP Agent Mail"
 # Distributed as binary-only via dist.yml + curl|bash installer.
 # Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
 publish = false
+# All integration tests link into ONE binary (tests/it.rs) instead of one ~0.7 GB
+# binary per file (br-kp1in.28); tests/it.rs checks every tests/*.rs is declared.
+autotests = false
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 json5.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
 same-file.workspace = true
-dirs = "6"
+dirs.workspace = true
 getrandom = "0.4.2"
 shellexpand = "3"
 shlex = "2"
@@ -31,8 +39,10 @@ sha2.workspace = true
 hex.workspace = true
 fs2.workspace = true
 globset.workspace = true
-# `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.
-nix = { workspace = true, features = ["fs"] }
+# `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`;
+# `resource` provides the safe `setrlimit` used to raise the server's soft
+# RLIMIT_NOFILE at startup (br-kp1in.17).
+nix = { workspace = true, features = ["fs", "resource"] }
 rustix.workspace = true
 tracing.workspace = true
 # Regular (not dev) dependency: `config::with_isolated_default_storage_root_for_test`
@@ -60,6 +70,7 @@ optional = true
 [dev-dependencies]
 criterion.workspace = true
 loom.workspace = true
+mcp-agent-mail-test-helpers.workspace = true
 nix = { workspace = true, features = ["process", "signal"] }
 proptest.workspace = true
 tempfile.workspace = true

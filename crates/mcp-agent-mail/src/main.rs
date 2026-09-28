@@ -103,25 +103,30 @@ fn resolve_early_dispatch(
     Ok(EarlyDispatch::Mcp)
 }
 
-const fn default_mcp_log_filter() -> &'static str {
-    concat!(
-        "warn,",
-        "mcp_agent_mail=info,",
-        "mcp_agent_mail_server=info,",
-        "mcp_agent_mail_core=info,",
-        "mcp_agent_mail_db=info,",
-        "mcp_agent_mail_storage=info,",
-        "mcp_agent_mail_tools=info,",
-        "fsqlite_core::connection=warn,",
-        "fsqlite_mvcc::observability=warn,",
-        "fsqlite_mvcc::gc=warn,",
-        "fsqlite_mvcc::rebase=warn,",
-        "mvcc=warn,",
-        "checkpoint=warn,",
-        "fsqlite.storage_wiring=warn,",
-        "fsqlite_wal::checkpoint_executor=warn,",
-        "fsqlite_vdbe::jit=warn,",
-        "fsqlite_vdbe::engine=warn",
+/// Agent Mail's own crates log at `log_level` (the canonical `LOG_LEVEL` from
+/// `Config`, br-kp1in.20); dependencies stay at `warn` unless it is stricter.
+fn default_mcp_log_filter(log_level: &str) -> String {
+    if mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level) {
+        return log_level.to_string();
+    }
+    format!(
+        "warn,\
+         mcp_agent_mail={log_level},\
+         mcp_agent_mail_server={log_level},\
+         mcp_agent_mail_core={log_level},\
+         mcp_agent_mail_db={log_level},\
+         mcp_agent_mail_storage={log_level},\
+         mcp_agent_mail_tools={log_level},\
+         fsqlite_core::connection=warn,\
+         fsqlite_mvcc::observability=warn,\
+         fsqlite_mvcc::gc=warn,\
+         fsqlite_mvcc::rebase=warn,\
+         mvcc=warn,\
+         checkpoint=warn,\
+         fsqlite.storage_wiring=warn,\
+         fsqlite_wal::checkpoint_executor=warn,\
+         fsqlite_vdbe::jit=warn,\
+         fsqlite_vdbe::engine=warn"
     )
 }
 
@@ -152,17 +157,23 @@ fn allow_noisy_dependency_logs() -> bool {
     })
 }
 
-fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool) -> EnvFilter {
+/// `RUST_LOG`, when set, replaces the `LOG_LEVEL`-derived default.
+fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool, log_level: &str) -> EnvFilter {
+    let from_rust_log = env::var_os("RUST_LOG").is_some();
     let mut filter = if suppress_runtime_logs_for_tui {
         EnvFilter::new("off")
     } else {
         EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()))
+            .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter(log_level)))
     };
     if suppress_runtime_logs_for_tui {
         return filter;
     }
-    if allow_noisy_dependency_logs() {
+    // The warn-level clamps would loosen a stricter LOG_LEVEL for dependencies.
+    if allow_noisy_dependency_logs()
+        || (!from_rust_log
+            && mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level))
+    {
         return filter;
     }
     for raw in noisy_dependency_log_clamp_directives() {
@@ -275,19 +286,28 @@ where
     }
 }
 
-/// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
-///
-/// I3 (br-bvq1x.9.3): a `SQLite` connection dropped without explicit `close()`.
-/// Thin delegator; the detection logic lives in `mcp_agent_mail_server`.
-struct DropCloseCounterLayer;
-
-impl<S> Layer<S> for DropCloseCounterLayer
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        mcp_agent_mail_server::note_possible_drop_close_event(event);
-    }
+/// The fmt layer under `filter`, plus the counting layers, each filtered to the
+/// targets it reads. An unfiltered layer would make `tracing::enabled!` true for
+/// every callsite and switch off the storage engine's fused DML lane (br-49zjq).
+fn mcp_log_subscriber(filter: EnvFilter) -> impl Subscriber + Send + Sync + 'static {
+    let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_filter(tracing_subscriber::filter::FilterExt::and(
+            filter,
+            mcp_agent_mail_cli::DependencyWarnRateLimit::default(),
+        ));
+    let git_segfault_layer =
+        GitSegfaultRetryTuiLayer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            matches!(
+                metadata.target(),
+                GIT_LOCKED_TRACE_TARGET | GUARD_SEGFAULT_TRACE_TARGET
+            )
+        }));
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(git_segfault_layer)
+        .with(mcp_agent_mail_cli::drop_close_counter_layer())
 }
 
 fn git_segfault_retry_trace_event_from_fields(
@@ -724,16 +744,8 @@ fn main() {
     let suppress_runtime_logs_for_tui = matches!(&cli.command, Some(Commands::Serve { no_tui, .. }) if !*no_tui)
         && config.tui_enabled
         && std::io::stdout().is_terminal();
-    let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
-    let fmt_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_filter(filter);
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(GitSegfaultRetryTuiLayer)
-        .with(DropCloseCounterLayer)
-        .init();
+    let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui, &config.log_level);
+    mcp_log_subscriber(filter).init();
 
     if cli.verbose {
         tracing::info!("Configuration loaded: {:?}", config);
@@ -1007,10 +1019,28 @@ mod tests {
 
     #[test]
     fn default_mcp_log_filter_includes_fsqlite_noise_suppressors() {
-        let filter = default_mcp_log_filter();
+        let filter = default_mcp_log_filter("info");
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
+    }
+
+    /// br-kp1in.20: `LOG_LEVEL` drives the server binary's default filter.
+    #[test]
+    fn default_mcp_log_filter_follows_log_level() {
+        let debug = default_mcp_log_filter("debug");
+        assert!(
+            debug.starts_with("warn,"),
+            "dependencies stay at warn: {debug}"
+        );
+        assert!(debug.contains("mcp_agent_mail=debug"));
+        assert!(debug.contains("mcp_agent_mail_server=debug"));
+        assert!(
+            !debug.contains("=info"),
+            "no crate is left at the old default: {debug}"
+        );
+        assert_eq!(default_mcp_log_filter("error"), "error");
+        assert_eq!(default_mcp_log_filter("off"), "off");
     }
 
     #[test]
@@ -1020,6 +1050,41 @@ mod tests {
         assert!(directives.contains(&"execute_statement_dispatch=error"));
         assert!(directives.contains(&"mvcc=warn"));
         assert!(directives.contains(&"checkpoint=warn"));
+    }
+
+    /// br-49zjq: the counting layers must not enable the storage engine's
+    /// per-statement tracing (which switches off its fused DML lane), yet must
+    /// still receive their own targets when the TUI turns fmt output off.
+    #[test]
+    fn mcp_subscriber_enables_only_the_counted_targets_beyond_its_filter() {
+        for directives in [
+            "off".to_string(),
+            default_mcp_log_filter("info"),
+            default_mcp_log_filter("debug"),
+        ] {
+            tracing::subscriber::with_default(
+                mcp_log_subscriber(EnvFilter::new(&directives)),
+                || {
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG),
+                        "filter {directives:?}"
+                    );
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO),
+                        "filter {directives:?}"
+                    );
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG),
+                        "filter {directives:?}"
+                    );
+                    assert!(tracing::enabled!(target: "fsqlite::runtime", tracing::Level::WARN));
+                    assert!(tracing::enabled!(
+                        target: "mcp_agent_mail::git_locked",
+                        tracing::Level::WARN
+                    ));
+                },
+            );
+        }
     }
 
     #[test]

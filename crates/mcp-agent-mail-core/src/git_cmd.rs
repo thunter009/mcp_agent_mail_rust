@@ -7,21 +7,14 @@
 //! - [`RepoFlock`][`crate::RepoFlock`] (B3, OS flock)
 //! - [`ReentrancyGuard`][`crate::ReentrancyGuard`] (B1 §6.1, panic on nested
 //!   calls to same repo from same thread)
-//! - SIGSEGV classification + retry (E1/E2 — wired as hooks here; retry
-//!   loop lives in this module but the retry *policy* is implemented
-//!   incrementally across E1/E2 beads)
+//! - SIGSEGV classification + bounded retry (E1/E2)
 //! - Structured logging under target `mcp_agent_mail::git_locked`
-//! - Metrics counters registered via [`crate::metrics`]
 //!
 //! # Typical usage
 //!
 //! ```ignore
 //! use mcp_agent_mail_core::git_cmd::GitCmd;
-//!
-//! // Simple: run and get Output.
 //! let out = GitCmd::new(repo_path).args(["log", "-1", "--format=%ct"]).run()?;
-//!
-//! // With stdin (e.g. pre-push hook data).
 //! let out = GitCmd::new(repo_path)
 //!     .args(["rev-list", "--stdin"])
 //!     .stdin(stdin_bytes)
@@ -34,8 +27,18 @@
 //!   pre-commit code: the guard runs inside the user's git process and
 //!   wrapping with flock would deadlock. See B1 design note §3.
 //! - Do NOT call from inside the `CommitCoalescer`'s per-repo worker:
-//!   the coalescer has its own CAS lock; mutexing twice wastes time
-//!   (but won't deadlock). Use direct `git2::` calls there.
+//!   the coalescer has its own CAS lock; use direct `git2::` calls there.
+//! - The configured timeout is one invocation budget. Registry/repository lock
+//!   waits, flock, and Unix stdin/stdout/stderr/child execution spend that same
+//!   budget. Segfault retries also obey a ten-second window from its origin.
+//!   A healthy first attempt is not restricted to that retry-only window.
+//! - No Unix pipe or lock-wait threads are spawned or detached. Output is
+//!   limited to 64 MiB combined; `AM_GIT_MAX_OUTPUT_BYTES` can override the
+//!   positive byte bound. Exceeding it is an error, never truncated success.
+//! - The budget is cooperative: it cannot preempt filesystem/binary-resolution
+//!   syscalls, spawning, diagnostic callbacks, or child reaping. Expiry is
+//!   rechecked before later work. Non-Unix blocking stdin and reader-thread
+//!   behavior remain unchanged and do not establish an end-to-end pipe deadline.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,31 +46,76 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::git_binary::{ResolvedGitBinary, resolve_git_binary};
-use crate::git_lock::{GitRepoLocks, ReentrancyGuard, RepoFlock, canonicalize_repo};
+use crate::git_lock::{
+    GitRepoLocks, ReentrancyGuard, RepoFlock, canonicalize_repo, flock_timeout_secs,
+    lock_mutex_with_timeout,
+};
 
-/// Default wall-clock timeout for the git child process.
+/// Default invocation budget, including lock admission and Unix pipe execution.
 pub const DEFAULT_GIT_EXEC_TIMEOUT_SECS: u64 = 120;
+const SEGFAULT_RETRY_WINDOW: Duration = Duration::from_secs(10);
+const SEGFAULT_BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
 
-/// What the git process did after we spawned it.
+/// Default combined stdout/stderr capture bound for Unix git invocations.
+#[cfg(unix)]
+pub const DEFAULT_GIT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// One monotonic origin survives lock admission, child setup and retries.
+/// Duration arithmetic avoids overflowing `Instant` for a `Duration::MAX` caller.
+#[derive(Debug, Clone, Copy)]
+struct GitBudget {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl GitBudget {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.timeout.saturating_sub(self.started.elapsed())
+    }
+
+    fn remaining_for(self, stage: &str) -> io::Result<Duration> {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("git invocation exceeded {:?} before {stage}", self.timeout),
+            ))
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn capped(self, timeout: Duration) -> Self {
+        Self {
+            timeout: self.timeout.min(timeout),
+            ..self
+        }
+    }
+}
+
+/// What the invocation did. Admission may fail before a child is spawned.
 #[derive(Debug)]
 pub enum GitRunOutcome {
     /// Normal exit (success OR non-zero) with captured Output.
     Finished(Output),
-    /// Process was killed by a signal in the "segfault-like" family
-    /// (SIGSEGV/11 or SIGBUS/7). Caller may want to retry (E2).
+    /// SIGSEGV/11 or SIGBUS/7, including corresponding shell exit codes.
     SegfaultLike { signal: i32 },
-    /// Process was killed by some other signal (SIGABRT, SIGKILL, ...)
-    /// or exited with the corresponding exit code. Not retryable.
+    /// Another signal; not retryable.
     OtherSignal { signal: i32 },
-    /// We killed the process because it exceeded the wall-clock timeout.
+    /// The child or its inherited pipes exceeded the invocation budget.
     Timeout { after: Duration },
-    /// Spawn or I/O error before we could run.
+    /// Admission, spawn, capture-limit or I/O error.
     Error(io::Error),
 }
 
 impl GitRunOutcome {
-    /// True if this outcome is one that Track E's retry policy should
-    /// retry.
     #[must_use]
     pub const fn is_segfault_like(&self) -> bool {
         matches!(self, Self::SegfaultLike { .. })
@@ -80,15 +128,9 @@ pub struct GitCmd<'a> {
     args: Vec<std::ffi::OsString>,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
-    /// Extra env vars to set on the child process (e.g. `GIT_AUTHOR_NAME`).
     envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    /// Override `cwd` of the child. Default: repo.
     cwd: Option<PathBuf>,
-    /// If true, skip flock. Used by the guard retry path (E5) which
-    /// already runs inside git's own process.
     skip_flock: bool,
-    /// If true, skip in-process mutex too. Only for extremely rare
-    /// cases; default is always serialize.
     skip_mutex: bool,
 }
 
@@ -131,6 +173,8 @@ impl<'a> GitCmd<'a> {
         self
     }
 
+    /// Set the invocation budget, including admission and Unix child/pipe work.
+    /// Zero refuses execution without spawning a child.
     #[must_use]
     pub const fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
@@ -154,196 +198,168 @@ impl<'a> GitCmd<'a> {
     }
 
     /// Skip the OS flock acquisition. Use only for guard-hook callers or
-    /// provably read-only probes whose contract forbids creating the flock
-    /// sentinel itself (for example a dry-run safety preflight).
+    /// provably read-only probes whose contract forbids creating the sentinel.
     #[must_use]
     pub const fn skip_flock(mut self) -> Self {
         self.skip_flock = true;
         self
     }
 
-    /// Skip the in-process mutex. Almost never correct; kept for
-    /// symmetry with [`Self::skip_flock`]. Don't use unless you know
-    /// exactly why.
+    /// Skip the in-process mutex. Almost never correct; retained for callers
+    /// whose surrounding protocol already supplies the required exclusion.
     #[must_use]
     pub const fn skip_mutex(mut self) -> Self {
         self.skip_mutex = true;
         self
     }
 
-    /// Run once with the given borrowed repo. Internal.
-    #[allow(clippy::too_many_arguments)]
-    fn run_once_inner(
-        repo: &Path,
-        cwd: Option<&Path>,
-        args: &[std::ffi::OsString],
-        stdin_bytes: Option<&[u8]>,
-        envs: &[(std::ffi::OsString, std::ffi::OsString)],
-        timeout: Duration,
-        skip_flock: bool,
-        skip_mutex: bool,
-    ) -> GitRunOutcome {
-        let canonical = canonicalize_repo(repo);
-        let binary = match resolve_git_binary() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    target: "mcp_agent_mail::git_locked",
-                    err = %e,
-                    "git_binary_unresolvable"
-                );
-                return GitRunOutcome::Error(io::Error::other(format!(
-                    "cannot resolve git binary: {e}"
-                )));
-            }
+    fn run_once_inner(&self, budget: GitBudget) -> GitRunOutcome {
+        let execute = || -> io::Result<GitRunOutcome> {
+            budget.remaining_for("repository resolution")?;
+            let canonical = canonicalize_repo(self.repo);
+            budget.remaining_for("binary resolution")?;
+            let binary = resolve_git_binary()
+                .map_err(|error| io::Error::other(format!("cannot resolve git binary: {error}")))?;
+            budget.remaining_for("lock admission")?;
+            let _reent = canonical.as_ref().map(|path| ReentrancyGuard::enter(path));
+
+            // Include the registry wait, not just the per-repository mutex.
+            let mutex =
+                if self.skip_mutex {
+                    None
+                } else if let Some(path) = canonical.as_ref() {
+                    Some(GitRepoLocks::global().lock_for_with_timeout(
+                        path,
+                        budget.remaining_for("repository lock lookup")?,
+                    )?)
+                } else {
+                    None
+                };
+            let _mutex_guard = match mutex.as_ref() {
+                Some(mutex) => Some(lock_mutex_with_timeout(
+                    mutex,
+                    budget.remaining_for("repository mutex")?,
+                )?),
+                None => None,
+            };
+
+            // Preserve the separate configured flock cap, but never let it
+            // grant a fresh wait beyond the invocation's remaining budget.
+            let _flock = if self.skip_flock {
+                None
+            } else if let Some(path) = canonical.as_ref() {
+                let remaining = budget.remaining_for("repository flock")?;
+                Some(RepoFlock::acquire_with_timeout(
+                    path,
+                    remaining.min(Duration::from_secs(flock_timeout_secs())),
+                )?)
+            } else {
+                None
+            };
+            budget.remaining_for("git child execution")?;
+            Ok(run_child(
+                &binary,
+                self.repo,
+                self.cwd.as_deref(),
+                &self.args,
+                self.stdin.as_deref(),
+                &self.envs,
+                budget,
+            ))
         };
-
-        // Reentrancy guard (panics on nested same-repo from same thread).
-        let _reent = canonical.as_ref().map(|c| ReentrancyGuard::enter(c));
-
-        // Mutex layer.
-        let mtx = if skip_mutex {
-            None
-        } else {
-            canonical
-                .as_ref()
-                .map(|c| GitRepoLocks::global().lock_for(c))
-        };
-        let _mtx_guard = mtx.as_ref().map(|arc| {
-            arc.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-
-        // Flock layer.
-        let _flock = if skip_flock {
-            None
-        } else if let Some(c) = canonical.as_ref() {
-            match RepoFlock::acquire(c) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::error!(
-                        target: "mcp_agent_mail::git_locked",
-                        err = %e,
-                        repo = %c.display(),
-                        "flock_acquire_failed"
-                    );
-                    return GitRunOutcome::Error(e);
-                }
-            }
-        } else {
-            None
-        };
-
-        run_child(&binary, repo, cwd, args, stdin_bytes, envs, timeout)
+        match execute() {
+            Ok(outcome) => outcome,
+            Err(error) => GitRunOutcome::Error(error),
+        }
     }
 
-    /// Run once, returning classified outcome.
+    /// Run once, including bounded lock admission, returning classified outcome.
     #[must_use]
     pub fn run_once(self) -> GitRunOutcome {
-        Self::run_once_inner(
-            self.repo,
-            self.cwd.as_deref(),
-            &self.args,
-            self.stdin.as_deref(),
-            &self.envs,
-            self.timeout,
-            self.skip_flock,
-            self.skip_mutex,
-        )
+        self.run_once_inner(GitBudget::new(self.timeout))
     }
 
-    /// Run with retry on `SegfaultLike`. Retry policy per bead E2
-    /// (3 retries, 100/400/1600ms jittered, 10s wall-clock cap).
+    /// Run with at most three segfault retries. Backoff and all later attempts
+    /// share the initial budget and its additional ten-second retry window.
     pub fn run(self) -> io::Result<Output> {
-        const MAX_RETRIES: u32 = 3;
-        const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
-
-        // Capture owned state so we can re-attempt without re-borrowing
-        // the original `&Path` beyond this function's lifetime.
-        let repo = self.repo.to_path_buf();
-        let args = self.args.clone();
-        let stdin = self.stdin.clone();
-        let envs = self.envs.clone();
-        let cwd = self.cwd.clone();
-        let timeout = self.timeout;
-        let skip_flock = self.skip_flock;
-        let skip_mutex = self.skip_mutex;
-
-        let attempt_limit = MAX_RETRIES + 1;
-        let overall_start = Instant::now();
-        let wallclock_cap = Duration::from_secs(10);
-        let mut last_err: Option<io::Error> = None;
-
-        for attempt in 0..attempt_limit {
-            let outcome = Self::run_once_inner(
-                &repo,
-                cwd.as_deref(),
-                &args,
-                stdin.as_deref(),
-                &envs,
-                timeout,
-                skip_flock,
-                skip_mutex,
-            );
-            match outcome {
-                GitRunOutcome::Finished(out) => {
-                    if attempt > 0 {
-                        tracing::info!(
-                            target: "mcp_agent_mail::git_locked",
-                            attempt = attempt,
-                            repo = %repo.display(),
-                            "git_segfault_retry_succeeded"
-                        );
-                    }
-                    return Ok(out);
-                }
-                GitRunOutcome::SegfaultLike { signal } => {
-                    tracing::warn!(
-                        target: "mcp_agent_mail::git_locked",
-                        attempt = attempt,
-                        signal = signal,
-                        repo = %repo.display(),
-                        "git_segfault_retry_attempt"
-                    );
-                    if attempt + 1 >= attempt_limit {
-                        last_err = Some(io::Error::other(format!(
-                            "git segfaulted {attempts} times in a row; system git may be 2.51.0 (known bad). Set AM_GIT_BINARY or upgrade/downgrade.",
-                            attempts = attempt + 1
-                        )));
-                        break;
-                    }
-                    if overall_start.elapsed() >= wallclock_cap {
-                        last_err = Some(io::Error::other(
-                            "git segfault retry budget exceeded 10s wall-clock cap",
-                        ));
-                        break;
-                    }
-                    let base_ms = BACKOFFS_MS[attempt as usize];
-                    let jittered = jitter_ms(base_ms);
-                    std::thread::sleep(Duration::from_millis(jittered));
-                }
-                GitRunOutcome::OtherSignal { signal } => {
-                    return Err(io::Error::other(format!(
-                        "git child killed by signal {signal} (not segfault-like, not retrying)"
-                    )));
-                }
-                GitRunOutcome::Timeout { after } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("git child exceeded {after:?} wall-clock timeout"),
-                    ));
-                }
-                GitRunOutcome::Error(e) => return Err(e),
-            }
-        }
-
-        tracing::error!(
-            target: "mcp_agent_mail::git_locked",
-            repo = %repo.display(),
-            "git_segfault_retry_exhausted"
-        );
-        Err(last_err.unwrap_or_else(|| io::Error::other("unknown git retry error")))
+        run_with_retry(self.repo, GitBudget::new(self.timeout), |budget| {
+            self.run_once_inner(budget)
+        })
     }
+}
+
+fn pause_before_retry(
+    budget: GitBudget,
+    desired: Duration,
+    pause: impl FnOnce(Duration),
+) -> io::Result<()> {
+    pause(desired.min(budget.remaining_for("retry backoff")?));
+    // Scheduler delay or a slow callback may exceed the requested sleep.
+    budget.remaining_for("retry admission")?;
+    Ok(())
+}
+
+fn run_with_retry(
+    repo: &Path,
+    budget: GitBudget,
+    mut run_attempt: impl FnMut(GitBudget) -> GitRunOutcome,
+) -> io::Result<Output> {
+    for attempt in 0..=SEGFAULT_BACKOFFS_MS.len() {
+        let attempt_budget = if attempt == 0 {
+            budget
+        } else {
+            budget.capped(SEGFAULT_RETRY_WINDOW)
+        };
+        attempt_budget.remaining_for("attempt admission")?;
+        match run_attempt(attempt_budget) {
+            GitRunOutcome::Finished(output) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        target: "mcp_agent_mail::git_locked",
+                        attempt,
+                        repo = %repo.display(),
+                        "git_segfault_retry_succeeded"
+                    );
+                }
+                // Preserve known terminal results, including nonzero status.
+                // A later clock check must not repeat completed side effects.
+                return Ok(output);
+            }
+            GitRunOutcome::SegfaultLike { signal } => {
+                tracing::warn!(
+                    target: "mcp_agent_mail::git_locked",
+                    attempt,
+                    signal,
+                    repo = %repo.display(),
+                    "git_segfault_retry_attempt"
+                );
+                let Some(&base_ms) = SEGFAULT_BACKOFFS_MS.get(attempt) else {
+                    return Err(io::Error::other(format!(
+                        "git segfaulted {} times in a row; set AM_GIT_BINARY to a supported binary",
+                        attempt + 1,
+                    )));
+                };
+                pause_before_retry(
+                    budget.capped(SEGFAULT_RETRY_WINDOW),
+                    Duration::from_millis(jitter_ms(base_ms)),
+                    std::thread::sleep,
+                )?;
+            }
+            GitRunOutcome::OtherSignal { signal } => {
+                return Err(io::Error::other(format!(
+                    "git child killed by signal {signal} (not segfault-like, not retrying)"
+                )));
+            }
+            GitRunOutcome::Timeout { after } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("git child or output pipes exceeded {after:?} invocation budget"),
+                ));
+            }
+            GitRunOutcome::Error(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("git retry attempts exhausted"))
 }
 
 fn git_exec_timeout_secs() -> u64 {
@@ -353,13 +369,19 @@ fn git_exec_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_GIT_EXEC_TIMEOUT_SECS)
 }
 
+#[cfg(unix)]
+fn parse_git_output_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_GIT_MAX_OUTPUT_BYTES)
+}
+
 fn jitter_ms(base: u64) -> u64 {
-    // Deterministic-ish jitter in [0.75x, 1.25x] using process nanos.
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let span = base / 2; // 0.5 * base
-    let low = base - span / 2; // 0.75x
+    let span = base / 2;
+    let low = base - span / 2;
     let offset = n % span.max(1);
     low + offset
 }
@@ -378,7 +400,6 @@ fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
         };
     }
     if let Some(code) = status.code() {
-        // Some shells report SIGSEGV as exit 139.
         if code == 139 {
             return GitRunOutcome::SegfaultLike { signal: 11 };
         }
@@ -386,7 +407,6 @@ fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
             return GitRunOutcome::SegfaultLike { signal: 7 };
         }
     }
-    // Otherwise a normal exit; caller inspects Output for nonzero codes.
     GitRunOutcome::Finished(Output {
         status,
         stdout: Vec::new(),
@@ -396,7 +416,6 @@ fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
 
 #[cfg(not(unix))]
 fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
-    // Windows STATUS_ACCESS_VIOLATION = 0xC0000005. Treat as segfault-like.
     if let Some(code) = status.code()
         && code.cast_unsigned() == 0xC000_0005
     {
@@ -416,7 +435,7 @@ fn run_child(
     args: &[std::ffi::OsString],
     stdin_bytes: Option<&[u8]>,
     envs: &[(std::ffi::OsString, std::ffi::OsString)],
-    timeout: Duration,
+    budget: GitBudget,
 ) -> GitRunOutcome {
     let start = Instant::now();
     let mut cmd = Command::new(&binary.path);
@@ -425,45 +444,43 @@ fn run_child(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.stdin(if stdin_bytes.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(
-                target: "mcp_agent_mail::git_locked",
-                err = %e,
-                binary = %binary.path.display(),
-                "git_spawn_failed"
-            );
-            return GitRunOutcome::Error(e);
+    #[cfg(unix)]
+    let outcome = run_piped_command(
+        cmd,
+        stdin_bytes,
+        budget,
+        parse_git_output_limit(std::env::var("AM_GIT_MAX_OUTPUT_BYTES").ok().as_deref()),
+    );
+    #[cfg(not(unix))]
+    let outcome = {
+        cmd.stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        if let Err(error) = budget.remaining_for("git child spawn") {
+            return GitRunOutcome::Error(error);
         }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => return GitRunOutcome::Error(error),
+        };
+        if let Some(bytes) = stdin_bytes
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            use std::io::Write;
+            if let Err(error) = stdin.write_all(bytes) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return GitRunOutcome::Error(error);
+            }
+        }
+        wait_with_timeout(&mut child, budget)
     };
-
-    // Feed stdin if any.
-    if let Some(bytes) = stdin_bytes
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(bytes) {
-            // Drop the stdin handle FIRST so the child sees EOF and can
-            // exit promptly, then reap. Otherwise child.wait() could
-            // hang waiting for a child that's still blocked on stdin.
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return GitRunOutcome::Error(e);
-        }
-    }
-
-    // Wait with timeout.
-    let outcome = wait_with_timeout(&mut child, timeout);
 
     let duration = start.elapsed();
     match &outcome {
@@ -497,10 +514,10 @@ fn run_child(
                 "git_locked_exit_timeout"
             );
         }
-        GitRunOutcome::Error(e) => {
+        GitRunOutcome::Error(error) => {
             tracing::error!(
                 target: "mcp_agent_mail::git_locked",
-                err = %e,
+                err = %error,
                 "git_locked_exit_io_error"
             );
         }
@@ -508,15 +525,218 @@ fn run_child(
     outcome
 }
 
-/// Give stdout/stderr reader threads a short grace period to observe EOF,
-/// then detach any that are still parked.
-///
-/// After `kill()` a grandchild that inherited our pipe fds (git hooks,
-/// credential helpers, `sh -c` wrappers) can hold the pipes open
-/// indefinitely; an unconditional join here would block the caller forever
-/// and defeat the wall-clock timeout this function exists to enforce. The
-/// Timeout and Error paths never consume the captured bytes, so detaching
-/// only leaks the parked reader thread, which exits once the pipes close.
+/// Only the parent endpoint is nonblocking. Git and its hooks keep ordinary
+/// blocking stdio semantics; no flags are changed on their pipe endpoints.
+#[cfg(unix)]
+fn nonblocking_parent_pipe(input: bool) -> io::Result<(io::PipeReader, io::PipeWriter)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let (reader, writer) = io::pipe()?;
+    if input {
+        let flags = fcntl_getfl(&writer)?;
+        fcntl_setfl(&writer, flags | OFlags::NONBLOCK)?;
+    } else {
+        let flags = fcntl_getfl(&reader)?;
+        fcntl_setfl(&reader, flags | OFlags::NONBLOCK)?;
+    }
+    Ok((reader, writer))
+}
+
+/// Owns just the direct child, never a caller's process group. Drop also
+/// covers an unwinding capture path; no child is abandoned on an I/O error.
+#[cfg(unix)]
+struct ReapedGitChild(Child);
+
+#[cfg(unix)]
+impl Drop for ReapedGitChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn run_piped_command(
+    mut command: Command,
+    stdin_bytes: Option<&[u8]>,
+    budget: GitBudget,
+    output_limit: usize,
+) -> GitRunOutcome {
+    if let Err(error) = budget.remaining_for("git pipe setup") {
+        return GitRunOutcome::Error(error);
+    }
+    let prepared = (|| -> io::Result<_> {
+        let (stdout, stdout_writer) = nonblocking_parent_pipe(false)?;
+        let (stderr, stderr_writer) = nonblocking_parent_pipe(false)?;
+        command.stdout(stdout_writer).stderr(stderr_writer);
+        let stdin = if stdin_bytes.is_some() {
+            let (reader, writer) = nonblocking_parent_pipe(true)?;
+            command.stdin(reader);
+            Some(writer)
+        } else {
+            command.stdin(Stdio::null());
+            None
+        };
+        Ok((stdin, stdout, stderr))
+    })();
+    let (stdin, stdout, stderr) = match prepared {
+        Ok(pipes) => pipes,
+        Err(error) => return GitRunOutcome::Error(error),
+    };
+    if let Err(error) = budget.remaining_for("git child spawn") {
+        return GitRunOutcome::Error(error);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => ReapedGitChild(child),
+        Err(error) => return GitRunOutcome::Error(error),
+    };
+    // Command retains explicit Stdio handles after spawn. Drop its writer
+    // copies so EOF depends only on the actual child and any descendants.
+    drop(command);
+    capture_pipes(
+        &mut child.0,
+        stdin,
+        stdin_bytes.unwrap_or_default(),
+        stdout,
+        stderr,
+        budget,
+        output_limit,
+    )
+}
+
+/// Read at most one chunk per turn, so continuous stdout cannot starve
+/// stderr, stdin, child reaping or the deadline. False means no progress.
+#[cfg(unix)]
+fn drain_pipe(
+    pipe: &mut Option<io::PipeReader>,
+    output: &mut Vec<u8>,
+    remaining: &mut usize,
+) -> io::Result<bool> {
+    use std::io::Read;
+
+    let Some(reader) = pipe else {
+        return Ok(false);
+    };
+    let mut buffer = [0_u8; 8192];
+    match reader.read(&mut buffer) {
+        Ok(0) => {
+            *pipe = None;
+            Ok(true)
+        }
+        Ok(length) => {
+            if length > *remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GIT_OUTPUT_LIMIT: combined stdout/stderr exceeded AM_GIT_MAX_OUTPUT_BYTES",
+                ));
+            }
+            output.try_reserve(length).map_err(|error| {
+                io::Error::other(format!("git capture allocation failed: {error}"))
+            })?;
+            output.extend_from_slice(&buffer[..length]);
+            *remaining -= length;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn capture_pipes(
+    child: &mut Child,
+    mut stdin: Option<io::PipeWriter>,
+    mut input: &[u8],
+    stdout: io::PipeReader,
+    stderr: io::PipeReader,
+    budget: GitBudget,
+    output_limit: usize,
+) -> GitRunOutcome {
+    use std::io::Write;
+
+    let mut stdout = Some(stdout);
+    let mut stderr = Some(stderr);
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut remaining = output_limit;
+    let mut status = None;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        if input.is_empty() {
+            stdin = None;
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => status = observed,
+                Err(error) => return GitRunOutcome::Error(error),
+            }
+        }
+        if let Some(exited) = status
+            && stdout.is_none()
+            && stderr.is_none()
+        {
+            return match classify_exit(exited) {
+                GitRunOutcome::Finished(_) if !input.is_empty() => {
+                    GitRunOutcome::Error(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "git exited before all supplied stdin could be written",
+                    ))
+                }
+                GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
+                    status: exited,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                }),
+                other => other,
+            };
+        }
+        if budget.remaining().is_zero() {
+            return GitRunOutcome::Timeout {
+                after: budget.timeout,
+            };
+        }
+        let mut progressed = false;
+        if let Some(writer) = stdin.as_mut() {
+            let length = input.len().min(8192);
+            match writer.write(&input[..length]) {
+                Ok(0) => {
+                    return GitRunOutcome::Error(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "git stdin accepted zero bytes before input was complete",
+                    ));
+                }
+                Ok(written) => {
+                    input = &input[written..];
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => progressed = true,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return GitRunOutcome::Error(error),
+            }
+        }
+        for (pipe, bytes) in [
+            (&mut stdout, &mut stdout_bytes),
+            (&mut stderr, &mut stderr_bytes),
+        ] {
+            match drain_pipe(pipe, bytes, &mut remaining) {
+                Ok(progress) => progressed |= progress,
+                Err(error) => return GitRunOutcome::Error(error),
+            }
+        }
+        if progressed {
+            pause = Duration::from_millis(1);
+        } else {
+            std::thread::sleep(pause.min(budget.remaining()));
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Legacy non-Unix give-up path. Unix capture above has no reader threads.
+#[cfg(not(unix))]
 fn join_readers_bounded(
     stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
     stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
@@ -529,75 +749,58 @@ fn join_readers_bounded(
     }
 }
 
-/// Grace period for reader threads to observe EOF on the give-up paths
-/// before they are detached.
+#[cfg(not(unix))]
 const READER_EOF_GRACE: Duration = Duration::from_millis(250);
 
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
-    // Spawn reader threads to drain stdout/stderr CONCURRENTLY with our
-    // wait loop. Without this, the child's pipe buffers (typically 64KiB
-    // each on Linux) can fill while we're in `try_wait`, blocking the
-    // child on write. Since we wait for the child to exit before
-    // reading, that produces a classic pipe deadlock: the child can't
-    // exit because its stdout is full, and we can't read because we're
-    // waiting for the child to exit. Timeout would fire on every large
-    // output. Concurrent drain eliminates this class of hang.
+#[cfg(not(unix))]
+fn wait_with_timeout(child: &mut Child, budget: GitBudget) -> GitRunOutcome {
     use std::io::Read;
 
-    let mut stdout_handle = child.stdout.take().map(|mut o| {
+    let mut stdout_handle = child.stdout.take().map(|mut output| {
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(4096);
-            let _ = o.read_to_end(&mut buf);
+            let _ = output.read_to_end(&mut buf);
             buf
         })
     });
-    let mut stderr_handle = child.stderr.take().map(|mut e| {
+    let mut stderr_handle = child.stderr.take().map(|mut output| {
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(4096);
-            let _ = e.read_to_end(&mut buf);
+            let _ = output.read_to_end(&mut buf);
             buf
         })
     });
 
-    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if Instant::now() >= deadline {
+                let remaining = budget.remaining();
+                if remaining.is_zero() {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Give readers a bounded grace period, then detach:
-                    // a grandchild holding the inherited pipes must not
-                    // hang past the wall-clock deadline. Bytes are unused.
                     join_readers_bounded(stdout_handle.take(), stderr_handle.take());
-                    return GitRunOutcome::Timeout { after: timeout };
+                    return GitRunOutcome::Timeout {
+                        after: budget.timeout,
+                    };
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(25).min(remaining));
             }
-            Err(e) => {
-                // try_wait failure (rare: EINTR, ECHILD, etc.). Best-effort
-                // reap — otherwise the child becomes a zombie for the rest
-                // of the server's lifetime.
+            Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 join_readers_bounded(stdout_handle.take(), stderr_handle.take());
-                return GitRunOutcome::Error(e);
+                return GitRunOutcome::Error(error);
             }
         }
     };
 
-    // Child exited — readers will finish promptly (pipes EOF on child
-    // exit). Join them to collect their captured bytes.
     let stdout_bytes = stdout_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
     let stderr_bytes = stderr_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
-
-    // classify_exit needs the ExitStatus; we attach the captured
-    // stdout/stderr for the Finished branch.
     match classify_exit(status) {
         GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
             status,
@@ -627,25 +830,390 @@ mod tests {
         let repo = init_repo(tmp.path());
         let out = GitCmd::new(&repo).arg("--version").run();
         assert!(out.is_ok(), "git --version should succeed: {out:?}");
-        let o = out.unwrap();
-        assert!(
-            String::from_utf8_lossy(&o.stdout).contains("git version"),
-            "unexpected output"
-        );
+        let output = out.unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
     }
 
     #[test]
     fn run_returns_nonzero_output_not_error() {
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
-        // Unknown subcommand → nonzero exit, but run() returns Output
-        // (it only errors on spawn / signal / timeout).
-        let res = GitCmd::new(&repo).arg("nonexistent-subcommand-xyz").run();
-        assert!(res.is_ok(), "nonzero exit should NOT be Err: {res:?}");
-        let o = res.unwrap();
-        assert!(
-            !o.status.success(),
-            "expected nonzero exit from unknown subcmd"
+        let result = GitCmd::new(&repo).arg("nonexistent-subcommand-xyz").run();
+        assert!(result.is_ok(), "nonzero exit should NOT be Err: {result:?}");
+        assert!(!result.unwrap().status.success());
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[cfg(unix)]
+    fn finished(outcome: GitRunOutcome) -> Output {
+        match outcome {
+            GitRunOutcome::Finished(output) => output,
+            other => panic!("expected complete output, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_stdin_and_both_output_pipes_make_progress_together() {
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let output = finished(run_piped_command(
+            shell(
+                "dd if=/dev/zero bs=65536 count=16 2>/dev/null; \
+                 dd if=/dev/zero bs=65536 count=16 >&2 2>/dev/null; cat",
+            ),
+            Some(&input),
+            GitBudget::new(Duration::from_secs(10)),
+            4 * 1024 * 1024,
+        ));
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 3 * 1024 * 1024);
+        assert!(output.stdout[..1024 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&output.stdout[1024 * 1024..], input.as_slice());
+        assert_eq!(output.stderr, vec![0; 1024 * 1024]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_stdin_is_cut_off_by_the_execution_deadline() {
+        let started = Instant::now();
+        let outcome = run_piped_command(
+            shell("exec sleep 30"),
+            Some(&vec![b'x'; 1024 * 1024]),
+            GitBudget::new(Duration::from_millis(100)),
+            1024,
         );
+        assert!(matches!(outcome, GitRunOutcome::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_child_with_retained_output_writer_still_has_a_deadline() {
+        let (reader, retained_writer) = nonblocking_parent_pipe(false).unwrap();
+        let (stderr, stderr_writer) = nonblocking_parent_pipe(false).unwrap();
+        let mut command = shell("exit 0");
+        command
+            .stdin(Stdio::null())
+            .stdout(retained_writer.try_clone().unwrap())
+            .stderr(stderr_writer);
+        let mut child = ReapedGitChild(command.spawn().unwrap());
+        drop(command);
+        let started = Instant::now();
+        let outcome = capture_pipes(
+            &mut child.0,
+            None,
+            &[],
+            reader,
+            stderr,
+            GitBudget::new(Duration::from_millis(100)),
+            1024,
+        );
+        assert!(matches!(outcome, GitRunOutcome::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.0.try_wait().unwrap().unwrap().success());
+        drop(retained_writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_exit_cannot_hide_unwritten_stdin() {
+        let (retained_reader, stdin) = nonblocking_parent_pipe(true).unwrap();
+        let (stdout, stdout_writer) = nonblocking_parent_pipe(false).unwrap();
+        let (stderr, stderr_writer) = nonblocking_parent_pipe(false).unwrap();
+        drop(stdout_writer);
+        drop(stderr_writer);
+        let mut child = ReapedGitChild(
+            shell("exit 0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(child.0.wait().unwrap().success());
+        let outcome = capture_pipes(
+            &mut child.0,
+            Some(stdin),
+            &vec![b'x'; 1024 * 1024],
+            stdout,
+            stderr,
+            GitBudget::new(Duration::from_secs(5)),
+            1024,
+        );
+        assert!(matches!(
+            outcome,
+            GitRunOutcome::Error(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        drop(retained_reader);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_capture_limit_is_exact_and_never_returns_partial_success() {
+        let output = finished(run_piped_command(
+            shell("printf abc; printf def >&2"),
+            None,
+            GitBudget::new(Duration::from_secs(5)),
+            6,
+        ));
+        assert_eq!(output.stdout, b"abc");
+        assert_eq!(output.stderr, b"def");
+        let limited = run_piped_command(
+            shell("printf abc; printf def >&2"),
+            None,
+            GitBudget::new(Duration::from_secs(5)),
+            5,
+        );
+        match limited {
+            GitRunOutcome::Error(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("GIT_OUTPUT_LIMIT"));
+            }
+            other => panic!("over-limit capture must fail, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_stdin_closes_and_nonzero_exit_keeps_stderr() {
+        let output = finished(run_piped_command(
+            shell("cat; printf problem >&2; exit 7"),
+            Some(&[]),
+            GitBudget::new(Duration::from_secs(5)),
+            1024,
+        ));
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"problem");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuous_output_cannot_bypass_capture_limit() {
+        let outcome = run_piped_command(
+            shell("while :; do printf '0123456789abcdef'; done"),
+            None,
+            GitBudget::new(Duration::from_secs(5)),
+            64 * 1024,
+        );
+        assert!(matches!(
+            outcome,
+            GitRunOutcome::Error(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maximum_timeout_does_not_overflow_instant() {
+        let output = finished(run_piped_command(
+            shell("printf complete"),
+            None,
+            GitBudget::new(Duration::MAX),
+            1024,
+        ));
+        assert_eq!(output.stdout, b"complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_overrides_require_a_positive_byte_count() {
+        for raw in [None, Some(""), Some("0"), Some("-1"), Some("garbage")] {
+            assert_eq!(parse_git_output_limit(raw), DEFAULT_GIT_MAX_OUTPUT_BYTES);
+        }
+        assert_eq!(parse_git_output_limit(Some(" 4096 ")), 4096);
+    }
+
+    #[test]
+    fn mutex_timeout_prevents_git_write_and_reacquisition_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path());
+        let canonical = canonicalize_repo(&repo).unwrap();
+        let mutex = GitRepoLocks::global().lock_for(&canonical);
+        let held = mutex.lock().unwrap();
+        let started = Instant::now();
+        let error = GitCmd::new(&repo)
+            .args(["config", "--local", "budget.probe", "admitted"])
+            .timeout(Duration::from_millis(50))
+            .run()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !repo.join(".git/config").exists(),
+            "timed-out work must not execute"
+        );
+        drop(held);
+        let output = GitCmd::new(&repo)
+            .args(["config", "--local", "budget.probe", "admitted"])
+            .run()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            std::fs::read_to_string(repo.join(".git/config"))
+                .unwrap()
+                .contains("admitted")
+        );
+    }
+
+    #[test]
+    fn flock_timeout_releases_the_process_mutex_without_executing_git() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path());
+        let canonical = canonicalize_repo(&repo).unwrap();
+        let held = RepoFlock::acquire(&canonical).unwrap();
+        assert!(held.is_real());
+        let error = GitCmd::new(&repo)
+            .args(["config", "--local", "budget.probe", "admitted"])
+            .timeout(Duration::from_millis(50))
+            .run()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!repo.join(".git/config").exists());
+        let mutex = GitRepoLocks::global().lock_for(&canonical);
+        let guard = mutex
+            .try_lock()
+            .expect("failed flock must release the mutex");
+        drop(guard);
+        drop(held);
+        assert!(
+            GitCmd::new(&repo)
+                .arg("--version")
+                .run()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn a_contended_repository_does_not_block_an_unrelated_git_invocation() {
+        let tmp = TempDir::new().unwrap();
+        let first = init_repo(&tmp.path().join("first"));
+        let second = init_repo(&tmp.path().join("second"));
+        let mutex = GitRepoLocks::global().lock_for(&canonicalize_repo(&first).unwrap());
+        let _held = mutex.lock().unwrap();
+        assert!(
+            GitCmd::new(&second)
+                .arg("--version")
+                .run()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn zero_invocation_budget_refuses_without_creating_a_sentinel_or_config() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path());
+        let error = GitCmd::new(&repo)
+            .args(["config", "--local", "budget.probe", "admitted"])
+            .timeout(Duration::ZERO)
+            .run()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!repo.join(".git/config").exists());
+        assert!(!repo.join(".git/am.git-serialize.lock").exists());
+    }
+
+    #[test]
+    fn retry_window_keeps_original_origin_and_does_not_cap_the_first_attempt() {
+        let budget = GitBudget {
+            started: Instant::now().checked_sub(Duration::from_secs(11)).unwrap(),
+            timeout: Duration::from_secs(120),
+        };
+        let mut calls = 0;
+        let error = run_with_retry(Path::new("repo"), budget, |attempt| {
+            calls += 1;
+            assert_eq!(attempt.started, budget.started);
+            assert_eq!(attempt.timeout, Duration::from_secs(120));
+            assert!(attempt.remaining() > Duration::from_secs(100));
+            GitRunOutcome::SegfaultLike { signal: 11 }
+        })
+        .unwrap_err();
+        assert_eq!(
+            calls, 1,
+            "an expired retry window must not launch attempt two"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let short = GitBudget::new(Duration::from_secs(2));
+        assert_eq!(short.capped(SEGFAULT_RETRY_WINDOW).timeout, short.timeout);
+        assert_eq!(short.capped(SEGFAULT_RETRY_WINDOW).started, short.started);
+    }
+
+    #[test]
+    fn retry_backoff_clips_sleep_and_rechecks_after_oversleep() {
+        let budget = GitBudget::new(Duration::from_millis(100));
+        let mut sleeps = 0;
+        let result = pause_before_retry(budget, Duration::from_secs(2), |requested| {
+            sleeps += 1;
+            assert!(requested <= Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        assert_eq!(sleeps, 1);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn non_segfault_signals_never_consume_another_attempt() {
+        let mut calls = 0;
+        let error = run_with_retry(
+            Path::new("repo"),
+            GitBudget::new(Duration::from_secs(10)),
+            |_| {
+                calls += 1;
+                GitRunOutcome::OtherSignal { signal: 15 }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("not retrying"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_shared_budget_never_spawns_the_prepared_child() {
+        let tmp = TempDir::new().unwrap();
+        let mut command = shell("printf dispatched > marker");
+        command.current_dir(tmp.path());
+        let budget = GitBudget {
+            started: Instant::now().checked_sub(Duration::from_secs(2)).unwrap(),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(matches!(
+            run_piped_command(command, None, budget, 1024),
+            GitRunOutcome::Error(error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(!tmp.path().join("marker").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segfault_then_slow_child_share_one_budget_and_stop_before_attempt_three() {
+        let budget = GitBudget::new(Duration::from_secs(2));
+        let mut calls = 0;
+        let error = run_with_retry(Path::new("repo"), budget, |attempt_budget| {
+            calls += 1;
+            assert_eq!(attempt_budget.started, budget.started);
+            assert_eq!(attempt_budget.timeout, budget.timeout);
+            let command = if calls == 1 {
+                // Shell exit classification, not a real crash/core dump.
+                shell("exit 139")
+            } else {
+                assert_eq!(calls, 2);
+                shell("exec sleep 30")
+            };
+            run_piped_command(command, None, attempt_budget, 1024)
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(budget.started.elapsed() < Duration::from_secs(5));
     }
 }

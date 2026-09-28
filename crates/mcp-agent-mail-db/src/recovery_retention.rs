@@ -22,6 +22,19 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+#[cfg(unix)]
+#[path = "recovery_retention_namespace.rs"]
+mod namespace;
+
+#[cfg(unix)]
+pub use namespace::{CompletedReclaimMove, ReclaimDirectory};
+
+#[cfg(all(test, unix))]
+use namespace::{
+    MAX_RECLAIM_MOVE_ATTEMPTS, create_private_reclaim_directory, move_recovery_debris,
+    move_recovery_debris_with, rename_reclaim_entry, sync_reclaim_move_parents,
+};
+
 /// Which kind of recovery debris an artifact is. Retention is applied
 /// independently per category so a burst of one kind cannot evict the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -299,36 +312,73 @@ pub fn enumerate_forensic_bundles(storage_root: &Path) -> Vec<DebrisArtifact> {
     out
 }
 
+/// Classify only an artifact suffix of this exact configured database family.
+///
+/// Recovery words in the database basename carry no ownership information:
+/// `mail.corrupt-live.db` and all of its live companions must remain live.
+/// Likewise, `mail.db2.corrupt-*` and `mail.db.notes.corrupt-*` do not belong
+/// to `mail.db`. Keep the basename byte-exact, including non-Unicode names.
+fn classify_recovery_debris_file(
+    database_name: &std::ffi::OsStr,
+    file_name: &std::ffi::OsStr,
+) -> Option<DebrisCategory> {
+    let remainder = file_name
+        .as_encoded_bytes()
+        .strip_prefix(database_name.as_encoded_bytes())?;
+    for companion in [
+        "",
+        "-wal",
+        "-shm",
+        "-journal",
+        "-wal-cert",
+        "-wal-cert-head",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+        ".lock",
+    ] {
+        let Some(suffix) = remainder
+            .strip_prefix(companion.as_bytes())
+            .and_then(|suffix| suffix.strip_prefix(b"."))
+        else {
+            continue;
+        };
+        let has_payload = |prefix: &[u8]| {
+            suffix
+                .strip_prefix(prefix)
+                .is_some_and(|payload| !payload.is_empty())
+        };
+        if has_payload(b"archive-reconcile-") {
+            return Some(DebrisCategory::ArchiveReconcileBackup);
+        }
+        if has_payload(b"corrupt-") || has_payload(b"reconstruct-failed-") {
+            return Some(DebrisCategory::CorruptQuarantine);
+        }
+        if has_payload(b"startup-precheckpoint-") || has_payload(b"startup-quarantine-") {
+            return Some(DebrisCategory::SidecarSnapshot);
+        }
+        if suffix == b"stale" || has_payload(b"stale-") || has_payload(b"stale.") {
+            return Some(DebrisCategory::StaleArtifact);
+        }
+    }
+    None
+}
+
 /// Enumerate quarantined corrupt-DB siblings next to `db_path`.
 #[must_use]
 pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
     let mut out = Vec::new();
-    let Some(parent) = db_path.parent() else {
+    let Some(db_name) = db_path.file_name() else {
         return out;
     };
-    let Some(db_name) = db_path.file_name().and_then(|n| n.to_str()) else {
-        return out;
-    };
+    let parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let Ok(entries) = std::fs::read_dir(parent) else {
         return out;
     };
     for entry in entries.flatten() {
-        let name_os = entry.file_name();
-        let Some(name) = name_os.to_str() else {
-            continue;
-        };
-        if !name.starts_with(db_name) {
-            continue;
-        }
-        let category = if is_archive_reconcile_backup_name(name) {
-            DebrisCategory::ArchiveReconcileBackup
-        } else if is_quarantine_name(name) {
-            DebrisCategory::CorruptQuarantine
-        } else if is_sidecar_snapshot_name(name) {
-            DebrisCategory::SidecarSnapshot
-        } else if is_stale_artifact_name(name) {
-            DebrisCategory::StaleArtifact
-        } else {
+        let Some(category) = classify_recovery_debris_file(db_name, &entry.file_name()) else {
             continue;
         };
         let path = entry.path();
@@ -351,6 +401,9 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
 /// Whether a filename is a recovery quarantine (corrupt / reconstruct-failed /
 /// archive-reconcile-restore), as opposed to the live DB, a `.bak`, or a live
 /// `-wal`/`-shm` sidecar.
+///
+/// This lexical helper does not establish ownership by a configured database;
+/// the reclaim inventory uses `classify_recovery_debris_file` for that boundary.
 #[must_use]
 pub fn is_quarantine_name(name: &str) -> bool {
     name.contains(".corrupt-") || name.contains(".reconstruct-failed-")
@@ -404,7 +457,7 @@ pub fn is_stale_artifact_name(name: &str) -> bool {
 //
 // This lived in `mcp-agent-mail-server::backup_rotation` and was lifted here
 // so BOTH `am doctor health` (CLI) and the MCP `health_check` retention block
-// (tools crate, which cannot depend on the server crate) consume one
+// (tools crate, which cannot depend on this crate) consume one
 // classifier. The server re-exports these for its rotation machinery.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -675,67 +728,66 @@ pub fn retention_resident_stats(
 /// Outcome of [`consolidate_debris`].
 #[derive(Debug, Clone, Default)]
 pub struct ReclaimOutcome {
+    /// Moves whose source/destination identity checks and directory syncs completed.
     pub moved: usize,
     pub moved_bytes: u64,
-    /// `(path, error_message)` for artifacts that could not be moved.
+    /// `(source_path, error_message)` for incomplete operations. A completed
+    /// rename followed by a sync or namespace-validation failure reports the
+    /// requested destination and preserves evidence in the retained directory.
+    /// Its pathname may have changed; never blindly retry or roll back it.
     pub failures: Vec<(PathBuf, String)>,
 }
 
 /// Consolidate (MOVE — never delete) the planned debris into `dest_dir`.
 ///
-/// Per RULE 1 and the forensic-bundle manifest's no-automatic-deletion
-/// contract, this never removes data; it relocates each artifact under one
-/// operator-reclaimable directory so disk is freed only by an explicit later
-/// `rm` the operator chooses to run. The destination directory is claimed with
-/// `create_dir`, never reused, so concurrent reclaim passes cannot overwrite
-/// one another's evidence. Same-filesystem renames are atomic and cheap.
+/// Retain one newly claimed quarantine directory for the entire batch. Walk
+/// source and destination ancestors without following user-controlled symlinks,
+/// create new components privately, and sync their entries before moving data.
+/// Each atomic no-replace move uses retained parent handles, not a fresh pathname
+/// lookup. A replaced parent cannot redirect the rename into its replacement.
+///
+/// A completed rename is counted only after both participating directories are
+/// synced and the source/destination identities revalidate. Post-move failures
+/// preserve evidence and report uncertainty without retrying or rolling back.
+/// Non-Unix platforms retain the existing fail-closed contract; an empty plan
+/// remains a side-effect-free no-op.
 pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Result<ReclaimOutcome> {
     if plan.prune.is_empty() {
         return Ok(ReclaimOutcome::default());
     }
-    if let Some(parent) = dest_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+    #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(parent)?;
+        let _ = dest_dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable recovery-debris consolidation is unsupported on this platform; sources retained",
+        ))
     }
-    std::fs::create_dir(dest_dir)?;
-    let mut outcome = ReclaimOutcome::default();
-    for art in &plan.prune {
-        let Some(name) = art.path.file_name() else {
-            outcome
-                .failures
-                .push((art.path.clone(), "artifact has no file name".to_string()));
-            continue;
-        };
-        let dest = unique_dest_path(dest_dir, name);
-        match std::fs::rename(&art.path, &dest) {
-            Ok(()) => {
-                outcome.moved += 1;
-                outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
+    #[cfg(unix)]
+    {
+        // Resolve every relative spelling against one captured working directory,
+        // rather than allowing a process-wide chdir to redirect a later artifact.
+        let cwd = std::env::current_dir()?;
+        let absolute = |path: &Path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
             }
-            Err(err) => outcome.failures.push((art.path.clone(), err.to_string())),
+        };
+        let destination = namespace::claim_reclaim_directory(&absolute(dest_dir))?;
+        let mut outcome = ReclaimOutcome::default();
+        for art in &plan.prune {
+            match namespace::move_recovery_debris_into(&absolute(&art.path), &destination) {
+                Ok(_) => {
+                    outcome.moved += 1;
+                    outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
+                }
+                Err(error) => outcome.failures.push((art.path.clone(), error.to_string())),
+            }
         }
+        Ok(outcome)
     }
-    Ok(outcome)
-}
-
-/// Pick a destination path under `dest_dir` that does not collide with an
-/// existing entry (suffix `.1`, `.2`, ... on conflict).
-fn unique_dest_path(dest_dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let candidate = dest_dir.join(name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    for n in 1..u32::MAX {
-        let mut alt = name.to_os_string();
-        alt.push(format!(".{n}"));
-        let candidate = dest_dir.join(&alt);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    dest_dir.join(name)
 }
 
 /// Recursive on-disk byte total for a directory, without following symlinks
@@ -1300,6 +1352,7 @@ mod tests {
         assert_eq!(stats.reclaimable_bytes, 0, "no policy → no reclaim probe");
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerates_startup_precheckpoint_snapshots_as_sidecar_snapshots() {
         let dir = tempfile::tempdir().unwrap();
@@ -1359,6 +1412,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_and_consolidate_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1448,6 +1502,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn consolidate_refuses_to_reuse_an_existing_destination() {
         let dir = tempfile::tempdir().unwrap();
@@ -1474,5 +1529,415 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&source).unwrap(), b"new evidence");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"prior evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_directory_collision_preserves_both_forensic_bundles() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bundle");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(source.join("evidence"), b"source bundle").unwrap();
+        let mut attempts = 0;
+        let moved = move_recovery_debris_with(
+            &source,
+            &dest,
+            |from_parent, from, to_parent, to| {
+                attempts += 1;
+                if attempts == 1 {
+                    std::fs::create_dir(dest.join(to)).unwrap();
+                    std::fs::write(dest.join(to).join("evidence"), b"raced bundle").unwrap();
+                }
+                rename_reclaim_entry(from_parent, from, to_parent, to)
+            },
+            sync_reclaim_move_parents,
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(moved, dest.join("bundle.1"));
+        assert_eq!(
+            std::fs::read(moved.join("evidence")).unwrap(),
+            b"source bundle"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("bundle/evidence")).unwrap(),
+            b"raced bundle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_preserves_dangling_destination_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source").unwrap();
+        std::os::unix::fs::symlink("absent", dest.join("evidence")).unwrap();
+        let moved = move_recovery_debris(&source, &dest).unwrap();
+        assert_eq!(moved, dest.join("evidence.1"));
+        assert_eq!(
+            std::fs::read_link(dest.join("evidence")).unwrap(),
+            Path::new("absent")
+        );
+        assert_eq!(std::fs::read(moved).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_sync_failure_reports_the_retained_destination_without_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source evidence").unwrap();
+        let mut renames = 0;
+        let error = move_recovery_debris_with(
+            &source,
+            &dest,
+            |from_parent, from, to_parent, to| {
+                renames += 1;
+                rename_reclaim_entry(from_parent, from, to_parent, to)
+            },
+            |_, _| Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+        assert_eq!(renames, 1);
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(dest.join("evidence")).unwrap(),
+            b"source evidence"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&dest.join("evidence").display().to_string()));
+        assert!(message.contains("durability is unconfirmed"));
+        assert!(message.contains("do not retry or roll back"));
+        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_exhaustion_preserves_source_and_all_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"source").unwrap();
+        for suffix in 0..MAX_RECLAIM_MOVE_ATTEMPTS {
+            let name = if suffix == 0 {
+                "evidence".to_string()
+            } else {
+                format!("evidence.{suffix}")
+            };
+            std::fs::write(dest.join(name), b"existing").unwrap();
+        }
+        let error = move_recovery_debris(&source, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        for entry in std::fs::read_dir(dest).unwrap() {
+            assert_eq!(std::fs::read(entry.unwrap().path()).unwrap(), b"existing");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_rejects_symlink_sources_and_destination_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let source = root.path().join("evidence");
+        let dest = root.path().join("quarantine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&target, b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+        assert!(move_recovery_debris(&source, &dest).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+        assert!(
+            std::fs::symlink_metadata(source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let linked_dest = root.path().join("linked-quarantine");
+        std::os::unix::fs::symlink(&dest, &linked_dest).unwrap();
+        assert!(move_recovery_debris(&target, &linked_dest).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_directories_are_private_when_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("doctor/reclaimable/run");
+        create_private_reclaim_directory(&dest, true).unwrap();
+        for path in [
+            root.path().join("doctor"),
+            root.path().join("doctor/reclaimable"),
+            dest,
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn reclaim_without_supported_directory_sync_refuses_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("evidence");
+        std::fs::write(&source, b"source").unwrap();
+        let plan = ReclaimPlan {
+            prune: vec![DebrisArtifact {
+                path: source.clone(),
+                bytes: 6,
+                modified_us: 1,
+                category: DebrisCategory::CorruptQuarantine,
+            }],
+            ..ReclaimPlan::default()
+        };
+        let dest = root.path().join("quarantine");
+        let error = consolidate_debris(&plan, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert!(!dest.exists());
+        assert_eq!(
+            consolidate_debris(&ReclaimPlan::default(), &dest)
+                .unwrap()
+                .moved,
+            0
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn recovery_words_in_database_basename_never_select_the_live_family() {
+        use std::ffi::OsStr;
+        for database in [
+            "mail.corrupt-live.db",
+            "mail.reconstruct-failed-live.db",
+            "mail.archive-reconcile-live.db",
+            "mail.startup-precheckpoint-live.db",
+            "mail.startup-quarantine-live.db",
+            "mail.stale",
+            "mail.stale-live.db",
+        ] {
+            for suffix in [
+                "",
+                "-wal",
+                "-shm",
+                "-journal",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                ".lock",
+                ".bak",
+                ".bak.meta.json",
+            ] {
+                let name = format!("{database}{suffix}");
+                assert_eq!(
+                    classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                    None,
+                    "live/control file must not enter reclaim: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_debris_requires_an_exact_family_and_complete_artifact_suffix() {
+        use std::ffi::OsStr;
+        for name in [
+            "mail.db2.corrupt-incident",
+            "mail.db-other.corrupt-incident",
+            "mail.db.notes.corrupt-incident",
+            "mail.db.bak.corrupt-incident",
+            "mail.db-wal2.stale",
+            "mail.db.corrupt-",
+            "mail.db.reconstruct-failed-",
+            "mail.db.archive-reconcile-",
+            "mail.db.startup-quarantine-",
+            "mail.db.stale-",
+            "mail.db.stale.",
+            "mail.db.staleness",
+            "mail.db.CORRUPT-incident",
+        ] {
+            assert_eq!(
+                classify_recovery_debris_file(OsStr::new("mail.db"), OsStr::new(name)),
+                None,
+                "unowned or incomplete spelling: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_debris_classifies_known_companions_after_the_database_name() {
+        use std::ffi::OsStr;
+        for companion in [
+            "",
+            "-wal",
+            "-shm",
+            "-journal",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            ".lock",
+        ] {
+            for (suffix, category) in [
+                ("corrupt-incident", DebrisCategory::CorruptQuarantine),
+                (
+                    "reconstruct-failed-incident",
+                    DebrisCategory::CorruptQuarantine,
+                ),
+                (
+                    "archive-reconcile-incident",
+                    DebrisCategory::ArchiveReconcileBackup,
+                ),
+                (
+                    "startup-precheckpoint-incident",
+                    DebrisCategory::SidecarSnapshot,
+                ),
+                (
+                    "startup-quarantine-incident",
+                    DebrisCategory::SidecarSnapshot,
+                ),
+                ("stale", DebrisCategory::StaleArtifact),
+                ("stale-incident", DebrisCategory::StaleArtifact),
+                ("stale.evidence", DebrisCategory::StaleArtifact),
+            ] {
+                let name = format!("mail.corrupt-live.db{companion}.{suffix}");
+                assert_eq!(
+                    classify_recovery_debris_file(
+                        OsStr::new("mail.corrupt-live.db"),
+                        OsStr::new(&name),
+                    ),
+                    Some(category),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_inventory_cannot_move_a_live_database_with_recovery_words() {
+        for database in [
+            "mail.corrupt-live.db",
+            "mail.archive-reconcile-live.db",
+            "mail.stale",
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let primary = root.join(database);
+            let protected = [
+                primary.clone(),
+                root.join(format!("{database}-wal")),
+                root.join(format!("{database}-shm")),
+                root.join(format!("{database}.bak")),
+                root.join(format!("{database}.bak.meta.json")),
+                root.join(format!("{database}2.corrupt-neighbor")),
+            ];
+            for path in &protected {
+                std::fs::write(path, b"protected mailbox state").unwrap();
+            }
+            let artifact = root.join(format!("{database}.corrupt-incident"));
+            std::fs::write(&artifact, b"incident evidence").unwrap();
+            let debris = enumerate_recovery_debris(&root, &primary);
+            assert_eq!(debris.len(), 1, "unexpected reclaim inventory: {debris:?}");
+            assert_eq!(debris[0].path, artifact);
+            let plan = select_recovery_debris_to_reclaim(
+                debris,
+                RetentionPolicy {
+                    keep_min: 0,
+                    max_age_secs: 0,
+                    max_total_bytes_per_category: Some(0),
+                },
+                i64::MAX,
+            );
+            let destination = root.join("doctor/reclaimable/scoped-run");
+            let outcome = consolidate_debris(&plan, &destination).unwrap();
+            assert_eq!(outcome.moved, 1, "{:?}", outcome.failures);
+            assert_eq!(outcome.failures, Vec::new());
+            for path in protected {
+                assert_eq!(std::fs::read(&path).unwrap(), b"protected mailbox state");
+            }
+            assert_eq!(
+                std::fs::read(destination.join(artifact.file_name().unwrap())).unwrap(),
+                b"incident evidence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_inventory_preserves_non_unicode_database_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let name = std::ffi::OsString::from_vec(b"mail-\xff.corrupt-live.db".to_vec());
+        let primary = root.join(&name);
+        std::fs::write(&primary, b"live state").unwrap();
+        let mut artifact_name = name.clone();
+        artifact_name.push(".corrupt-incident");
+        let artifact = root.join(&artifact_name);
+        std::fs::write(&artifact, b"owned evidence").unwrap();
+        let alias = root.join("mail-�.corrupt-live.db.corrupt-incident");
+        std::fs::write(&alias, b"different mailbox").unwrap();
+        let debris = enumerate_corrupt_quarantines(&primary);
+        assert_eq!(debris.len(), 1);
+        assert_eq!(debris[0].path, artifact);
+        assert_eq!(debris[0].category, DebrisCategory::CorruptQuarantine);
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live state");
+        assert_eq!(std::fs::read(alias).unwrap(), b"different mailbox");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consolidate_rejects_an_aliased_source_without_losing_other_batch_artifacts() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let outside_artifact = outside.join("outside-evidence");
+        std::fs::write(&outside_artifact, b"outside evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-forensics")).unwrap();
+        let aliased = root.join("linked-forensics/outside-evidence");
+        let owned = root.join("owned-evidence");
+        std::fs::write(&owned, b"owned").unwrap();
+        let plan = ReclaimPlan {
+            prune: vec![
+                DebrisArtifact {
+                    path: aliased.clone(),
+                    bytes: 16,
+                    modified_us: 1,
+                    category: DebrisCategory::CorruptQuarantine,
+                },
+                DebrisArtifact {
+                    path: owned.clone(),
+                    bytes: 5,
+                    modified_us: 1,
+                    category: DebrisCategory::CorruptQuarantine,
+                },
+            ],
+            ..ReclaimPlan::default()
+        };
+        let destination = root.join("doctor/reclaimable/anchored-run");
+        let outcome = consolidate_debris(&plan, &destination).unwrap();
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.moved_bytes, 5);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, aliased);
+        assert_eq!(
+            std::fs::read(outside_artifact).unwrap(),
+            b"outside evidence"
+        );
+        assert!(!owned.exists());
+        assert_eq!(
+            std::fs::read(destination.join("owned-evidence")).unwrap(),
+            b"owned"
+        );
+        assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
     }
 }

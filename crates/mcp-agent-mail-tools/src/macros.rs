@@ -71,7 +71,15 @@ pub struct HandshakeResponse {
     pub request: Value,
     pub response: Option<Value>,
     pub welcome_message: Option<Value>,
+    /// Why a requested welcome message was not sent (br-kp1in.15). Omitted
+    /// when no welcome was requested or it was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_skipped_reason: Option<String>,
 }
+
+/// Reason reported when a cross-project handshake cannot deliver its welcome.
+pub const WELCOME_SKIPPED_CROSS_PROJECT: &str = "cross_project_messaging_unsupported: the contact link was \
+     created, but send_message only delivers within one project, so the welcome was not sent";
 
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
     serde_json::from_str(&payload)
@@ -403,15 +411,7 @@ pub async fn macro_prepare_thread(
         let system = llm::single_thread_system_prompt();
         let user = llm::single_thread_user_prompt(&msg_tuples);
 
-        match llm::complete_system_user(
-            ctx.cx(),
-            system,
-            &user,
-            llm_model.as_deref(),
-            Some(config.llm_temperature),
-            Some(config.llm_max_tokens),
-        )
-        .await
+        match llm::complete_system_user(ctx.cx(), config, system, &user, llm_model.as_deref()).await
         {
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
@@ -635,7 +635,7 @@ pub async fn macro_file_reservation_cycle(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Request contact permissions and optionally auto-approve plus send a welcome message."
+    description = "Request contact permissions and optionally auto-approve plus send a welcome message.\n\nA cross-project handshake (`to_project`) links the contact but sends no welcome, because `send_message` delivers within one project; the response then carries `welcome_skipped_reason`."
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn macro_contact_handshake(
@@ -759,11 +759,15 @@ pub async fn macro_contact_handshake(
         None
     };
 
-    let _has_welcome = welcome_subject.is_some() && welcome_body.is_some();
+    let has_welcome = welcome_subject.is_some() && welcome_body.is_some();
     let thread_id_for_log = thread_id.clone();
+    let welcome_skipped_reason =
+        (has_welcome && is_cross_project).then(|| WELCOME_SKIPPED_CROSS_PROJECT.to_string());
 
     let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
         if is_cross_project {
+            // br-kp1in.15: surfaced in the response (welcome_skipped_reason), not
+            // only a debug log, so the caller does not assume the peer was told.
             tracing::debug!(
                 from = %from_agent,
                 to = %target_agent_name,
@@ -807,6 +811,7 @@ pub async fn macro_contact_handshake(
         request: request_val,
         response: response_val,
         welcome_message: welcome_val,
+        welcome_skipped_reason,
     };
     tracing::debug!(
         "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome_sent: {})",
@@ -1067,6 +1072,7 @@ mod tests {
             request: serde_json::json!({"from": "A", "to": "B"}),
             response: None,
             welcome_message: None,
+            welcome_skipped_reason: None,
         };
         let val: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
@@ -1081,6 +1087,7 @@ mod tests {
             request: serde_json::json!({"from": "A", "to": "B"}),
             response: Some(serde_json::json!({"approved": true})),
             welcome_message: Some(serde_json::json!({"id": 1, "subject": "Hello"})),
+            welcome_skipped_reason: None,
         };
         let val: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
@@ -1510,6 +1517,7 @@ mod tests {
             request: serde_json::json!({"status": "pending"}),
             response: None,
             welcome_message: None,
+            welcome_skipped_reason: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: HandshakeResponse = serde_json::from_str(&json).unwrap();
@@ -1528,12 +1536,39 @@ mod tests {
                 "subject": "Welcome!",
                 "body": "Hello and welcome to the project."
             })),
+            welcome_skipped_reason: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: HandshakeResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.welcome_message.is_some());
         let welcome = parsed.welcome_message.unwrap();
         assert_eq!(welcome["subject"], "Welcome!");
+    }
+
+    /// br-kp1in.15: the skip reason appears only when set, so same-project
+    /// handshake payloads (and the Python parity fixture) are unchanged.
+    #[test]
+    fn handshake_response_reports_skipped_welcome_only_when_set() {
+        let delivered = HandshakeResponse {
+            request: serde_json::json!({"from": "A"}),
+            response: None,
+            welcome_message: None,
+            welcome_skipped_reason: None,
+        };
+        let json = serde_json::to_value(&delivered).unwrap();
+        assert!(json.get("welcome_skipped_reason").is_none());
+
+        let skipped = HandshakeResponse {
+            welcome_skipped_reason: Some(WELCOME_SKIPPED_CROSS_PROJECT.to_string()),
+            ..delivered
+        };
+        let json = serde_json::to_value(&skipped).unwrap();
+        assert!(
+            json["welcome_skipped_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("cross_project_messaging_unsupported"))
+        );
+        assert!(json["welcome_message"].is_null());
     }
 
     // -----------------------------------------------------------------------

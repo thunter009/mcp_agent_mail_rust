@@ -462,9 +462,7 @@ struct WriteBehindQueue {
     receiver_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<WbqMsg>>>>,
 }
 
-// WBQ timing defaults. Capacity and batch limits come from `Config`.
-const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
-const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
+// WBQ retry backoff and control-message budgets. Runtime tuning comes from `Config`.
 const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 /// Total budget for a flush round-trip: delivering the Flush message AND
 /// receiving the drain acknowledgement share this single deadline (br-lrrry).
@@ -487,6 +485,126 @@ static ARCHIVE_PUBLICATION_FENCE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::
 
 thread_local! {
     static ARCHIVE_MUTATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Who holds `ARCHIVE_PUBLICATION_FENCE` (br-kp1in.29/.13). Every archive
+/// writer serializes on the fence; a 2026-09-24 stack capture of a wedged
+/// drain showed all of them queued on it while no thread held it on its
+/// stack, so the holder is recorded instead of inferred from stacks.
+struct FenceHolderRecord {
+    thread: String,
+    site: &'static std::panic::Location<'static>,
+    since: Instant,
+}
+
+static FENCE_HOLDER: Mutex<Option<FenceHolderRecord>> = Mutex::new(None);
+
+/// A contended fence wait at least this long is reported with its blocker.
+const FENCE_WAIT_REPORT_AFTER: Duration = Duration::from_secs(2);
+
+/// The current holder of the archive publication fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFenceHolder {
+    /// Holding thread, as `name (ThreadId(n))`.
+    pub thread: String,
+    /// Source location (`file:line:column`) that acquired the fence.
+    pub site: String,
+    /// How long the fence has been held.
+    pub held_for: Duration,
+}
+
+impl std::fmt::Display for ArchiveFenceHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at {} for {} ms",
+            self.thread,
+            self.site,
+            self.held_for.as_millis()
+        )
+    }
+}
+
+/// The current holder of the archive publication fence, if any. Stall
+/// watchdogs and health report it, so a blocked archive drain names the
+/// holder that blocks it.
+#[must_use]
+pub fn archive_publication_fence_holder() -> Option<ArchiveFenceHolder> {
+    let record = FENCE_HOLDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    record.as_ref().map(|record| ArchiveFenceHolder {
+        thread: record.thread.clone(),
+        site: record.site.to_string(),
+        held_for: record.since.elapsed(),
+    })
+}
+
+/// Report text for a contended fence wait, or `None` below the threshold.
+fn fence_contention_report(
+    waited: Duration,
+    waiter: &std::panic::Location<'_>,
+    blocker: Option<&ArchiveFenceHolder>,
+) -> Option<String> {
+    (waited >= FENCE_WAIT_REPORT_AFTER).then(|| {
+        let blocker = blocker.map_or_else(|| "an unrecorded holder".to_string(), ToString::to_string);
+        format!(
+            "archive publication fence contended: {waiter} waited {} ms; held by {blocker} when the wait began",
+            waited.as_millis()
+        )
+    })
+}
+
+/// A held archive publication fence. The holder record is set after the lock
+/// is taken and cleared before it is released, so it is never stale.
+struct FenceLease {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl FenceLease {
+    #[track_caller]
+    fn acquire() -> Self {
+        let site = std::panic::Location::caller();
+        let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let blocker = archive_publication_fence_holder();
+                let started = Instant::now();
+                let guard = ARCHIVE_PUBLICATION_FENCE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(report) =
+                    fence_contention_report(started.elapsed(), site, blocker.as_ref())
+                {
+                    tracing::warn!("{report}");
+                }
+                guard
+            }
+        };
+        let thread = std::thread::current();
+        *FENCE_HOLDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FenceHolderRecord {
+            thread: format!(
+                "{} ({:?})",
+                thread.name().unwrap_or("<unnamed>"),
+                thread.id()
+            ),
+            site,
+            since: Instant::now(),
+        });
+        Self { guard: Some(guard) }
+    }
+}
+
+impl Drop for FenceLease {
+    fn drop(&mut self) {
+        *FENCE_HOLDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        drop(self.guard.take());
+    }
 }
 
 /// File name of the persisted per-repo mutation epoch token, stored inside the
@@ -613,7 +731,7 @@ fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
 }
 
 struct ArchiveMutationGuard {
-    fence: Option<std::sync::MutexGuard<'static, ()>>,
+    fence: Option<FenceLease>,
     /// Mutated path anchoring the persisted epoch rewrite; `Some` only for the
     /// outermost guard of a window that was opened with `begin_at`. The
     /// enclosing repo is re-resolved on each edge so a window that CREATES the
@@ -622,6 +740,7 @@ struct ArchiveMutationGuard {
 }
 
 impl ArchiveMutationGuard {
+    #[track_caller]
     fn begin() -> Self {
         Self::begin_inner(None)
     }
@@ -630,21 +749,25 @@ impl ArchiveMutationGuard {
     /// at or beneath the mutated archive). In addition to the in-process
     /// epoch/fence, the outermost guard rewrites the persisted per-repo epoch
     /// token on both edges so readers in other processes observe the window.
+    #[track_caller]
     fn begin_at(path: &Path) -> Self {
         Self::begin_inner(Some(path))
     }
 
+    #[track_caller]
     fn begin_inner(anchor: Option<&Path>) -> Self {
         let outermost = ARCHIVE_MUTATION_DEPTH.with(|depth| {
             let outermost = depth.get() == 0;
             depth.set(depth.get().saturating_add(1));
             outermost
         });
-        let fence = outermost.then(|| {
-            ARCHIVE_PUBLICATION_FENCE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        // Not a closure: #[track_caller] does not propagate through closures,
+        // and the lease records the caller of `begin`/`begin_at`.
+        let fence = if outermost {
+            Some(FenceLease::acquire())
+        } else {
+            None
+        };
         let epoch_anchor = if outermost {
             anchor.map(Path::to_path_buf)
         } else {
@@ -680,6 +803,7 @@ impl Drop for ArchiveMutationGuard {
 
 /// Run a non-blocking snapshot publication check while physical archive
 /// mutations are excluded. The callback must not initiate an archive write.
+#[track_caller]
 pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -> T {
     // Latent self-deadlock guard (concurrency audit F3): the publication fence
     // is a plain, NON-reentrant `Mutex`. A thread already inside an
@@ -695,9 +819,7 @@ pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -
          ArchiveMutationGuard window; the fence mutex is non-reentrant and \
          this self-deadlocks"
     );
-    let _fence = ARCHIVE_PUBLICATION_FENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _fence = FenceLease::acquire();
     publish()
 }
 
@@ -987,6 +1109,9 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let channel_capacity = config.wbq_channel_capacity;
     let drain_batch_cap = config.wbq_drain_batch_cap;
     let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
+    // A (re)started drain is the progress baseline: salvaged ops it never
+    // drains still read as stalled (br-kp1in.23).
+    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
 
     // br-b9x63: a dead drain thread leaves its buffered ops in the old
     // channel. Salvage them into the fresh channel instead of silently
@@ -1016,6 +1141,12 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
                     }
                 }
             }
+            #[cfg(test)]
+            WBQ_AFTER_SALVAGE_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
         }
         *slot = Some(rx);
         let prior_depth = wbq.op_depth.swap(salvaged_ops, Ordering::Relaxed);
@@ -1042,6 +1173,12 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
         );
     }
 
+    #[cfg(test)]
+    WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     let receiver_slot = Arc::clone(&wbq.receiver_slot);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
     let handle = std::thread::Builder::new()
@@ -1076,11 +1213,16 @@ pub fn wbq_start() {
     wbq_start_inner(wbq);
 }
 
-fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
+fn wbq_reserve_enqueue(op_depth: &AtomicU64) {
     let metrics = mcp_agent_mail_core::global_metrics();
-    metrics.storage.wbq_enqueued_total.inc();
 
     let depth = op_depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if depth == 1 {
+        // The queue was empty: waiting starts now, not at the last drained op.
+        // A rejected admission may have left an older anchor while depth was
+        // zero, so every empty-to-nonempty transition replaces it.
+        WBQ_BACKLOG_SINCE_US.store(now_micros_u64().max(1), Ordering::Relaxed);
+    }
     // GH#225: the gauge must be updated with a commuting delta, not
     // `set(depth)`. A racing enqueue/drain pair can otherwise apply their
     // `set`s out of order, permanently stranding the gauge one above the
@@ -1099,10 +1241,96 @@ fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Coordinate admission/restart at the actual accounting and salvage
+    // boundaries without sleeps or replacing the real queue/drain.
+    static WBQ_AFTER_RESERVE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static WBQ_AFTER_SALVAGE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    // Pause only the calling producer after the real channel publication, so
+    // tests can let the real drain finish before the enqueue call returns.
+    static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn wbq_try_send_counted(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    msg: WbqMsg,
+    lifecycle: Option<&Mutex<()>>,
+) -> std::result::Result<(), std::sync::mpsc::TrySendError<WbqMsg>> {
+    // Restart/shutdown own this mutex while replacing the receiver and its
+    // counters. Serialize only this nonblocking admission attempt: a reserve
+    // on the old sender must never be rolled back against replacement work,
+    // and no accepted op may arrive after the salvage pass has finished.
+    // Contention shares the bounded channel-full retry path; neither shutdown
+    // nor another producer can extend admission by holding us in a mutex wait.
+    let _admission = match lifecycle.map(Mutex::try_lock) {
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
+        Some(Err(std::sync::TryLockError::WouldBlock)) => {
+            return Err(std::sync::mpsc::TrySendError::Full(msg));
+        }
+        None => None,
+    };
+    // Account for the op BEFORE the receiver can observe it. Incrementing
+    // after try_send lets a fast drain subtract from zero; saturating counters
+    // then strand a phantom queued op and eventually report a false stall.
+    wbq_reserve_enqueue(op_depth);
+    #[cfg(test)]
+    WBQ_AFTER_RESERVE_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    let result = sender.try_send(msg);
+    let metrics = mcp_agent_mail_core::global_metrics();
+    if result.is_ok() {
+        #[cfg(test)]
+        WBQ_AFTER_PUBLISH_TEST_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        metrics.storage.wbq_enqueued_total.inc();
+    } else {
+        // Full/disconnected channels never acquired this op. Undo its
+        // reservation before retrying or returning it to synchronous fallback.
+        let depth_after = op_depth
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0)
+            .saturating_sub(1);
+        metrics.storage.wbq_depth.sub_saturating(1);
+        let cap = u64::try_from(Config::get().wbq_channel_capacity).unwrap_or(u64::MAX);
+        let threshold = cap.saturating_mul(80).saturating_div(100);
+        if threshold == 0 || depth_after < threshold {
+            metrics.storage.wbq_over_80_since_us.set(0);
+        }
+    }
+    result
+}
+
+#[cfg(any(test, fuzzing))]
 fn wbq_enqueue_with_sender(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     op: WriteOp,
+) -> WbqEnqueueResult {
+    wbq_enqueue_with_sender_admission(sender, op_depth, op, None)
+}
+
+fn wbq_enqueue_with_sender_admission(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    op: WriteOp,
+    lifecycle: Option<&Mutex<()>>,
 ) -> WbqEnqueueResult {
     let envelope = WbqOpEnvelope {
         enqueued_at: Instant::now(),
@@ -1110,11 +1338,8 @@ fn wbq_enqueue_with_sender(
     };
 
     let msg = WbqMsg::Op(envelope);
-    match sender.try_send(msg) {
-        Ok(()) => {
-            wbq_record_enqueue_success(op_depth);
-            WbqEnqueueResult::Enqueued
-        }
+    match wbq_try_send_counted(sender, op_depth, msg, lifecycle) {
+        Ok(()) => WbqEnqueueResult::Enqueued,
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
             // Backpressure: queue is temporarily full. Block briefly to avoid
@@ -1125,16 +1350,14 @@ fn wbq_enqueue_with_sender(
                 .inc();
             // std::sync::mpsc::SyncSender does not expose a stable send_timeout; emulate with
             // try_send + bounded exponential backoff until a deadline.
-            let deadline = Instant::now() + Duration::from_millis(WBQ_ENQUEUE_TIMEOUT_MS);
+            let deadline =
+                Instant::now() + Duration::from_millis(Config::get().wbq_enqueue_timeout_ms);
             let mut cur = msg;
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
-                match sender.try_send(cur) {
-                    Ok(()) => {
-                        wbq_record_enqueue_success(op_depth);
-                        break WbqEnqueueResult::Enqueued;
-                    }
+                match wbq_try_send_counted(sender, op_depth, cur, lifecycle) {
+                    Ok(()) => break WbqEnqueueResult::Enqueued,
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         break WbqEnqueueResult::QueueUnavailable;
                     }
@@ -1157,6 +1380,7 @@ fn wbq_enqueue_with_sender(
     }
 }
 
+#[cfg(any(test, fuzzing))]
 fn wbq_enqueue_with_sender_and_pressure(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
@@ -1183,7 +1407,10 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
     let Some(sender) = wbq_sender_clone(wbq) else {
         return WbqEnqueueResult::QueueUnavailable;
     };
-    wbq_enqueue_with_sender_and_pressure(&sender, wbq.op_depth.as_ref(), op, disk_pressure)
+    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return WbqEnqueueResult::SkippedDiskCritical;
+    }
+    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(&wbq.lifecycle))
 }
 
 /// Execute a write op synchronously on the caller thread.
@@ -2160,7 +2387,7 @@ pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
 /// Live archive-materialization lag: how far the git archive trails the
 /// authoritative DB. `oldest_unmaterialized_us` is the age of the oldest write
 /// that has landed in the DB but not yet in the archive (max of the retry
-/// backlog and the commit coalescer), and the depth counters are the current
+/// backlog, the commit coalescer and the in-flight WBQ batch), and the depth counters are the current
 /// unmaterialized-write backlog. Surfaced via `health_check` (br-hpv61 ask #1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveLagSnapshot {
@@ -2172,6 +2399,10 @@ pub struct ArchiveLagSnapshot {
     pub coalescer_pending: u64,
     /// Age (microseconds) of the oldest uncommitted coalescer request, 0 if none.
     pub coalescer_oldest_age_us: u64,
+    /// Longest interval without a successful commit among repositories with
+    /// pending coalescer work, including requests a worker has already dequeued.
+    #[serde(default)]
+    pub coalescer_since_progress_us: u64,
     /// Age (microseconds) of the oldest unmaterialized archive write overall.
     pub oldest_unmaterialized_us: u64,
     /// Lifetime count of ops queued into the retry backlog.
@@ -2190,22 +2421,145 @@ pub struct ArchiveLagSnapshot {
     /// journal write failed). Nonzero means the archive is not crash-safe for
     /// those ops until they drain; the DB stays authoritative (br-ack-fast).
     pub ephemeral_total: u64,
+    /// Ops waiting in the write-behind queue channel (not yet dequeued).
+    #[serde(default)]
+    pub wbq_depth: u64,
+    /// Age (microseconds) of the oldest op in the batch the WBQ drain is
+    /// executing right now, 0 when no batch is in flight. The queue is FIFO, so
+    /// while a batch is in flight this is the oldest unmaterialized WBQ write.
+    #[serde(default)]
+    pub wbq_inflight_oldest_age_us: u64,
+    /// How long (microseconds) the drain has been executing its current batch,
+    /// 0 when idle. A value that keeps growing means the drain is stuck.
+    #[serde(default)]
+    pub wbq_inflight_execution_us: u64,
+    /// How long (microseconds) queued WBQ work has waited without the drain
+    /// completing a single op; 0 when the queue is empty. Unlike the in-flight
+    /// age this also grows when the drain thread is dead or never dequeues.
+    #[serde(default)]
+    pub wbq_since_progress_us: u64,
+}
+
+/// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
+/// now; 0 when no batch is in flight (br-kp1in.23).
+static WBQ_INFLIGHT_SINCE_US: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock µs at which the oldest op of the in-flight WBQ batch was
+/// enqueued; 0 when no batch is in flight.
+static WBQ_INFLIGHT_OLDEST_ENQUEUED_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the drain is about to execute `batch` (non-empty).
+fn wbq_mark_batch_in_flight(batch: &[WbqOpEnvelope]) {
+    let oldest_age_us = batch
+        .iter()
+        .map(|envelope| duration_as_micros_u64(envelope.enqueued_at.elapsed()))
+        .max()
+        .unwrap_or(0);
+    let now_us = now_micros_u64();
+    WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(now_us.saturating_sub(oldest_age_us), Ordering::Relaxed);
+    WBQ_INFLIGHT_SINCE_US.store(now_us.max(1), Ordering::Relaxed);
+}
+
+/// Record that the drain finished its in-flight batch.
+fn wbq_clear_batch_in_flight() {
+    WBQ_INFLIGHT_SINCE_US.store(0, Ordering::Relaxed);
+    WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(0, Ordering::Relaxed);
+}
+
+/// Wall-clock µs of the drain's last completed op (or its start); 0 = never.
+static WBQ_LAST_PROGRESS_US: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock µs at which the queue last went from empty to non-empty;
+/// 0 while it is empty.
+static WBQ_BACKLOG_SINCE_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the drain completed ops, leaving `depth_after` queued.
+fn wbq_note_drain_progress(depth_after: u64) {
+    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
+    if depth_after == 0 {
+        WBQ_BACKLOG_SINCE_US.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How long queued work has waited without the drain completing an op.
+///
+/// Measured from the later of the last completed op and the moment the queue
+/// became non-empty, so the first enqueue after a long idle period is not a
+/// stall. Unknown anchors report 0 rather than a false stall.
+const fn wbq_since_progress_us(
+    now_us: u64,
+    depth: u64,
+    last_progress_us: u64,
+    backlog_since_us: u64,
+) -> u64 {
+    let anchor = if last_progress_us > backlog_since_us {
+        last_progress_us
+    } else {
+        backlog_since_us
+    };
+    if depth == 0 || anchor == 0 {
+        0
+    } else {
+        now_us.saturating_sub(anchor)
+    }
+}
+
+/// `(oldest in-flight op age, in-flight execution time)` in µs at `now_us`.
+fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
+    let age_since = |stamp: u64| {
+        if stamp == 0 {
+            0
+        } else {
+            now_us.saturating_sub(stamp)
+        }
+    };
+    (
+        age_since(WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed)),
+        age_since(WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed)),
+    )
 }
 
 /// Snapshot the live archive-materialization lag for `health_check`.
+///
+/// `oldest_unmaterialized_us` covers the retry backlog, the commit coalescer
+/// AND the batch the WBQ drain is executing. Before br-kp1in.23 the WBQ was
+/// omitted, so a drain blocked mid-batch with thousands of queued writes
+/// reported 0 ms of lag (observed 2026-09-23).
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let backlog = &*ARCHIVE_BACKLOG;
     let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
-    let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
-        (c.pending_requests(), c.oldest_pending_age_us())
-    });
+    let (coalescer_pending, coalescer_lag) = COMMIT_COALESCER
+        .get()
+        .map_or((0, CoalescerLagState::default()), |c| {
+            (c.pending_requests(), c.lag_state())
+        });
+    let now_us = now_micros_u64();
+    let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
+    let wbq_depth = mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_depth
+        .load();
+    let wbq_since_progress_us = wbq_since_progress_us(
+        now_us,
+        wbq_depth,
+        WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
+        WBQ_BACKLOG_SINCE_US.load(Ordering::Relaxed),
+    );
     ArchiveLagSnapshot {
         backlog_depth,
         backlog_oldest_age_us,
         coalescer_pending,
-        coalescer_oldest_age_us,
-        oldest_unmaterialized_us: backlog_oldest_age_us.max(coalescer_oldest_age_us),
+        coalescer_oldest_age_us: coalescer_lag.oldest_age_us,
+        coalescer_since_progress_us: coalescer_lag.since_progress_us,
+        // Queued work that has not advanced for this long is at least this
+        // stale, even when no batch is in flight (dead or idle drain).
+        oldest_unmaterialized_us: backlog_oldest_age_us
+            .max(coalescer_lag.oldest_age_us)
+            .max(wbq_inflight_oldest_age_us)
+            .max(wbq_since_progress_us),
+        wbq_depth,
+        wbq_inflight_oldest_age_us,
+        wbq_inflight_execution_us,
+        wbq_since_progress_us,
         enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
         drained_total: backlog.drained_total.load(Ordering::Relaxed),
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
@@ -2891,7 +3245,7 @@ fn wbq_drain_loop(
     channel_capacity: usize,
     drain_batch_cap: usize,
 ) {
-    let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
+    let flush_interval = Duration::from_millis(Config::get().wbq_flush_interval_ms);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
 
@@ -2967,6 +3321,9 @@ fn wbq_drain_loop(
             metrics.storage.wbq_over_80_since_us.set(0);
         }
 
+        if !batch.is_empty() {
+            wbq_mark_batch_in_flight(&batch);
+        }
         let mut errors = 0usize;
         let mut idx = 0usize;
         while idx < batch.len() {
@@ -3027,6 +3384,8 @@ fn wbq_drain_loop(
         }
 
         metrics.storage.wbq_drained_total.add(drained_u64);
+        wbq_clear_batch_in_flight();
+        wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
         metrics
             .storage
             .wbq_errors_total
@@ -3077,6 +3436,7 @@ fn wbq_drain_loop(
                     metrics.storage.wbq_over_80_since_us.set(0);
                 }
 
+                wbq_mark_batch_in_flight(std::slice::from_ref(&envelope));
                 let r = wbq_execute_op(&envelope.op, "wbq-drain");
                 let latency_us = u64::try_from(
                     envelope
@@ -3088,6 +3448,8 @@ fn wbq_drain_loop(
                 .unwrap_or(u64::MAX);
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
                 metrics.storage.wbq_drained_total.inc();
+                wbq_clear_batch_in_flight();
+                wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
                 if let Err(error) = r {
                     // Same exhausted-retry semantics as the main drain
                     // branch — failures here are also rows the API
@@ -4285,8 +4647,54 @@ struct RepoQueue {
     retry_after: Mutex<Option<Instant>>,
     /// Consecutive commit failures used to calculate per-repo retry backoff.
     failure_streak: AtomicU64,
+    /// Worker-owned requests stay visible after leaving the queue or spill.
+    /// Progress belongs to this repository: another repository's successful
+    /// commits must not hide a stalled worker here.
+    progress: Mutex<CoalescerRepoProgress>,
     /// Per-repo metrics for observability.
     metrics: RepoCommitMetrics,
+}
+
+#[derive(Default)]
+struct CoalescerRepoProgress {
+    inflight_oldest: Option<Instant>,
+    last_completed: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CoalescerLagState {
+    oldest_age_us: u64,
+    since_progress_us: u64,
+}
+
+impl RepoQueue {
+    /// Publish ownership before releasing the queue/spill mutex, so a health
+    /// reader cannot see the request disappear during the worker handoff.
+    fn mark_inflight(&self, oldest: Instant) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.inflight_oldest = Some(
+            progress
+                .inflight_oldest
+                .map_or(oldest, |current| current.min(oldest)),
+        );
+    }
+
+    fn note_commit_progress(&self) {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_completed = Some(Instant::now());
+    }
+
+    fn set_inflight_oldest(&self, oldest: Option<Instant>) {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inflight_oldest = oldest;
+    }
 }
 
 /// Spill state for a single repo (replaces the per-shard `HashMap`<`PathBuf`, _>).
@@ -4338,6 +4746,7 @@ impl Default for RepoQueue {
             last_serviced_us: AtomicU64::new(0),
             retry_after: Mutex::new(None),
             failure_streak: AtomicU64::new(0),
+            progress: Mutex::new(CoalescerRepoProgress::default()),
             metrics: RepoCommitMetrics::default(),
         }
     }
@@ -4938,39 +5347,60 @@ impl CommitCoalescer {
     }
 
     /// Age (microseconds) of the oldest archive request still waiting to be
-    /// committed across all per-repo queues and spill buffers, or 0 if none.
+    /// committed across all per-repo queues, spill buffers and in-flight
+    /// batches, or 0 if none.
     /// Used by [`archive_lag_snapshot`] to report commit-lag as unmaterialized
     /// archive age.
     #[must_use]
     pub fn oldest_pending_age_us(&self) -> u64 {
+        self.lag_state().oldest_age_us
+    }
+
+    fn lag_state(&self) -> CoalescerLagState {
+        let now = Instant::now();
         let repos = self
             .repos
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut oldest: Option<Instant> = None;
+        let mut lag = CoalescerLagState::default();
         for rq in repos.values() {
-            {
-                let queue = rq
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(front) = queue.front() {
-                    oldest = Some(oldest.map_or(front.enqueued_at, |o| o.min(front.enqueued_at)));
-                }
+            // Keep all three ownership locations locked together. In
+            // particular, a failed commit can move from in-flight back into
+            // the queue while this snapshot is being sampled.
+            let queue = rq
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let spill = rq
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+            if let Some(repo) = spill.inner.as_ref() {
+                oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                    o.min(repo.earliest_enqueued_at)
+                }));
             }
-            {
-                let spill = rq
-                    .spill
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(repo) = spill.inner.as_ref() {
-                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
-                        o.min(repo.earliest_enqueued_at)
-                    }));
-                }
+            let progress = rq
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(inflight) = progress.inflight_oldest {
+                oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
+            }
+            if let Some(oldest) = oldest {
+                lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                    now.saturating_duration_since(oldest),
+                ));
+                let last_progress = progress
+                    .last_completed
+                    .map_or(oldest, |completed| completed.max(oldest));
+                lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
+                    now.saturating_duration_since(last_progress),
+                ));
             }
         }
-        oldest.map_or(0, |instant| duration_as_micros_u64(instant.elapsed()))
+        lag
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -5217,10 +5647,16 @@ fn coalescer_pool_worker(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
-                let (guard, _) = cvar
+                let (guard, timeout) = cvar
                     .wait_timeout(wake_tokens, idle_wait)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 wake_tokens = guard;
+                if timeout.timed_out() {
+                    // A consumed/lost notification must not park pending
+                    // commits forever. Recheck repository readiness even
+                    // without a wake token after the bounded safety interval.
+                    break;
+                }
             }
             if *wake_tokens > 0 {
                 *wake_tokens -= 1;
@@ -5349,13 +5785,34 @@ fn self_process_repo(
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
         rq: &'a Arc<RepoQueue>,
+        repos: &'a Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
+        work_cv: &'a Arc<(Mutex<u64>, std::sync::Condvar)>,
+        worker_count: usize,
     }
     impl Drop for ProcessingGuard<'_> {
         fn drop(&mut self) {
+            // PanicGuard restores uncommitted work before this guard drops.
+            // Release the claim before waking peers; otherwise a peer can
+            // consume the notification while the repository is unselectable.
+            self.rq.set_inflight_oldest(None);
             self.rq.processing.store(false, Ordering::Release);
+            let more_work = self
+                .repos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|repo| repo.depth.load(Ordering::Relaxed) > 0);
+            if more_work {
+                coalescer_signal_worker(self.work_cv, self.worker_count);
+            }
         }
     }
-    let _guard = ProcessingGuard { rq };
+    let _guard = ProcessingGuard {
+        rq,
+        repos,
+        work_cv,
+        worker_count,
+    };
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
@@ -5382,6 +5839,13 @@ fn self_process_repo(
             }
         }
         if !batch.is_empty() {
+            rq.mark_inflight(
+                batch
+                    .iter()
+                    .map(|request| request.enqueued_at)
+                    .min()
+                    .expect("a non-empty batch has an oldest request"),
+            );
             coalescer_depth_decrement(&rq.depth, batch.len() as u64);
         }
         q.is_empty()
@@ -5397,8 +5861,6 @@ fn self_process_repo(
 
     struct PanicGuard<'a> {
         rq: &'a RepoQueue,
-        work_cv: &'a Arc<(Mutex<u64>, std::sync::Condvar)>,
-        worker_count: usize,
         pending_batch: Vec<CoalescerCommitFields>,
         inflight_batch: Option<Vec<CoalescerCommitFields>>,
         pending_spilled: Option<CoalescerSpilledWork>,
@@ -5407,22 +5869,18 @@ fn self_process_repo(
     impl Drop for PanicGuard<'_> {
         fn drop(&mut self) {
             if std::thread::panicking() {
-                if coalescer_restore_drained_work_on_panic(
+                coalescer_restore_drained_work_on_panic(
                     self.rq,
                     &mut self.pending_batch,
                     &mut self.inflight_batch,
                     &mut self.pending_spilled,
                     &mut self.inflight_spilled,
-                ) {
-                    coalescer_signal_worker(self.work_cv, self.worker_count);
-                }
+                );
             }
         }
     }
     let mut panic_guard = PanicGuard {
         rq,
-        work_cv,
-        worker_count,
         pending_batch: batch,
         inflight_batch: None,
         pending_spilled: spilled_work,
@@ -5499,6 +5957,7 @@ fn self_process_repo(
             }
 
             if outcome.committed_requests > 0 {
+                rq.note_commit_progress();
                 coalescer_update_pending(pending_requests, outcome.committed_requests);
                 coalescer_note_commit_success(rq);
             }
@@ -5509,6 +5968,19 @@ fn self_process_repo(
             }
         }
         panic_guard.inflight_batch = None;
+        rq.set_inflight_oldest(
+            panic_guard
+                .pending_batch
+                .iter()
+                .map(|request| request.enqueued_at)
+                .chain(
+                    panic_guard
+                        .pending_spilled
+                        .as_ref()
+                        .map(|work| work.earliest_enqueued_at),
+                )
+                .min(),
+        );
     }
 
     if let Some(work) = panic_guard.pending_spilled.take() {
@@ -5525,6 +5997,7 @@ fn self_process_repo(
 
         let metrics = mcp_agent_mail_core::global_metrics();
         if outcome.committed_requests > 0 {
+            rq.note_commit_progress();
             metrics
                 .storage
                 .commit_drained_total
@@ -5562,22 +6035,10 @@ fn self_process_repo(
         panic_guard.inflight_spilled = None;
     }
 
-    // Release processing lock (via guard drop) + update last_serviced timestamp
+    // ProcessingGuard releases the claim and then wakes peers, including on
+    // panic after PanicGuard has restored unfinished work.
     rq.last_serviced_us
         .store(now_micros_u64(), Ordering::Relaxed);
-
-    // If any repo still has work, wake another worker
-    let more_work = {
-        let repos_guard = repos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        repos_guard
-            .values()
-            .any(|r| r.depth.load(Ordering::Relaxed) > 0)
-    };
-    if more_work {
-        coalescer_signal_worker(work_cv, worker_count);
-    }
 
     had_failure
 }
@@ -5667,6 +6128,7 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
     if repo.pending_requests == 0 {
         return None;
     }
+    rq.mark_inflight(repo.earliest_enqueued_at);
     coalescer_depth_decrement(&rq.depth, repo.pending_requests);
     Some(CoalescerSpilledWork {
         repo_root: repo_root.to_path_buf(),
@@ -6796,6 +7258,107 @@ fn head_update_refname(repo: &Repository) -> Result<String> {
         .map_or_else(|| "HEAD".to_string(), str::to_string))
 }
 
+/// A ref lockfile nobody holds open must be at least this old before it counts
+/// as the leftover of a dead writer (br-1l9mc). libgit2 and git keep the
+/// lockfile open for the whole reference transaction, so the only window in
+/// which a live lock is closed is git's close-then-rename, microseconds long.
+const STALE_REF_LOCK_MIN_AGE: Duration = Duration::from_secs(5);
+/// Without holder evidence (no `/proc`), only a lock this old is taken as dead.
+const STALE_REF_LOCK_MIN_AGE_UNPROBED: Duration = Duration::from_secs(600);
+
+/// PIDs holding `path` open, or `None` when no holder evidence is available.
+///
+/// Compares `/proc/*/fd` link targets without touching their filesystems (a
+/// stat into a dead FUSE mount can block forever, br-piwvy). Other users'
+/// descriptors are unreadable, and the archive is private to its owner.
+#[cfg(target_os = "linux")]
+fn lock_file_holders(path: &Path) -> Option<Vec<u32>> {
+    let target = fs::canonicalize(path).ok()?;
+    let mut holders = Vec::new();
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| fs::read_link(fd.path()).is_ok_and(|link| link == target))
+        {
+            holders.push(pid);
+        }
+    }
+    Some(holders)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_file_holders(_path: &Path) -> Option<Vec<u32>> {
+    None
+}
+
+/// Move aside the lockfile of `refname` when it is the leftover of a writer
+/// that died inside a reference transaction (br-1l9mc): a regular file under
+/// the repository's git dir that no process holds open and that is older than
+/// [`STALE_REF_LOCK_MIN_AGE`]. Anything else fails closed. The lock is renamed
+/// into the git dir itself, never beside the ref, where Git would read it as a
+/// branch; it is never deleted.
+fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
+    let lock_path = repo.path().join(format!("{refname}.lock"));
+    if !path_is_nonsymlink_file(&lock_path)
+        || path_existing_prefix_has_symlink(&lock_path).unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(identity) = git_lock_identity(&lock_path) else {
+        return false;
+    };
+    let min_age = match lock_file_holders(&lock_path) {
+        Some(holders) if holders.is_empty() => STALE_REF_LOCK_MIN_AGE,
+        Some(_) => return false,
+        None => STALE_REF_LOCK_MIN_AGE_UNPROBED,
+    };
+    let age = fs::symlink_metadata(&lock_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    if age.is_none_or(|age| age < min_age) {
+        return false;
+    }
+    let quarantine = next_startup_quarantine_path(
+        &repo
+            .path()
+            .join(format!("{}.lock", refname.replace('/', "-"))),
+        "stale-ref-lock",
+    );
+    // The decision was made on this exact file; a replaced lock is left alone.
+    if git_lock_identity(&lock_path).as_ref() != Some(&identity) {
+        return false;
+    }
+    match fs::rename(&lock_path, &quarantine) {
+        Ok(()) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                quarantine = %quarantine.display(),
+                age_secs = age.map_or(0, |age| age.as_secs()),
+                "[git-lock] quarantined a stale reference lock left by a dead writer"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                "[git-lock] could not quarantine stale reference lock: {error}"
+            );
+            false
+        }
+    }
+}
+
 /// Create a commit object from a caller-built tree and atomically advance
 /// HEAD onto it.
 ///
@@ -6830,7 +7393,15 @@ where
     let mut tx = repo.transaction()?;
     // Hold the reference lock across tree-build + parent-read + ref-write:
     // this is the critical section another mcp-agent-mail process blocks on.
-    tx.lock_ref(&refname)?;
+    if let Err(error) = tx.lock_ref(&refname) {
+        // br-1l9mc: a writer killed inside this critical section leaves the
+        // ref lockfile behind, and every later commit would fail on it.
+        if error.code() != ErrorCode::Locked || !quarantine_stale_ref_lock(repo, &refname) {
+            return Err(error.into());
+        }
+        tx = repo.transaction()?;
+        tx.lock_ref(&refname)?;
+    }
     let Some(tree_oid) = build_tree(repo)? else {
         // Caller produced no changes (e.g. every path was already absent);
         // releasing the transaction without set_target leaves HEAD intact.
@@ -6847,6 +7418,12 @@ where
     };
     tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
     tx.commit()?;
+    // The archive commit is durable even when an operator or an interrupted
+    // writer owns staged evidence. Index maintenance must never discard it or
+    // turn an already-committed operation into a retryable commit failure.
+    if let Err(error) = sync_clean_index_after_commit(repo, parent.as_ref(), &tree) {
+        tracing::warn!("failed to synchronize clean archive index: {error}");
+    }
     Ok(())
 }
 fn commit_paths_lockfree(
@@ -6897,12 +7474,6 @@ fn commit_paths_lockfree(
             .and_then(|p| p.tree().ok());
         build_tree_with_updates(repo, base_tree.as_ref(), &updates).map(Some)
     })?;
-
-    // Lock-free commits bypass the index by design; sync index to HEAD so
-    // status/porcelain views remain clean for tooling and tests.
-    if let Err(err) = try_restore_index_to_head(repo) {
-        tracing::warn!("[git-lockfree] failed to sync index after commit: {err}");
-    }
 
     Ok(())
 }
@@ -6973,6 +7544,10 @@ pub fn commit_paths_with_retry(
 ) -> Result<()> {
     const MAX_INDEX_LOCK_RETRIES: usize = 5;
 
+    // Retain the fence through fallback/retries. Otherwise the fallback commit
+    // lock could be held while commit_paths waits for this fence, reversing the
+    // order used by bundle writers and message reconciliation.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);
@@ -7389,7 +7964,6 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 
 /// Create a directory (and parents) only if we haven't already created it.
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    let _mutation = ArchiveMutationGuard::begin_at(dir);
     {
         let cache = DIR_CACHE
             .lock()
@@ -7398,6 +7972,9 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    // A cached directory is no mutation: it must not wait for the global
+    // publication fence behind a draining batch (br-kp1in.13).
+    let _mutation = ArchiveMutationGuard::begin_at(dir);
     if path_existing_prefix_has_symlink(dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -7863,14 +8440,19 @@ pub fn write_agent_profile_with_config(
     let name = validate_archive_component("agent name", name)?;
 
     let repo_root = archive_repo_root_checked(archive)?;
-    let project_root = archive_project_root_checked(archive)?;
-    let profile_dir = project_root.join("agents").join(name);
-    ensure_dir(&profile_dir)?;
+    // Keep ordinary profile writes in the same cross-process critical section
+    // as lifecycle reconciliation. The publication fence precedes the project
+    // lock, matching every other archive writer's lock order.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+    let rel = with_project_lock(archive, || {
+        let project_root = archive_project_root_checked(archive)?;
+        let profile_dir = project_root.join("agents").join(name);
+        ensure_dir(&profile_dir)?;
 
-    let profile_path = profile_dir.join("profile.json");
-    write_json(&profile_path, agent, true)?;
-
-    let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
+        let profile_path = profile_dir.join("profile.json");
+        write_json(&profile_path, agent, true)?;
+        rel_path_cached(&archive.canonical_repo_root, &profile_path)
+    })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
     Ok(())
@@ -8186,21 +8768,120 @@ fn collect_canonical_message_paths_with_id(
     }
 }
 
+/// Stat identity of a canonical message file; see [`CanonicalIdCache`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct MessageFileStamp {
+    len: u64,
+    device: u64,
+    inode: u64,
+    modified_ns: i128,
+    changed_ns: i128,
+}
+
+#[cfg(unix)]
+fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some(MessageFileStamp {
+        len: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+            + i128::from(metadata.mtime_nsec()),
+        changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
+            + i128::from(metadata.ctime_nsec()),
+    })
+}
+
+/// Without a change time a rewritten file cannot be told apart: never cache.
+#[cfg(not(unix))]
+const fn message_file_stamp(_metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+    None
+}
+
+/// Front-matter ids of one project's canonical message files, parsed once and
+/// reused while a file's stamp is unchanged.
+///
+/// Every canonical write checks that no other file claims its message id, and
+/// parsing every file for that made each write O(messages in the project):
+/// thousands of opens per message in large live projects (br-dgut7). The walk
+/// still lists and stats every file, but only new or changed files are parsed.
+/// An entry is trusted only when the file last changed [`RACY_STAMP_WINDOW`]
+/// before it was parsed; otherwise a rewrite inside one filesystem timestamp
+/// tick could keep the stamp while changing the id (git's racily-clean rule).
+#[derive(Debug, Default)]
+struct CanonicalIdCache {
+    files: HashMap<PathBuf, CanonicalIdCacheEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CanonicalIdCacheEntry {
+    stamp: MessageFileStamp,
+    parsed_at_ns: i128,
+    id: Option<i64>,
+}
+
+impl CanonicalIdCacheEntry {
+    fn trusted_for(&self, stamp: MessageFileStamp, racy_window_ns: i128) -> bool {
+        self.stamp == stamp && stamp.changed_ns.saturating_add(racy_window_ns) < self.parsed_at_ns
+    }
+}
+
+/// Coarser than the timestamp granularity of the filesystems the archive may
+/// live on (ext4 ticks, 1-2 s on NFS/FAT).
+const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
+
+static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalIdCache>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn unix_time_ns(time: SystemTime) -> i128 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+        i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX)
+    })
+}
+
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
 ) -> HashMap<i64, Vec<PathBuf>> {
+    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+}
+
+/// The id index for `wanted_ids`, and how many files had to be parsed.
+fn collect_canonical_message_id_index_with_window(
+    messages_root: &Path,
+    wanted_ids: &HashSet<i64>,
+    racy_window: Duration,
+) -> (HashMap<i64, Vec<PathBuf>>, usize) {
     let mut index = HashMap::new();
+    let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return index;
+        return (index, parsed);
     }
     if !path_is_nonsymlink_dir(messages_root) {
-        return index;
+        return (index, parsed);
+    }
+    // `read_message_file` refuses every file under a symlinked prefix, so no
+    // file can match; cached ids must not be served through one either.
+    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
+        return (index, parsed);
     }
 
     let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return index;
+        return (index, parsed);
     };
+    let cache = {
+        let mut caches = CANONICAL_ID_CACHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(caches.entry(messages_root.to_path_buf()).or_default())
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
+    let mut seen = HashSet::with_capacity(cache.files.len());
     for year_entry in year_entries.flatten() {
         let year_path = year_entry.path();
         let Ok(year_type) = year_entry.file_type() else {
@@ -8249,11 +8930,43 @@ fn collect_canonical_message_id_index(
                     continue;
                 }
 
-                let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                    continue;
+                let stamp = file_entry
+                    .metadata()
+                    .ok()
+                    .as_ref()
+                    .and_then(message_file_stamp);
+                seen.insert(file_path.clone());
+                let cached = stamp.and_then(|stamp| {
+                    cache
+                        .files
+                        .get(&file_path)
+                        .filter(|entry| entry.trusted_for(stamp, racy_window_ns))
+                        .map(|entry| entry.id)
+                });
+                let existing_id = if let Some(id) = cached {
+                    id
+                } else {
+                    parsed += 1;
+                    let parsed_at_ns = unix_time_ns(SystemTime::now());
+                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
+                        // Never cache a failed read: it may be transient.
+                        cache.files.remove(&file_path);
+                        continue;
+                    };
+                    let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
+                    if let Some(stamp) = stamp {
+                        cache.files.insert(
+                            file_path.clone(),
+                            CanonicalIdCacheEntry {
+                                stamp,
+                                parsed_at_ns,
+                                id,
+                            },
+                        );
+                    }
+                    id
                 };
-                let Some(existing_id) = frontmatter.get("id").and_then(serde_json::Value::as_i64)
-                else {
+                let Some(existing_id) = existing_id else {
                     continue;
                 };
                 if wanted_ids.contains(&existing_id) {
@@ -8265,7 +8978,8 @@ fn collect_canonical_message_id_index(
             }
         }
     }
-    index
+    cache.files.retain(|path, _| seen.contains(path));
+    (index, parsed)
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -8686,6 +9400,9 @@ pub fn write_message_batch_bundle(
     );
 
     let repo_root = archive_repo_root_checked(archive)?;
+    // Direct callers need the same fence-before-project-lock order as WBQ.
+    // Nested guards reuse the outer mutation window on the current thread.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     let estimated_rel_paths = entries
         .iter()
         .map(|entry| {
@@ -8840,8 +9557,11 @@ pub fn write_message_bundle(
     extra_paths: &[String],
     commit_text: Option<&str>,
 ) -> Result<()> {
+    let repo_root = archive_repo_root_checked(archive)?;
+    // Retention holds the publication fence through its project-locked proof
+    // and DB commit. Acquire that fence before this writer's project lock too.
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     with_project_lock(archive, || {
-        let repo_root = archive_repo_root_checked(archive)?;
         let mut rel_paths = Vec::with_capacity(
             2 + recipients.len()
                 + extra_paths.len()
@@ -9020,7 +9740,12 @@ pub struct AttachmentMeta {
     pub kind: String,
     pub media_type: String,
     pub bytes: usize,
+    /// SHA1 of the original source bytes, before image conversion.
     pub sha1: String,
+    /// SHA256 of the exact stored/embedded bytes. Older metadata lacks this
+    /// witness; its original-image SHA1 cannot authorize converted WebP bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     pub width: u32,
     pub height: u32,
     /// Base64-encoded WebP data (only for inline type)
@@ -9112,7 +9837,15 @@ fn store_attachment_from_cache(
 
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, webp_path)?;
     let manifest_rel = rel_path_cached(&archive.canonical_repo_root, manifest_path)?;
-    let webp_bytes_len = fs::metadata(webp_path)?.len() as usize;
+    // Hash the same bytes used for the metadata and inline payload. A cached
+    // file may predate its first Git commit, so its encoded content also needs
+    // a durable witness in the accepted message's attachment metadata.
+    let webp_bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        webp_path,
+        fs::metadata(webp_path)?.len(),
+    )?;
+    let webp_bytes_len = webp_bytes.len();
+    let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
 
     let original_rel = if config.keep_original_images {
         match manifest.original_path.as_deref() {
@@ -9159,13 +9892,13 @@ fn store_attachment_from_cache(
     };
 
     let meta = if should_inline {
-        let webp_bytes = fs::read(webp_path)?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
         AttachmentMeta {
             kind: "inline".to_string(),
             media_type: "image/webp".to_string(),
             bytes: webp_bytes_len,
             sha1: digest.to_string(),
+            content_sha256: Some(content_sha256),
             width: manifest.width,
             height: manifest.height,
             data_base64: Some(encoded),
@@ -9178,6 +9911,7 @@ fn store_attachment_from_cache(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes_len,
             sha1: digest.to_string(),
+            content_sha256: Some(content_sha256),
             width: manifest.width,
             height: manifest.height,
             data_base64: None,
@@ -9299,6 +10033,7 @@ pub fn store_attachment(
         .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
+    let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
     atomic_write_bytes(&webp_path, &webp_bytes, true)?;
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
@@ -9363,6 +10098,7 @@ pub fn store_attachment(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes.len(),
             sha1: digest,
+            content_sha256: Some(content_sha256),
             width,
             height,
             data_base64: Some(encoded),
@@ -9375,6 +10111,7 @@ pub fn store_attachment(
             media_type: "image/webp".to_string(),
             bytes: webp_bytes.len(),
             sha1: digest,
+            content_sha256: Some(content_sha256),
             width,
             height,
             data_base64: None,
@@ -9470,6 +10207,7 @@ pub fn store_raw_attachment(
         media_type: "application/octet-stream".to_string(),
         bytes: bytes.len(),
         sha1: digest,
+        content_sha256: Some(hex::encode(Sha256::digest(&bytes))),
         width: 0,
         height: 0,
         data_base64: None,
@@ -9977,7 +10715,10 @@ pub fn clear_notification_signal(
     project_slug: &str,
     agent_name: &str,
 ) -> SignalClearOutcome {
-    let _mutation = ArchiveMutationGuard::begin_at(&config.notifications_signals_dir);
+    // No archive mutation guard: a signal file is a wake-up hint outside the
+    // Git archive, and fetch_inbox calls this on every read. Holding the global
+    // publication fence here queued inbox reads behind whole write-behind
+    // batches, 25-30 s under load (br-kp1in.13).
     if !config.notifications_enabled {
         return SignalClearOutcome::Disabled;
     }
@@ -11686,34 +12427,92 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
     Ok(())
 }
 
-/// Best-effort cleanup of staged/index state after a failed commit attempt.
+/// Update an unstaged index without consuming an interrupted writer's evidence.
 ///
-/// Previously had a `git -C <workdir> read-tree HEAD` shell-out as a
-/// "try CLI git first, fall back to libgit2" path. Removed under bead
-/// br-8ujfs.3.5 (C5): the CLI git branch was redundant with the
-/// libgit2 recovery below (`reset_index_to_head` + `index.write`) and
-/// added a race surface against the 2.51.0 `.git/index` bug. The
-/// libgit2 path handles every case we care about — regular repos,
-/// unborn HEAD (via `try_clear_for_empty_head`), detached HEAD,
-/// submodules. See `docs/GIT_SHELLOUT_AUDIT.md` #2.
-fn try_restore_index_to_head(repo: &Repository) -> Result<()> {
-    if let Some(workdir) = repo.workdir() {
-        // Heal stale lock artifacts so the libgit2 write has a clean
-        // `.git/index` to acquire.
-        let _ = try_clean_stale_git_lock(workdir, 300.0);
+/// Hold Git's exclusive index lock from observation through atomic replacement.
+/// Dirty, conflicted, corrupt, oversized or locked indexes remain untouched.
+/// This maintenance is best-effort: the caller has already committed its tree.
+fn sync_clean_index_after_commit(
+    repo: &Repository,
+    parent: Option<&git2::Commit<'_>>,
+    committed: &git2::Tree<'_>,
+) -> Result<()> {
+    const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+    let index_path = repo.path().join("index");
+    let lock_path = repo.path().join("index.lock");
+    if path_existing_prefix_has_symlink(&index_path)?
+        || path_existing_prefix_has_symlink(&lock_path)?
+    {
+        return Err(StorageError::InvalidPath(
+            "archive index synchronization refuses symlinked paths".to_string(),
+        ));
     }
-
-    // Re-open to avoid stale ref views from long-lived handles.
-    let reopened = Repository::open(repo.path())?;
-    let mut index = reopened.index()?;
-    reset_index_to_head(&reopened, &mut index)?;
+    let lock_file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // Adopt only the lock we just created; dropping it never touches another
+    // writer's lock. On success persist consumes it by renaming it to index.
+    let mut lock = tempfile::NamedTempFile::from_parts(
+        lock_file,
+        tempfile::TempPath::try_from_path(lock_path)?,
+    );
+    let scratch = tempfile::tempdir()?;
+    let scratch_path = scratch.path().join("index");
+    match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &index_path,
+        MAX_INDEX_BYTES,
+    ) {
+        Ok(bytes) => {
+            let metadata = fs::symlink_metadata(&index_path)?;
+            if !metadata.is_file() {
+                return Err(StorageError::InvalidPath(
+                    "archive index is not a regular file".to_string(),
+                ));
+            }
+            lock.as_file().set_permissions(metadata.permissions())?;
+            let header = bytes.get(..12).ok_or_else(|| {
+                StorageError::InvalidPath("archive index header is incomplete".to_string())
+            })?;
+            if &header[..4] != b"DIRC"
+                || u32::from_be_bytes([header[8], header[9], header[10], header[11]]) > 100_000
+            {
+                return Err(StorageError::InvalidPath(
+                    "archive index format or entry budget is invalid".to_string(),
+                ));
+            }
+            fs::write(&scratch_path, bytes)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut index = git2::Index::open_ext(&scratch_path, repo.object_format())?;
+    let parent_tree = parent.map(git2::Commit::tree).transpose()?;
+    if index.has_conflicts()
+        || repo
+            .diff_tree_to_index(parent_tree.as_ref(), Some(&index), None)?
+            .deltas()
+            .len()
+            != 0
+    {
+        return Ok(());
+    }
+    index.read_tree(committed)?;
     index.write()?;
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &scratch_path,
+        MAX_INDEX_BYTES,
+    )?;
+    lock.write_all(&bytes)?;
+    lock.as_file().sync_all()?;
+    lock.persist(&index_path)
+        .map_err(|error| StorageError::Io(error.error))?;
     Ok(())
-}
-
-/// Best-effort cleanup of staged/index state after a failed commit attempt.
-fn try_restore_index(repo: &Repository) {
-    let _ = try_restore_index_to_head(repo);
 }
 
 /// Add files to the git index and create a commit.
@@ -11732,12 +12531,13 @@ fn commit_paths(
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-    // Index reset → stage → tree all run under the HEAD reference-transaction
-    // lock so the committed tree is built against a parent read in the same
-    // critical section that moves the ref (cross-process lost-update guard).
-    let result = commit_tree_advancing_head(repo, &sig, message, |repo| {
-        let mut index = repo.index()?;
-        reset_index_to_head(repo, &mut index)?;
+    // Build against the locked HEAD in a private index. The shared index may
+    // contain the only surviving reply metadata for a different message.
+    commit_tree_advancing_head(repo, &sig, message, |repo| {
+        let private_repo = Repository::open(repo.path())?;
+        let mut index = git2::Index::new_ext(repo.object_format())?;
+        private_repo.set_index(&mut index)?;
+        reset_index_to_head(&private_repo, &mut index)?;
         let mut any_added = false;
         for path in rel_paths {
             let path = validate_repo_relative_path("commit path", path)?;
@@ -11762,21 +12562,13 @@ fn commit_paths(
             }
             any_added = true;
         }
-        index.write()?;
         if !any_added {
             // Every requested path was already absent from disk and index —
             // nothing to commit (historical early-out preserved).
             return Ok(None);
         }
         Ok(Some(index.write_tree()?))
-    });
-
-    if result.is_err() {
-        try_restore_index(repo);
-        return result;
-    }
-
-    Ok(())
+    })
 }
 
 /// Add all changed files to the git index and create a commit.
@@ -11790,16 +12582,17 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-    // Same cross-process guard as `commit_paths`: the whole reset → add-all
-    // → tree sequence is a full-state snapshot built under the HEAD ref lock.
+    // The full worktree snapshot also uses a private index: overload recovery
+    // must not discard or publish unrelated staged-only message evidence.
     commit_tree_advancing_head(repo, &sig, message, |repo| {
-        let mut index = repo.index()?;
-        reset_index_to_head(repo, &mut index)?;
+        let private_repo = Repository::open(repo.path())?;
+        let mut index = git2::Index::new_ext(repo.object_format())?;
+        private_repo.set_index(&mut index)?;
+        reset_index_to_head(&private_repo, &mut index)?;
 
         // Respect .gitignore, add all changes under the workdir.
         index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
 
-        index.write()?;
         Ok(Some(index.write_tree()?))
     })?;
 
@@ -12931,6 +13724,163 @@ mod tests {
         }
     }
 
+    /// br-kp1in.29/.13: while a guard holds the publication fence the holder
+    /// record names that thread and its `begin` call site; a contending
+    /// thread takes over the record after the handoff.
+    #[test]
+    fn archive_fence_holder_names_the_holding_thread_and_call_site() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .name("fence-holder-probe".to_string())
+            .spawn(move || {
+                let begin_line = line!() + 1;
+                let guard = ArchiveMutationGuard::begin();
+                held_tx.send(begin_line).expect("report the begin line");
+                release_rx.recv().expect("wait for release");
+                drop(guard);
+            })
+            .expect("spawn fence holder");
+        let begin_line = held_rx.recv().expect("fence held");
+        let current =
+            archive_publication_fence_holder().expect("a held fence has a recorded holder");
+        assert!(
+            current.thread.starts_with("fence-holder-probe ("),
+            "{current}"
+        );
+        assert!(
+            current.site.contains(&format!("lib.rs:{begin_line}:")),
+            "{current}"
+        );
+
+        // A contender blocks (the WouldBlock path) and records itself once
+        // the holder releases.
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::Builder::new()
+            .name("fence-waiter-probe".to_string())
+            .spawn(move || {
+                let guard = ArchiveMutationGuard::begin();
+                waiter_tx
+                    .send(archive_publication_fence_holder())
+                    .expect("report the new holder");
+                drop(guard);
+            })
+            .expect("spawn fence waiter");
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        let after_handoff = waiter_rx.recv().expect("waiter acquired the fence");
+        waiter.join().expect("waiter thread");
+        assert!(
+            after_handoff.is_some_and(|holder| holder.thread.starts_with("fence-waiter-probe (")),
+            "the contender must be recorded after the handoff"
+        );
+        assert!(
+            archive_publication_fence_holder().is_none_or(|holder| {
+                !holder.thread.starts_with("fence-holder-probe")
+                    && !holder.thread.starts_with("fence-waiter-probe")
+            }),
+            "a released lease must not stay recorded"
+        );
+    }
+
+    #[test]
+    fn fence_contention_report_names_the_blocker_only_past_the_threshold() {
+        let waiter = std::panic::Location::caller();
+        let blocker = ArchiveFenceHolder {
+            thread: "commit-coalesce (ThreadId(7))".to_string(),
+            site: "crates/example.rs:10:5".to_string(),
+            held_for: Duration::from_secs(3),
+        };
+        assert_eq!(
+            fence_contention_report(
+                FENCE_WAIT_REPORT_AFTER - Duration::from_millis(1),
+                waiter,
+                Some(&blocker)
+            ),
+            None
+        );
+        let report = fence_contention_report(Duration::from_millis(2_500), waiter, Some(&blocker))
+            .expect("a wait past the threshold is reported");
+        assert!(report.contains("waited 2500 ms"), "{report}");
+        assert!(
+            report.contains(
+                "held by commit-coalesce (ThreadId(7)) at crates/example.rs:10:5 for 3000 ms"
+            ),
+            "{report}"
+        );
+        let unknown = fence_contention_report(FENCE_WAIT_REPORT_AFTER, waiter, None)
+            .expect("reported even without a recorded holder");
+        assert!(unknown.contains("an unrecorded holder"), "{unknown}");
+    }
+
+    /// br-kp1in.13: fetch_inbox clears a notification signal on every read, and
+    /// a cached directory is no mutation. Neither may queue behind the global
+    /// publication fence that a draining write-behind batch holds (observed:
+    /// inbox reads waiting 25-30 s); a real archive mutation still waits.
+    #[test]
+    fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
+        let tmp = TempDir::new().unwrap();
+        let cached_dir = tmp.path().join("cached");
+        ensure_dir(&cached_dir).expect("create and cache the directory");
+        let mut config = test_config(tmp.path());
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/proj/agents/BlueLake.signal");
+        fs::create_dir_all(signal.parent().unwrap()).unwrap();
+        fs::write(&signal, "{}").unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+
+        // On a helper thread with a deadline, so a regression fails instead
+        // of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for enabled in [false, true] {
+                config.notifications_enabled = enabled;
+                outcomes.push(clear_notification_signal(&config, "proj", "BlueLake"));
+            }
+            ensure_dir(&cached_dir).expect("cached directory");
+            done_tx.send(outcomes).expect("report outcomes");
+        });
+        let outcomes = done_rx.recv_timeout(Duration::from_secs(5));
+
+        // Negative control: a real mutation window waits while the fence is held.
+        let (mutated_tx, mutated_rx) = std::sync::mpsc::channel();
+        let mutator = std::thread::spawn(move || {
+            let _guard = ArchiveMutationGuard::begin();
+            mutated_tx.send(()).expect("report the mutation");
+        });
+        let mutation_waited = mutated_rx.recv_timeout(Duration::from_millis(300)).is_err();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        mutated_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the mutation proceeds once the fence is released");
+        mutator.join().expect("mutator thread");
+        probe.join().expect("probe thread");
+
+        assert_eq!(
+            outcomes.expect("signal clears and a cached ensure_dir must not wait for the fence"),
+            vec![SignalClearOutcome::Disabled, SignalClearOutcome::Cleared]
+        );
+        assert!(!signal.exists(), "the enabled clear removed the signal");
+        assert!(
+            mutation_waited,
+            "a real archive mutation waits for the held fence"
+        );
+    }
+
     #[test]
     fn ensure_archive_root_refuses_default_root_under_test_harness() {
         // br-99aih: every archive write funnels through `ensure_archive_root`,
@@ -13734,6 +14684,66 @@ mod tests {
             1,
             "duplicate-id rejection must not create a second canonical file"
         );
+    }
+
+    /// br-dgut7: the canonical-id index parses a message file once, re-parses
+    /// only files whose stamp changed, forgets deleted files, and trusts
+    /// nothing that changed within the racy window of its parse.
+    #[test]
+    fn canonical_id_index_reparses_only_new_or_changed_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("messages");
+        let month = root.join("2026").join("09");
+        fs::create_dir_all(&month).unwrap();
+        let write = |name: &str, id: i64, body: &str| {
+            let message = serde_json::json!({ "id": id, "subject": name });
+            let content = render_message_bundle_content(&message, body).unwrap();
+            fs::write(month.join(name), content).unwrap();
+        };
+        let names = |index: &HashMap<i64, Vec<PathBuf>>, id: i64| -> Vec<String> {
+            index.get(&id).map_or_else(Vec::new, |paths| {
+                paths
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect()
+            })
+        };
+        write("a__1.md", 1, "a");
+        write("b__2.md", 2, "b");
+        write("c__3.md", 3, "c");
+        let wanted = HashSet::from([1, 2, 3, 9]);
+
+        let (first, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 3);
+        assert_eq!(names(&first, 2), ["b__2.md"]);
+        let (second, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 0, "unchanged files must be served from the cache");
+        assert_eq!(second, first);
+
+        // In-place rewrite to another id: a cache keyed by path alone would
+        // keep reporting id 2 and miss a collision on id 9.
+        write("b__2.md", 9, "b, rewritten under another id");
+        let (rewritten, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 1);
+        assert!(names(&rewritten, 2).is_empty());
+        assert_eq!(names(&rewritten, 9), ["b__2.md"]);
+
+        fs::remove_file(month.join("c__3.md")).unwrap();
+        let (deleted, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 0);
+        assert!(names(&deleted, 3).is_empty());
+
+        // Every file changed within an hour of its parse: nothing is trusted.
+        let (_, parsed) = collect_canonical_message_id_index_with_window(
+            &root,
+            &wanted,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(parsed, 2);
     }
 
     #[test]
@@ -16611,6 +17621,13 @@ mod tests {
         second_rel_paths.sort();
         assert_eq!(second_rel_paths, first_rel_paths);
         assert_eq!(second.meta.sha1, first_sha1);
+        let stored_bytes =
+            fs::read(archive.repo_root.join(first.meta.path.as_ref().unwrap())).unwrap();
+        assert_eq!(
+            first.meta.content_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&stored_bytes)).as_str())
+        );
+        assert_eq!(second.meta.content_sha256, first.meta.content_sha256);
         assert_eq!(second.meta.width, first.meta.width);
         assert_eq!(second.meta.height, first.meta.height);
         assert_eq!(second.meta.kind, "file");
@@ -16654,6 +17671,8 @@ mod tests {
         // Cache hit — inline mode re-reads the WebP and base64-encodes it.
         let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::Inline).unwrap();
         assert_eq!(second.meta.kind, "inline");
+        assert!(first.meta.content_sha256.is_some());
+        assert_eq!(second.meta.content_sha256, first.meta.content_sha256);
         assert_eq!(
             second.meta.data_base64.unwrap(),
             first_b64,
@@ -17761,6 +18780,99 @@ mod tests {
         );
     }
 
+    /// br-kp1in.23: a WBQ drain blocked mid-batch must show up as archive lag.
+    /// Holding the process-global publication fence reproduces the observed
+    /// 2026-09-23 shape (drain thread parked on a futex) without timing tricks.
+    #[test]
+    fn archive_lag_reports_wbq_batch_blocked_in_flight() {
+        wbq_start();
+        let fence = ArchiveMutationGuard::begin();
+        assert_eq!(
+            wbq_enqueue(wbq_test_clear_signal_op("lag-inflight")),
+            WbqEnqueueResult::Enqueued
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while archive_lag_snapshot().wbq_inflight_execution_us == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "drain never dequeued the op while the fence was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(1_200));
+
+        let stuck = archive_lag_snapshot();
+        assert!(
+            stuck.wbq_inflight_execution_us >= 1_000_000,
+            "a batch blocked for >1 s must report its execution time: {stuck:?}"
+        );
+        assert!(
+            stuck.wbq_inflight_oldest_age_us >= stuck.wbq_inflight_execution_us,
+            "the oldest in-flight op was enqueued before its batch was dequeued: {stuck:?}"
+        );
+        assert!(
+            stuck.oldest_unmaterialized_us >= stuck.wbq_inflight_oldest_age_us,
+            "overall lag must include the blocked WBQ batch: {stuck:?}"
+        );
+
+        drop(fence);
+        assert_eq!(
+            wbq_flush_status(),
+            WbqFlushOutcome::Drained,
+            "releasing the fence must let the blocked batch drain"
+        );
+        let after = archive_lag_snapshot();
+        assert_eq!(
+            (
+                after.wbq_inflight_execution_us,
+                after.wbq_inflight_oldest_age_us
+            ),
+            (0, 0),
+            "completed batches must not keep reporting lag: {after:?}"
+        );
+    }
+
+    #[test]
+    fn wbq_inflight_ages_are_zero_without_a_batch_and_saturate() {
+        wbq_clear_batch_in_flight();
+        assert_eq!(wbq_inflight_ages_us(1_000_000), (0, 0));
+        WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(400, Ordering::Relaxed);
+        WBQ_INFLIGHT_SINCE_US.store(900, Ordering::Relaxed);
+        assert_eq!(wbq_inflight_ages_us(1_000), (600, 100));
+        // A clock step backwards never produces a huge bogus age.
+        assert_eq!(wbq_inflight_ages_us(100), (0, 0));
+        wbq_clear_batch_in_flight();
+    }
+
+    /// br-kp1in.23: queued work with no completed op is a stall even when no
+    /// batch is in flight (dead drain), but a fresh backlog after a long idle
+    /// period is not.
+    #[test]
+    fn wbq_since_progress_measures_waiting_work_not_idle_time() {
+        // Empty queue: never a stall, however old the last progress.
+        assert_eq!(wbq_since_progress_us(10_000_000, 0, 1, 0), 0);
+        // Drain dead since it started at t=1 s with salvaged work queued.
+        assert_eq!(
+            wbq_since_progress_us(61_000_000, 5, 1_000_000, 0),
+            60_000_000
+        );
+        // Idle for an hour, then one op enqueued 2 ms ago: 2 ms, not an hour.
+        assert_eq!(
+            wbq_since_progress_us(3_600_002_000, 1, 1, 3_600_000_000),
+            2_000
+        );
+        // Steady load: measured from the last completed op.
+        assert_eq!(
+            wbq_since_progress_us(5_000_500, 40, 5_000_000, 1_000_000),
+            500
+        );
+        // No anchor at all: report nothing rather than a bogus stall.
+        assert_eq!(wbq_since_progress_us(5_000_000, 3, 0, 0), 0);
+        // Clock stepped backwards: saturate at 0.
+        assert_eq!(wbq_since_progress_us(10, 3, 1_000, 0), 0);
+    }
+
     #[test]
     fn wbq_stats_tracks_enqueues() {
         wbq_start();
@@ -18411,6 +19523,247 @@ mod tests {
     }
 
     #[test]
+    fn archive_lag_reports_coalescer_batch_blocked_in_flight() {
+        if !isolated_coalescer_regression(
+            "tests::archive_lag_reports_coalescer_batch_blocked_in_flight",
+        ) {
+            return;
+        }
+
+        let coalescer = get_commit_coalescer();
+        for spill in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            fs::write(tmp.path().join("pending.txt"), b"archive durability\n").unwrap();
+            let mut config = test_config(tmp.path());
+            config.coalescer_queue_cap = if spill { 0 } else { 32 };
+
+            // Exercise the real Git path after the worker takes ownership.
+            // The publication fence blocks commit_paths_lockfree before Git
+            // can publish the file, with no WBQ or retry-backlog operations.
+            let fence = ArchiveMutationGuard::begin();
+            coalescer.enqueue(
+                tmp.path().to_path_buf(),
+                &config,
+                "pending archive commit".to_string(),
+                vec!["pending.txt".to_string()],
+            );
+            let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(tmp.path()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !rq.processing.load(Ordering::Acquire) || rq.depth.load(Ordering::Relaxed) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "coalescer never acquired the batch"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            let stuck = archive_lag_snapshot();
+            assert_eq!(stuck.coalescer_pending, 1, "{stuck:?}");
+            assert_eq!((stuck.wbq_depth, stuck.backlog_depth), (0, 0));
+            assert!(stuck.coalescer_oldest_age_us >= 1_000, "{stuck:?}");
+            assert!(stuck.coalescer_since_progress_us >= 1_000, "{stuck:?}");
+            assert!(stuck.oldest_unmaterialized_us >= stuck.coalescer_oldest_age_us);
+            assert!(
+                repo.head().is_err(),
+                "the blocked request must not be committed yet"
+            );
+
+            drop(fence);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while coalescer.pending_requests() != 0 || rq.processing.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "released batch did not commit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let tree = repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap();
+            let entry = tree.get_path(Path::new("pending.txt")).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                b"archive durability\n"
+            );
+            let drained = archive_lag_snapshot();
+            assert_eq!(drained.coalescer_pending, 0);
+            assert_eq!(drained.coalescer_oldest_age_us, 0);
+            assert_eq!(drained.coalescer_since_progress_us, 0);
+        }
+    }
+
+    #[test]
+    fn coalescer_worker_recovers_pending_work_without_wake_token() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_worker_recovers_pending_work_without_wake_token",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("recovered.txt"), b"recovered wake\n").unwrap();
+        let rq = Arc::new(RepoQueue::default());
+        coalescer_requeue_requests(
+            &rq,
+            vec![CoalescerCommitFields {
+                enqueued_at: Instant::now(),
+                enqueued_wall: Utc::now(),
+                git_author_name: "Recovery".to_string(),
+                git_author_email: "recovery@example.com".to_string(),
+                message: "recover a consumed wake notification".to_string(),
+                rel_paths: vec!["recovered.txt".to_string()],
+            }],
+        );
+        let repos = Arc::new(Mutex::new(HashMap::from([(tmp.path().to_path_buf(), rq)])));
+        // This is the state left when a peer consumes the notification before
+        // the old worker releases processing: pending work, no wake token.
+        let work_cv = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(1));
+        let worker_cv = Arc::clone(&work_cv);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_pending = Arc::clone(&pending);
+        let worker = std::thread::Builder::new()
+            .name("coalescer-lost-wake-regression".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || {
+                coalescer_pool_worker(
+                    repos,
+                    worker_cv,
+                    worker_shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(CommitQueueStats::default())),
+                    Arc::new(Mutex::new(VecDeque::new())),
+                    worker_pending,
+                    Duration::from_millis(10),
+                    1,
+                );
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let drained = pending.load(Ordering::Relaxed) == 0;
+        shutdown.store(true, Ordering::Release);
+        work_cv.1.notify_all();
+        worker
+            .join()
+            .expect("worker exits after bounded regression");
+        assert!(
+            drained,
+            "the idle safety probe must drain work without another enqueue or flush"
+        );
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("recovered.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"recovered wake\n"
+        );
+    }
+
+    #[test]
+    fn coalescer_failed_commit_retains_lag_and_recovers_without_enqueue() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_failed_commit_retains_lag_and_recovers_without_enqueue",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("retry.txt"), b"retained request\n").unwrap();
+        let coalescer = get_commit_coalescer();
+        // Opening a repository fails until Git initialization below. The
+        // original request must survive this real failure and retry itself.
+        coalescer.enqueue(
+            tmp.path().to_path_buf(),
+            &test_config(tmp.path()),
+            "retry after archive initialization".to_string(),
+            vec!["retry.txt".to_string()],
+        );
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(tmp.path()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rq.metrics.errors_total.load(Ordering::Relaxed) == 0
+            || rq.processing.load(Ordering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not expose the failed commit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let failed = archive_lag_snapshot();
+        assert_eq!(failed.coalescer_pending, 1);
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 1);
+        assert!(failed.coalescer_oldest_age_us > 0, "{failed:?}");
+        assert!(failed.coalescer_since_progress_us > 0, "{failed:?}");
+
+        let repo = Repository::init(tmp.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coalescer.pending_requests() != 0 || rq.processing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "retained request never retried successfully"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("retry.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"retained request\n"
+        );
+        assert_eq!(coalescer.lag_state(), CoalescerLagState::default());
+    }
+
+    fn isolated_coalescer_regression(test_name: &str) -> bool {
+        const CHILD: &str = "AM_TEST_COALESCER_PROGRESS_CASE";
+        if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+            return true;
+        }
+        // These tests hold a process-wide archive fence or exercise the global
+        // health snapshot. A fresh process isolates other tests' workers and
+        // keeps all archive recovery state under a temporary storage root.
+        let isolated = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env("STORAGE_ROOT", isolated.path())
+            .env("AM_ARCHIVE_BATCH_EVENTS", "1")
+            .env("AM_COALESCER_MAX_WORKERS", "2")
+            .output()
+            .expect("run isolated coalescer regression");
+        assert!(
+            output.status.success(),
+            "{test_name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "the exact child selector must execute one regression: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        false
+    }
+
+    #[test]
     fn commit_coalescer_oldest_pending_age_tracks_enqueue() {
         // Long flush interval so the worker cannot drain during the test window.
         let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
@@ -18578,6 +19931,213 @@ mod tests {
     }
 
     #[test]
+    fn wbq_restart_admission_is_atomic_with_salvage() {
+        const CHILD: &str = "AM_TEST_WBQ_RESTART_ADMISSION";
+        const COMPLETED: &str = "WBQ restart admission verified";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_restart_admission_is_atomic_with_salvage",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("STORAGE_ROOT", isolated.path())
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .expect("isolated WBQ restart race");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        // A deadlock must fail this isolated test instead of hanging the suite.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(15));
+            eprintln!("WBQ restart admission watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "restart-admission".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/restart-admission/agents/{agent}.signal"))
+        };
+        let finish_drain = |wbq: &WriteBehindQueue| {
+            let sender = wbq_sender_clone(wbq).expect("replacement sender");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline)
+                .expect("flush admission");
+            done_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("replacement must drain all admitted work");
+            wbq_send_control_with_deadline(&sender, WbqMsg::Shutdown, deadline)
+                .expect("shutdown admission");
+            let handle = wbq.drain_handle.lock().take().expect("drain handle");
+            handle.join().expect("bounded drain shutdown");
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        };
+
+        // First race: an old-generation producer has reserved its depth but
+        // has not published the message when another caller starts salvage.
+        let wbq = Arc::new(new_write_behind_queue());
+        let (old_sender, old_receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.receiver_slot.lock().unwrap() = Some(old_receiver);
+        *wbq.sender.lock().unwrap() = Some(old_sender.clone());
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let producer_wbq = Arc::clone(&wbq);
+        let producer_sender = old_sender.clone();
+        let admitted_op = signal_op("GreenCastle");
+        let producer = std::thread::spawn(move || {
+            WBQ_AFTER_RESERVE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    reserved_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume reserved producer");
+                }));
+            });
+            wbq_enqueue_with_sender_admission(
+                &producer_sender,
+                producer_wbq.op_depth.as_ref(),
+                admitted_op,
+                Some(&producer_wbq.lifecycle),
+            )
+        });
+        reserved_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer must reserve before publication");
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(
+                wbq.lifecycle.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "restart must not replace accounting while an admission is unfinished"
+        );
+        let restart_wbq = Arc::clone(&wbq);
+        let (starting_tx, starting_rx) = std::sync::mpsc::sync_channel(1);
+        let restart = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            wbq_start_inner(&restart_wbq);
+        });
+        starting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(producer.join().unwrap(), WbqEnqueueResult::Enqueued);
+        restart.join().expect("restart after completed admission");
+        finish_drain(&wbq);
+        assert!(signal_path("GreenCastle").is_file());
+
+        // Second race: salvage has copied the old channel, but has not dropped
+        // its receiver yet. A stale sender must never acknowledge new work in
+        // this gap: that work would miss salvage and be discarded on drop.
+        let wbq = Arc::new(new_write_behind_queue());
+        let (old_sender, old_receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.receiver_slot.lock().unwrap() = Some(old_receiver);
+        *wbq.sender.lock().unwrap() = Some(old_sender.clone());
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("BronzeHare"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::Enqueued
+        );
+        let (salvaged_tx, salvaged_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::sync_channel(1);
+        let (spawn_tx, spawn_rx) = std::sync::mpsc::sync_channel(1);
+        let restart_wbq = Arc::clone(&wbq);
+        let restart = std::thread::spawn(move || {
+            WBQ_AFTER_SALVAGE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    salvaged_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume completed salvage pass");
+                }));
+            });
+            WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    replaced_tx.send(()).unwrap();
+                    spawn_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("allow replacement drain to spawn");
+                }));
+            });
+            wbq_start_inner(&restart_wbq);
+        });
+        salvaged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("CobaltRobin"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+            "an old sender cannot publish behind the completed salvage pass"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "restart contention must respect the enqueue budget"
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 1);
+        resume_tx.send(()).unwrap();
+        replaced_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the real replacement worker from dequeuing its salvaged op
+        // until the stale producer has completed its rejected admission.
+        let receiver_guard = wbq.receiver_slot.lock().unwrap();
+        spawn_tx.send(()).unwrap();
+        restart.join().expect("finish replacement generation");
+        // Even after restart, a stale sender's rejected attempt must balance
+        // its own accounting without subtracting salvaged replacement work.
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("SilverFox"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::QueueUnavailable
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 1);
+        drop(receiver_guard);
+        finish_drain(&wbq);
+        assert!(signal_path("BronzeHare").is_file());
+        assert!(!signal_path("CobaltRobin").exists());
+        assert!(!signal_path("SilverFox").exists());
+        assert_eq!(wbq_stats().enqueued, 2);
+        assert_eq!(wbq_stats().drained, 2);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        assert_eq!(metrics.storage.wbq_respawn_salvaged_total.load(), 2);
+        assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), 0);
+        println!("{COMPLETED}");
+    }
+
+    #[test]
     fn wbq_file_reservation_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -18683,6 +20243,128 @@ mod tests {
     }
 
     #[test]
+    fn wbq_enqueue_accounting_precedes_observable_work() {
+        const CHILD: &str = "AM_TEST_WBQ_PUBLICATION_ACCOUNTING";
+        const COMPLETED: &str = "WBQ publication accounting verified";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_enqueue_accounting_precedes_observable_work",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        // Global health counters must belong only to this real producer/drain
+        // pair; a fresh process prevents another test's WBQ from masking drift.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_path = config
+            .notifications_signals_dir
+            .join("projects/accounting/agents/BlueLake.signal");
+        let wbq = new_write_behind_queue();
+        wbq_start_inner(&wbq);
+        let sender = wbq_sender_clone(&wbq).unwrap();
+        let flush_sender = sender.clone();
+        let depth = Arc::clone(&wbq.op_depth);
+        let observed_signal = signal_path.clone();
+        WBQ_AFTER_PUBLISH_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+                wbq_send_control_with_deadline(&flush_sender, WbqMsg::Flush(done_tx), deadline)
+                    .expect("flush must enter the live channel");
+                done_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("real drain must finish before the producer resumes");
+                assert!(observed_signal.is_file(), "the actual write must have run");
+                assert_eq!(depth.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    mcp_agent_mail_core::global_metrics()
+                        .storage
+                        .wbq_depth
+                        .load(),
+                    0,
+                );
+            }));
+        });
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &sender,
+                wbq.op_depth.as_ref(),
+                WriteOp::NotificationSignal {
+                    config,
+                    project_slug: "accounting".to_string(),
+                    agent_name: "BlueLake".to_string(),
+                    metadata: None,
+                },
+            ),
+            WbqEnqueueResult::Enqueued,
+        );
+        assert!(signal_path.is_file());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(archive_lag_snapshot().wbq_since_progress_us, 0);
+        assert_eq!(wbq_stats().enqueued, 1);
+        assert_eq!(wbq_stats().drained, 1);
+
+        wbq_send_control_with_deadline(
+            &sender,
+            WbqMsg::Shutdown,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let handle = wbq.drain_handle.lock().take().unwrap();
+        handle.join().expect("drain must shut down cleanly");
+
+        // A disconnected publication and a full-channel timeout roll back
+        // their accounting without changing accepted/drained totals.
+        let (disconnected, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        let rejected_depth = AtomicU64::new(0);
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &disconnected,
+                &rejected_depth,
+                wbq_test_clear_signal_op("accounting-disconnected"),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        let (full, receiver) = std::sync::mpsc::sync_channel(1);
+        full.try_send(WbqMsg::Flush(std::sync::mpsc::sync_channel(1).0))
+            .unwrap();
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &full,
+                &rejected_depth,
+                wbq_test_clear_signal_op("accounting-full"),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        assert!(matches!(receiver.try_recv(), Ok(WbqMsg::Flush(_))));
+        assert_eq!(rejected_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(archive_lag_snapshot().wbq_since_progress_us, 0);
+        assert_eq!(wbq_stats().enqueued, 1);
+        assert_eq!(wbq_stats().drained, 1);
+        println!("{COMPLETED}");
+    }
+
+    #[test]
     fn wbq_enqueue_with_sender_times_out_when_channel_stays_full() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         tx.send(WbqMsg::Op(WbqOpEnvelope {
@@ -18731,6 +20413,81 @@ mod tests {
         drain.join().expect("drain helper should not panic");
         assert_eq!(result, WbqEnqueueResult::Enqueued);
         assert_eq!(op_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wbq_enqueue_honors_configured_deadline_in_fresh_process() {
+        const CHILD_TIMEOUT: &str = "AM_TEST_WBQ_CONFIGURED_TIMEOUT";
+        const COMPLETED: &str = "configured WBQ deadline verified";
+        if let Ok(timeout) = std::env::var(CHILD_TIMEOUT) {
+            let timeout: u64 = timeout.parse().unwrap();
+            assert_eq!(Config::get().wbq_enqueue_timeout_ms, timeout);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(WbqMsg::Op(WbqOpEnvelope {
+                enqueued_at: Instant::now(),
+                op: Box::new(wbq_test_clear_signal_op("configured-prefill")),
+            }))
+            .unwrap();
+            // Release real channel pressure after the old hardcoded 100 ms
+            // deadline, but before the configured long deadline. The short
+            // deadline must refuse without consuming or replacing the first op.
+            let drain = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let second = rx.recv_timeout(Duration::from_secs(5));
+                (first, second)
+            });
+            let depth = AtomicU64::new(0);
+            let result =
+                wbq_enqueue_with_sender(&tx, &depth, wbq_test_clear_signal_op("configured-second"));
+            drop(tx);
+            let (first, second) = drain.join().unwrap();
+            assert!(matches!(
+                first,
+                WbqMsg::Op(envelope)
+                    if matches!(&*envelope.op, WriteOp::ClearSignal { project_slug, .. }
+                        if project_slug == "configured-prefill")
+            ));
+            if timeout > 500 {
+                assert_eq!(result, WbqEnqueueResult::Enqueued);
+                assert_eq!(depth.load(Ordering::Relaxed), 1);
+                assert!(matches!(
+                    second.unwrap(),
+                    WbqMsg::Op(envelope)
+                        if matches!(&*envelope.op, WriteOp::ClearSignal { project_slug, .. }
+                            if project_slug == "configured-second")
+                ));
+            } else {
+                assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+                assert_eq!(depth.load(Ordering::Relaxed), 0);
+                assert!(matches!(
+                    second,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                ));
+            }
+            println!("{COMPLETED}");
+            return;
+        }
+
+        for timeout in ["2500", "10"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_enqueue_honors_configured_deadline_in_fresh_process",
+                    "--nocapture",
+                ])
+                .env(CHILD_TIMEOUT, timeout)
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", timeout)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "timeout={timeout}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+        }
     }
 
     #[test]
@@ -19879,7 +21636,7 @@ mod tests {
                 WbqEnqueueResult::Enqueued => actually_enqueued += 1,
                 WbqEnqueueResult::SkippedDiskCritical => {}
                 WbqEnqueueResult::QueueUnavailable => {
-                    panic!("WBQ should not become unavailable during burst (op {i})");
+                    panic!("WBQ should not become unavailable during burst (op {i})"); // ubs:ignore -- Test-only assertion: unavailable burst operations must fail the test.
                 }
             }
         }
@@ -20322,6 +22079,7 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!(
+                    // ubs:ignore -- Test-only deadline assertion: incomplete draining must fail the test.
                     "WBQ drain did not complete within 10s \
                      (enqueued {actually_enqueued}, drained delta {drained_delta})"
                 );
@@ -20409,6 +22167,93 @@ mod tests {
     }
 
     // ── Lock-free commit tests ────────────────────────────────────────
+
+    #[test]
+    fn archive_commit_strategies_preserve_staged_locked_and_corrupt_indexes() {
+        for strategy in 0..3 {
+            for state in ["clean", "staged", "locked", "corrupt"] {
+                let tmp = TempDir::new().unwrap();
+                let retained = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "index-preservation").unwrap();
+                let repo = Repository::open(&archive.repo_root).unwrap();
+                let mut index = repo.index().unwrap();
+                if state == "staged" {
+                    let staged = archive.root.join("staged-only.txt");
+                    fs::write(&staged, "irreplaceable staged evidence").unwrap();
+                    let relative = rel_path_cached(&archive.canonical_repo_root, &staged).unwrap();
+                    index.add_path(Path::new(&relative)).unwrap();
+                    fs::rename(&staged, retained.path().join("evidence.txt")).unwrap();
+                }
+                index.write().unwrap();
+                drop(index);
+                let index_path = repo.path().join("index");
+                let lock_path = repo.path().join("index.lock");
+                if state == "corrupt" {
+                    fs::write(&index_path, "invalid retained index evidence").unwrap();
+                }
+                if state == "locked" {
+                    fs::write(&lock_path, "another writer owns this lock").unwrap();
+                }
+                let before_index = fs::read(&index_path).unwrap();
+                let before_head = resolve_head_commit_oid(&repo).unwrap();
+                let commit = |paths: &[&str]| match strategy {
+                    0 => commit_paths_lockfree(&repo, &config, "private tree commit", paths),
+                    1 => commit_paths(&repo, &config, "private index commit", paths),
+                    _ => commit_all(&repo, &config, "private full commit"),
+                };
+                if strategy != 2 {
+                    assert!(commit(&["../foreign.txt"]).is_err());
+                    assert_eq!(fs::read(&index_path).unwrap(), before_index);
+                    assert_eq!(resolve_head_commit_oid(&repo).unwrap(), before_head);
+                }
+                let ordinary = archive.root.join("ordinary.txt");
+                fs::write(&ordinary, "ordinary committed content").unwrap();
+                let relative = rel_path_cached(&archive.canonical_repo_root, &ordinary).unwrap();
+                commit(&[relative.as_str()]).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                assert!(tree.get_path(Path::new(&relative)).is_ok());
+                let staged_relative = rel_path_cached(
+                    &archive.canonical_repo_root,
+                    &archive.root.join("staged-only.txt"),
+                )
+                .unwrap();
+                assert!(tree.get_path(Path::new(&staged_relative)).is_err());
+                if state == "clean" {
+                    let reopened = Repository::open(&archive.repo_root).unwrap();
+                    assert_eq!(
+                        reopened
+                            .diff_tree_to_index(Some(&tree), None, None)
+                            .unwrap()
+                            .deltas()
+                            .len(),
+                        0,
+                        "strategy {strategy} must keep an unstaged index clean",
+                    );
+                } else {
+                    assert_eq!(
+                        fs::read(&index_path).unwrap(),
+                        before_index,
+                        "strategy {strategy}, state {state}",
+                    );
+                }
+                if state == "staged" {
+                    assert_eq!(
+                        fs::read(retained.path().join("evidence.txt")).unwrap(),
+                        b"irreplaceable staged evidence",
+                    );
+                }
+                if state == "locked" {
+                    assert_eq!(
+                        fs::read(&lock_path).unwrap(),
+                        b"another writer owns this lock",
+                    );
+                } else {
+                    assert!(!lock_path.exists());
+                }
+            }
+        }
+    }
 
     #[test]
     fn lockfree_commit_single_file_success() {
@@ -20772,6 +22617,80 @@ mod tests {
         );
     }
 
+    /// br-1l9mc: a writer killed inside the reference transaction leaves
+    /// `<ref>.lock`. The next commit moves an old, unheld lock aside instead of
+    /// failing on it forever, and leaves a fresh or held lock alone.
+    #[test]
+    fn commit_quarantines_only_a_stale_unheld_ref_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "stale-ref-lock").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        let commit = |version: u32| {
+            fs::write(
+                &file_path,
+                format!(r#"{{"name":"TestAgent","v":{version}}}"#),
+            )
+            .unwrap();
+            commit_paths_lockfree(&repo, &config, "ref lock", &[rel.as_str()])
+        };
+        commit(1).expect("initial commit");
+        let refname = repo
+            .head()
+            .unwrap()
+            .name()
+            .expect("head refname")
+            .to_string();
+        let lock_path = repo.path().join(format!("{refname}.lock"));
+        let quarantine_prefix = format!("{}.lock", refname.replace('/', "-"));
+        let quarantined = || {
+            fs::read_dir(repo.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&quarantine_prefix)
+                })
+                .count()
+        };
+        // Older than both thresholds, so the unprobed path agrees on it too.
+        let long_ago = SystemTime::now() - Duration::from_secs(700);
+
+        // A fresh lock is a live transaction as far as anyone can tell.
+        drop(fs::File::create(&lock_path).unwrap());
+        let error = commit(2).expect_err("a fresh ref lock blocks the commit");
+        assert!(error.to_string().contains("lock"), "{error}");
+        assert!(lock_path.exists());
+
+        // An old lock that a live process holds open is still live.
+        let held = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        held.set_modified(long_ago).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            commit(3).expect_err("a held ref lock blocks the commit");
+            assert!(lock_path.exists());
+        }
+        drop(held);
+
+        // Old and unheld: the leftover of a dead writer.
+        assert_eq!(quarantined(), 0);
+        let head_before = repo.head().unwrap().target();
+        commit(4).expect("the stale ref lock is moved aside and the commit lands");
+        assert!(!lock_path.exists());
+        assert_eq!(quarantined(), 1, "the lock is moved aside, not deleted");
+        assert_ne!(repo.head().unwrap().target(), head_before);
+        assert_eq!(
+            repo.branches(None).unwrap().count(),
+            1,
+            "Git does not read the quarantined lock as a branch"
+        );
+    }
+
     /// Cross-process lost-update guard: two independently opened Repository
     /// handles (the in-process analog of two server processes sharing one
     /// storage root) commit concurrently. The reference-transaction lock must
@@ -20960,7 +22879,7 @@ mod tests {
                     }
                 }
                 if let Some(e) = last_err {
-                    panic!("agent {i} commit failed after retries: {e}");
+                    panic!("agent {i} commit failed after retries: {e}"); // ubs:ignore -- Test-only assertion: exhausted concurrent commit retries must fail the test.
                 }
             }));
         }

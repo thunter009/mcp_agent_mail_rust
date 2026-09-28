@@ -931,6 +931,56 @@ pub const fn read_fd_limits() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
+/// Soft `RLIMIT_NOFILE` a server process requests at startup (br-kp1in.17).
+///
+/// The systemd user-unit default soft limit is 1,024; on 2026-09-23 a v0.3.36
+/// server exhausted it within a minute of mixed load and a long-lived daemon
+/// exhausted 2,048 within a day. Raising toward the (usually far higher) hard
+/// limit is defense in depth, not a fix for a leak.
+pub const SERVER_FD_SOFT_LIMIT_TARGET: u64 = 65_536;
+
+/// Soft limit to request: raise toward `target`, never above `hard`, and never
+/// lower an already higher soft limit.
+#[must_use]
+pub const fn desired_fd_soft_limit(soft: u64, hard: u64, target: u64) -> u64 {
+    let capped = if target < hard { target } else { hard };
+    if soft >= capped { soft } else { capped }
+}
+
+/// Raise this process's soft `RLIMIT_NOFILE` toward `target`.
+///
+/// Returns `(before, after)` soft limits, or `None` when the limit cannot be
+/// read or no increase could be applied.
+#[cfg(unix)]
+#[must_use]
+pub fn raise_fd_soft_limit(target: u64) -> Option<(u64, u64)> {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    /// macOS rejects soft limits above `OPEN_MAX` even when hard is unlimited.
+    const MACOS_OPEN_MAX: u64 = 10_240;
+
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+    let desired = desired_fd_soft_limit(soft, hard, target);
+    if desired == soft {
+        return Some((soft, soft));
+    }
+    if setrlimit(Resource::RLIMIT_NOFILE, desired, hard).is_ok() {
+        return Some((soft, desired));
+    }
+    let fallback = desired_fd_soft_limit(soft, hard, MACOS_OPEN_MAX);
+    if fallback > soft && setrlimit(Resource::RLIMIT_NOFILE, fallback, hard).is_ok() {
+        return Some((soft, fallback));
+    }
+    None
+}
+
+/// Raise this process's soft `RLIMIT_NOFILE` (unsupported platform stub).
+#[cfg(not(unix))]
+#[must_use]
+pub const fn raise_fd_soft_limit(_target: u64) -> Option<(u64, u64)> {
+    None
+}
+
 /// Count open file descriptors for the current process.
 ///
 /// Linux counts `/proc/self/fd` entries; other platforms (and unreadable
@@ -965,6 +1015,120 @@ pub fn fd_metrics_snapshot() -> FdMetricsSnapshot {
         open_fds,
         utilization_pct,
     }
+}
+
+/// Length of one descriptor-floor window (br-kp1in.17 leak detector).
+pub const DESCRIPTOR_FLOOR_WINDOW: std::time::Duration = std::time::Duration::from_mins(30);
+/// Consecutive windows whose floors must all rise before growth is reported.
+pub const DESCRIPTOR_FLOOR_WINDOWS: usize = 6;
+/// Minimum total rise of the floor across those windows.
+pub const DESCRIPTOR_FLOOR_MIN_RISE: u64 = 64;
+
+/// A descriptor floor that rose in every recent window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DescriptorFloorGrowth {
+    /// Floors (minimum open descriptors) of the last windows, oldest first.
+    pub floors: Vec<u64>,
+    /// Growth of the floor per hour across those windows.
+    pub per_hour: u64,
+}
+
+/// Floors of one process's open-descriptor count over consecutive windows.
+///
+/// The count churns with pooled connections, Git children and HTTP sockets,
+/// so single samples say little; a leak raises the floor, the minimum seen in
+/// each window. Growth is reported when the last `windows` floors rise
+/// strictly and by at least `min_rise` in total. The v0.3.36 leak (~2,000
+/// descriptors a day) took a live daemon down before anything flagged it.
+#[derive(Debug)]
+pub struct DescriptorFloorTracker {
+    window_us: u64,
+    windows: usize,
+    min_rise: u64,
+    /// Start of the open window and the lowest count seen in it.
+    current: Option<(u64, u64)>,
+    floors: std::collections::VecDeque<u64>,
+}
+
+impl DescriptorFloorTracker {
+    #[must_use]
+    pub fn new(window: std::time::Duration, windows: usize, min_rise: u64) -> Self {
+        Self {
+            window_us: u64::try_from(window.as_micros()).unwrap_or(u64::MAX).max(1),
+            windows: windows.max(2),
+            min_rise,
+            current: None,
+            floors: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Record one sample taken at `now_us` on a monotonic microsecond clock.
+    pub fn record(&mut self, now_us: u64, open_fds: u64) {
+        self.current = match self.current {
+            Some((start, floor)) if now_us.saturating_sub(start) < self.window_us => {
+                Some((start, floor.min(open_fds)))
+            }
+            Some((_, floor)) => {
+                self.floors.push_back(floor);
+                while self.floors.len() > self.windows {
+                    self.floors.pop_front();
+                }
+                Some((now_us, open_fds))
+            }
+            None => Some((now_us, open_fds)),
+        };
+    }
+
+    /// The rising floor series, if every one of the last windows rose.
+    #[must_use]
+    pub fn growth(&self) -> Option<DescriptorFloorGrowth> {
+        if self.floors.len() < self.windows {
+            return None;
+        }
+        let rising = self
+            .floors
+            .iter()
+            .zip(self.floors.iter().skip(1))
+            .all(|(earlier, later)| later > earlier);
+        let rise = self.floors.back()? - self.floors.front()?;
+        if !rising || rise < self.min_rise {
+            return None;
+        }
+        let span_us = self
+            .window_us
+            .saturating_mul(u64::try_from(self.windows - 1).unwrap_or(u64::MAX));
+        let per_hour = u64::try_from(u128::from(rise) * 3_600_000_000 / u128::from(span_us.max(1)))
+            .unwrap_or(u64::MAX);
+        Some(DescriptorFloorGrowth {
+            floors: self.floors.iter().copied().collect(),
+            per_hour,
+        })
+    }
+}
+
+static DESCRIPTOR_FLOORS: LazyLock<Mutex<DescriptorFloorTracker>> = LazyLock::new(|| {
+    Mutex::new(DescriptorFloorTracker::new(
+        DESCRIPTOR_FLOOR_WINDOW,
+        DESCRIPTOR_FLOOR_WINDOWS,
+        DESCRIPTOR_FLOOR_MIN_RISE,
+    ))
+});
+
+/// Feed this process's open-descriptor count to the leak detector.
+pub fn record_descriptor_sample(now_us: u64, open_fds: u64) {
+    DESCRIPTOR_FLOORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(now_us, open_fds);
+}
+
+/// This process's rising descriptor floor, if the leak detector sees one.
+#[must_use]
+pub fn descriptor_floor_growth() -> Option<DescriptorFloorGrowth> {
+    DESCRIPTOR_FLOORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .growth()
 }
 
 #[inline]
@@ -2424,6 +2588,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desired_fd_soft_limit_raises_toward_target_within_hard_and_never_lowers() {
+        assert_eq!(desired_fd_soft_limit(1_024, 1_048_576, 65_536), 65_536);
+        assert_eq!(
+            desired_fd_soft_limit(1_024, 4_096, 65_536),
+            4_096,
+            "capped by hard"
+        );
+        assert_eq!(
+            desired_fd_soft_limit(100_000, 1_048_576, 65_536),
+            100_000,
+            "an already higher soft limit is never lowered"
+        );
+        assert_eq!(desired_fd_soft_limit(65_536, 65_536, 65_536), 65_536);
+    }
+
+    /// br-kp1in.17: the real syscall path raises the soft limit by one step and
+    /// reports it; asking for less than the current soft limit changes nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raise_fd_soft_limit_applies_and_never_lowers() {
+        let (Some(soft), Some(hard)) = read_fd_limits() else {
+            panic!("/proc/self/limits must expose Max open files on Linux");
+        };
+        assert_eq!(
+            raise_fd_soft_limit(soft.saturating_sub(1)),
+            Some((soft, soft))
+        );
+        if soft < hard {
+            assert_eq!(raise_fd_soft_limit(soft + 1), Some((soft, soft + 1)));
+            assert_eq!(read_fd_limits().0, Some(soft + 1));
+        }
+    }
+
+    #[test]
     fn timeout_diagnostics_names_only_a_stage_that_exceeded_the_budget() {
         let diagnostics = timeout_diagnostics_from_samples(
             30_000_000,
@@ -2497,6 +2695,60 @@ mod tests {
         assert!(snap.hard_limit.is_none());
         assert!(snap.open_fds.is_none());
         assert!(snap.utilization_pct.is_none());
+    }
+
+    /// Feed one-minute windows of 10 s samples: window `i` churns between
+    /// `floors[i]` and `floors[i] + 300`.
+    fn feed_floor_windows(tracker: &mut DescriptorFloorTracker, floors: &[u64]) {
+        const WINDOW_US: u64 = 60_000_000;
+        let mut now = 0;
+        for floor in floors {
+            let end = now + WINDOW_US;
+            while now < end {
+                let churn = (now / 10_000_000) % 4 * 100;
+                tracker.record(now, floor + churn);
+                now += 10_000_000;
+            }
+        }
+        // The first sample of the next window closes the last one.
+        tracker.record(now, 10_000);
+    }
+
+    fn floor_tracker() -> DescriptorFloorTracker {
+        DescriptorFloorTracker::new(std::time::Duration::from_secs(60), 4, 64)
+    }
+
+    /// br-kp1in.17: a leak raises the floor under heavy churn.
+    #[test]
+    fn descriptor_floor_tracker_reports_a_floor_rising_in_every_window() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
+        let growth = tracker.growth().expect("rising floor is growth");
+        assert_eq!(growth.floors, vec![100, 130, 170, 220]);
+        // 120 descriptors over 3 one-minute intervals.
+        assert_eq!(growth.per_hour, 2_400);
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_ignores_churn_above_a_flat_floor() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 100, 100, 100]);
+        assert_eq!(tracker.growth(), None);
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_needs_every_window_to_rise() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 180, 180, 260]);
+        assert_eq!(tracker.growth(), None, "one flat window clears it");
+
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 110, 120, 130]);
+        assert_eq!(tracker.growth(), None, "a 30-descriptor rise is below 64");
+
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 200, 300]);
+        assert_eq!(tracker.growth(), None, "three windows are not enough");
     }
 
     #[test]

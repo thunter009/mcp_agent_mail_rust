@@ -1175,13 +1175,13 @@ fn execute_tool(
         meta: None,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        router.handle_tools_call(
+        fastmcp_core::block_on(router.handle_tools_call(
             &McpContext::new(cx.clone(), *req_id),
             params,
             SessionState::new(),
             None,
             None,
-        )
+        ))
     }))
     .map_err(|payload| {
         format!(
@@ -1668,13 +1668,13 @@ fn run_fixtures_against_rust_server_router() {
             };
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                router.handle_tools_call(
+                fastmcp_core::block_on(router.handle_tools_call(
                     &McpContext::new(cx.clone(), req_id),
                     params,
                     SessionState::new(),
                     None,
                     None,
-                )
+                ))
             }))
             .unwrap_or_else(|payload| {
                 panic!(
@@ -1747,19 +1747,25 @@ fn run_fixtures_against_rust_server_router() {
         }
     }
 
+    // Resource fixtures describe the completed tool operations, including an
+    // idle archive-lock inventory. Drain both asynchronous write layers before
+    // taking that snapshot so a transient Git index lock cannot race the read.
+    mcp_agent_mail_storage::wbq_flush();
+    mcp_agent_mail_storage::flush_async_commits();
+
     for (uri, resource_fixture) in &fixtures.resources {
         for case in &resource_fixture.cases {
             let params = ReadResourceParams {
                 uri: uri.clone(),
                 meta: None,
             };
-            let result = router.handle_resources_read(
+            let result = fastmcp_core::block_on(router.handle_resources_read(
                 &McpContext::new(cx.clone(), req_id),
                 &params,
                 SessionState::new(),
                 None,
                 None,
-            );
+            ));
             req_id += 1;
 
             match (&case.expect.ok, &case.expect.err) {
@@ -1778,8 +1784,11 @@ fn run_fixtures_against_rust_server_router() {
                         supported_compatibility_mismatch(&actual, &expected, "$")
                     {
                         panic!(
-                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}",
-                            case.name
+                            "resource {uri} case {}: supported compatibility mismatch: {mismatch}; actual={actual}; archive lock inventory={:?}",
+                            case.name,
+                            mcp_agent_mail_storage::collect_lock_status(
+                                &mcp_agent_mail_core::Config::get()
+                            )
                         );
                     }
                 }
@@ -2317,15 +2326,14 @@ fn run_fixtures_against_rust_server_router() {
         arguments: Some(serde_json::json!({ "human_key": project_key })),
         meta: None,
     };
-    let ensure_result = router
-        .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            ensure_params,
-            SessionState::new(),
-            None,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
+    let ensure_result = fastmcp_core::block_on(router.handle_tools_call(
+        &McpContext::new(cx.clone(), req_id),
+        ensure_params,
+        SessionState::new(),
+        None,
+        None,
+    ))
+    .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
     req_id += 1;
     assert!(!ensure_result.is_error, "ensure_project returned error");
 
@@ -2340,15 +2348,14 @@ fn run_fixtures_against_rust_server_router() {
             })),
             meta: None,
         };
-        let register_result = router
-            .handle_tools_call(
-                &McpContext::new(cx.clone(), req_id),
-                register_params,
-                SessionState::new(),
-                None,
-                None,
-            )
-            .unwrap_or_else(|e| panic!("register_agent failed for {name}: {e}"));
+        let register_result = fastmcp_core::block_on(router.handle_tools_call(
+            &McpContext::new(cx.clone(), req_id),
+            register_params,
+            SessionState::new(),
+            None,
+            None,
+        ))
+        .unwrap_or_else(|e| panic!("register_agent failed for {name}: {e}"));
         req_id += 1;
         assert!(
             !register_result.is_error,
@@ -2371,15 +2378,14 @@ fn run_fixtures_against_rust_server_router() {
         })),
         meta: None,
     };
-    let send_result = router
-        .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            send_params,
-            SessionState::new(),
-            None,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("send_message failed: {e}"));
+    let send_result = fastmcp_core::block_on(router.handle_tools_call(
+        &McpContext::new(cx.clone(), req_id),
+        send_params,
+        SessionState::new(),
+        None,
+        None,
+    ))
+    .unwrap_or_else(|e| panic!("send_message failed: {e}"));
     req_id += 1;
     assert!(
         !send_result.is_error,
@@ -2431,15 +2437,14 @@ fn run_fixtures_against_rust_server_router() {
         })),
         meta: None,
     };
-    let fetch_result = router
-        .handle_tools_call(
-            &McpContext::new(cx, req_id),
-            fetch_params,
-            SessionState::new(),
-            None,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("fetch_inbox failed: {e}"));
+    let fetch_result = fastmcp_core::block_on(router.handle_tools_call(
+        &McpContext::new(cx, req_id),
+        fetch_params,
+        SessionState::new(),
+        None,
+        None,
+    ))
+    .unwrap_or_else(|e| panic!("fetch_inbox failed: {e}"));
     assert!(!fetch_result.is_error, "fetch_inbox returned error");
 
     assert!(
@@ -2489,15 +2494,14 @@ fn tool_filter_profiles_match_fixtures() {
             uri: "resource://tooling/directory".to_string(),
             meta: None,
         };
-        let result = router
-            .handle_resources_read(
-                &McpContext::new(cx.clone(), 1),
-                &params,
-                SessionState::new(),
-                None,
-                None,
-            )
-            .expect("tooling directory read failed");
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &McpContext::new(cx.clone(), 1),
+            &params,
+            SessionState::new(),
+            None,
+            None,
+        ))
+        .expect("tooling directory read failed");
         let dir_json = decode_json_from_resource_contents(&params.uri, &result.contents)
             .expect("tooling directory JSON decode failed");
         let mut directory_tools = extract_tool_names_from_directory(&dir_json);
@@ -3472,13 +3476,13 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
         })),
         meta: None,
     };
-    let shedable_result = router.handle_tools_call(
+    let shedable_result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx.clone(), req_id),
         shedable_params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     req_id += 1;
     match shedable_result {
         Ok(call_result) => {
@@ -3511,15 +3515,14 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
         arguments: Some(serde_json::json!({})),
         meta: None,
     };
-    let critical_result = router
-        .handle_tools_call(
-            &McpContext::new(cx, req_id),
-            critical_params,
-            SessionState::new(),
-            None,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("health_check should not be shed: {e}"));
+    let critical_result = fastmcp_core::block_on(router.handle_tools_call(
+        &McpContext::new(cx, req_id),
+        critical_params,
+        SessionState::new(),
+        None,
+        None,
+    ))
+    .unwrap_or_else(|e| panic!("health_check should not be shed: {e}"));
     assert!(
         !critical_result.is_error,
         "health_check must remain available even under Red"
@@ -3574,15 +3577,14 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
             arguments: Some(arguments),
             meta: None,
         };
-        let result = router
-            .handle_tools_call(
-                &McpContext::new(cx.clone(), req_id),
-                params,
-                SessionState::new(),
-                None,
-                None,
-            )
-            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        ))
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"));
         req_id += 1;
         assert!(
             !result.is_error,
@@ -4227,13 +4229,13 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
             arguments: Some(serde_json::json!({ "human_key": human_key })),
             meta: None,
         };
-        let result = router.handle_tools_call(
+        let result = fastmcp_core::block_on(router.handle_tools_call(
             &McpContext::new(cx.clone(), req_id),
             params,
             SessionState::new(),
             None,
             None,
-        );
+        ));
         req_id += 1;
         let call_result = result.unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
         assert!(!call_result.is_error, "ensure_project returned error");
@@ -4244,13 +4246,13 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         uri: "resource://projects?contains=mail&limit=1".to_string(),
         meta: None,
     };
-    let result = router.handle_resources_read(
+    let result = fastmcp_core::block_on(router.handle_resources_read(
         &McpContext::new(cx.clone(), req_id),
         &params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     let read_result = result.expect("projects query read should succeed");
     let json = decode_json_from_resource_contents(&params.uri, &read_result.contents)
         .expect("projects query response should decode");
@@ -4281,15 +4283,14 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         uri: "resource://projects?limit=0".to_string(),
         meta: None,
     };
-    let zero_result = router
-        .handle_resources_read(
-            &McpContext::new(cx, 1),
-            &zero_params,
-            SessionState::new(),
-            None,
-            None,
-        )
-        .expect("projects limit=0 read should succeed");
+    let zero_result = fastmcp_core::block_on(router.handle_resources_read(
+        &McpContext::new(cx, 1),
+        &zero_params,
+        SessionState::new(),
+        None,
+        None,
+    ))
+    .expect("projects limit=0 read should succeed");
     let zero_json = decode_json_from_resource_contents(&zero_params.uri, &zero_result.contents)
         .expect("projects limit=0 response should decode");
     let zero_projects = zero_json
@@ -4335,13 +4336,13 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
             uri: uri.to_string(),
             meta: None,
         };
-        let result = router.handle_resources_read(
+        let result = fastmcp_core::block_on(router.handle_resources_read(
             &McpContext::new(cx.clone(), u64::try_from(idx + 1).expect("request id")),
             &params,
             SessionState::new(),
             None,
             None,
-        );
+        ));
 
         match result {
             Err(err) => {
@@ -4416,13 +4417,13 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
             uri: uri.to_string(),
             meta: None,
         };
-        let result = router.handle_resources_read(
+        let result = fastmcp_core::block_on(router.handle_resources_read(
             &McpContext::new(cx.clone(), u64::try_from(idx + 1).expect("request id")),
             &params,
             SessionState::new(),
             None,
             None,
-        );
+        ));
 
         let contains_any = |text: &str| -> bool {
             let lower = text.to_ascii_lowercase();
@@ -4501,13 +4502,13 @@ fn toon_format_resolution_json_fallback() {
         arguments: None,
         meta: None,
     };
-    let result = router.handle_tools_call(
+    let result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx, 1),
         params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     let call_result = result.expect("health_check should not fail");
     assert!(!call_result.is_error, "health_check should succeed");
 
@@ -4567,13 +4568,13 @@ fn llm_mode_parameter_accepted_by_tools() {
         arguments: Some(serde_json::json!({ "human_key": project_key.as_str() })),
         meta: None,
     };
-    let result = router.handle_tools_call(
+    let result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx.clone(), req_id),
         params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     req_id += 1;
     let call_result = result.unwrap_or_else(|e| panic!("ensure_project setup failed: {e}"));
     assert!(!call_result.is_error, "ensure_project setup returned error");
@@ -4619,13 +4620,13 @@ fn llm_mode_parameter_accepted_by_tools() {
         })),
         meta: None,
     };
-    let result = router.handle_tools_call(
+    let result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx.clone(), req_id),
         params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     req_id += 1;
     let call_result = result.expect("summarize_thread should not fail with llm_mode=false");
     assert!(
@@ -4654,13 +4655,13 @@ fn llm_mode_parameter_accepted_by_tools() {
         })),
         meta: None,
     };
-    let result = router.handle_tools_call(
+    let result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx, req_id),
         params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
     assert!(
         !call_result.is_error,

@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 //! Tool-level acceptance tests for client-supplied idempotency keys
 //! (br-idempotency-keys-mutating-tools-h0x9k).
 //!
@@ -19,9 +17,12 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
-use mcp_agent_mail_tools::{acknowledge_message, ensure_project, register_agent, send_message};
+use mcp_agent_mail_tools::{
+    acknowledge_message, ensure_project, fetch_inbox, register_agent, reply_message, send_message,
+};
 use serde_json::Value;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +47,14 @@ where
     F: FnOnce(Cx, String) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_with_storage_env(&[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0")], f)
+}
+
+fn run_with_storage_env<F, Fut, T>(extra_env: &[(&str, &str)], f: F) -> T
+where
+    F: FnOnce(Cx, String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -53,27 +62,30 @@ where
     let db_path = format!("/tmp/idem-tool-{suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/idem-tool-storage-{suffix}");
-    let env = [
+    let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
     ];
+    env.extend_from_slice(extra_env);
     with_process_env_overrides_for_test(&env, || {
         Config::reset_cached();
-        let cx = Cx::for_testing();
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let out = rt.block_on(f(cx, storage_root.clone()));
+        let out = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs the tool test context");
+            f(cx, storage_root.clone()).await
+        });
         Config::reset_cached();
         out
     })
 }
 
-async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &str) {
+async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &str) -> String {
     ensure_project(ctx, project_key.to_string(), None)
         .await
         .expect("ensure_project");
-    register_agent(
+    let registration = register_agent(
         ctx,
         project_key.to_string(),
         "codex-cli".to_string(),
@@ -96,13 +108,17 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
     )
     .await
     .expect("set_contact_policy");
+    serde_json::from_str::<Value>(&registration).unwrap()["registration_token"]
+        .as_str()
+        .expect("registration token")
+        .to_string()
 }
 
-/// Count canonical message `.md` artifacts on disk (those under a `messages`
-/// directory), which is what `try_write_message_archive` dispatches. Inbox/outbox
-/// copies live under `agents/`, so they are not counted.
-fn count_canonical_messages(storage_root: &str) -> usize {
-    fn walk(dir: &Path, count: &mut usize) {
+/// Identify canonical messages at `projects/<slug>/messages/YYYY/MM/<file>.md`.
+/// Thread digests under `messages/threads/` are distinct archive artifacts;
+/// they remain covered by the full delivery-file snapshot below.
+fn canonical_message_paths(storage_root: &str) -> BTreeMap<i64, PathBuf> {
+    fn walk(root: &Path, dir: &Path, messages: &mut BTreeMap<i64, PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -113,17 +129,50 @@ fn count_canonical_messages(storage_root: &str) -> usize {
                 if path.file_name().is_some_and(|n| n == ".git") {
                     continue;
                 }
-                walk(&path, count);
-            } else if path.extension().is_some_and(|ext| ext == "md")
-                && path.components().any(|c| c.as_os_str() == "messages")
-            {
-                *count += 1;
+                walk(root, &path, messages);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("archive-relative fixture path");
+                let components: Vec<_> = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_str().expect("UTF-8 fixture path"))
+                    .collect();
+                let ["projects", _, "messages", year, month, _] = components.as_slice() else {
+                    continue;
+                };
+                assert!(year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()));
+                assert!(month.len() == 2 && month.bytes().all(|byte| byte.is_ascii_digit()));
+                let (metadata, _) = mcp_agent_mail_storage::read_message_file(&path)
+                    .expect("canonical message frontmatter");
+                let message_id = metadata["id"].as_i64().expect("canonical message ID");
+                assert!(message_id > 0);
+                let filename_id = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.rsplit_once("__"))
+                    .and_then(|(_, id)| id.parse::<i64>().ok());
+                assert_eq!(
+                    filename_id,
+                    Some(message_id),
+                    "filename/frontmatter ID mismatch"
+                );
+                let previous = messages.insert(message_id, path);
+                assert!(
+                    previous.is_none(),
+                    "duplicate canonical artifact for message {message_id}"
+                );
             }
         }
     }
-    let mut count = 0;
-    walk(Path::new(storage_root), &mut count);
-    count
+    let mut messages = BTreeMap::new();
+    let root = Path::new(storage_root);
+    walk(root, root, &mut messages);
+    messages
+}
+
+fn count_canonical_messages(storage_root: &str) -> usize {
+    canonical_message_paths(storage_root).len()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,6 +206,324 @@ async fn send_with_key(
         key.map(str::to_string),
     )
     .await
+}
+
+async fn attachment_request(
+    ctx: &McpContext,
+    project_key: &str,
+    source: &Path,
+    parent: Option<i64>,
+    body: &str,
+    token: Option<&str>,
+) -> Result<String, fastmcp::McpError> {
+    let attachments = Some(vec![source.to_string_lossy().into_owned()]);
+    let bcc = Some(vec!["RedFox".to_string()]);
+    let token = token.map(str::to_string);
+    let key = Some("attachment-retry".to_string());
+    if let Some(parent) = parent {
+        reply_message(
+            ctx,
+            project_key.to_string(),
+            parent,
+            "GreenCastle".to_string(),
+            body.to_string(),
+            Some(vec!["BlueLake".to_string()]),
+            None,
+            bcc,
+            None,
+            None,
+            None,
+            attachments,
+            Some(false),
+            token,
+            key,
+        )
+        .await
+    } else {
+        send_message(
+            ctx,
+            project_key.to_string(),
+            "GreenCastle".to_string(),
+            vec!["BlueLake".to_string()],
+            "Attachment retry".to_string(),
+            body.to_string(),
+            None,
+            bcc,
+            attachments,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            token,
+            key,
+        )
+        .await
+    }
+}
+
+fn snapshot_delivery_files(storage_root: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_none_or(|name| name != ".git") {
+                    visit(&path, files);
+                }
+            } else if path.components().any(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some("messages" | "inbox" | "outbox" | "attachments")
+                )
+            }) {
+                files.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(&Path::new(storage_root).join("projects"), &mut files);
+    files
+}
+
+async fn inbox_snapshot(ctx: &McpContext, project_key: &str) -> Value {
+    let inbox = fetch_inbox(
+        ctx,
+        project_key.to_string(),
+        "BlueLake".to_string(),
+        None,
+        None,
+        Some(100),
+        Some(true),
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .await
+    .expect("peek persisted inbox");
+    serde_json::from_str(&inbox).unwrap()
+}
+
+fn assert_error_type(error: &fastmcp::McpError, expected: &str) {
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("error"))
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str),
+        Some(expected)
+    );
+}
+
+fn assert_exact_replay(fresh: &Value, replay: &str) {
+    let mut replay: Value = serde_json::from_str(replay).unwrap();
+    assert_eq!(
+        replay.as_object_mut().unwrap().remove("idempotent_replay"),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(&replay, fresh);
+}
+
+#[allow(clippy::too_many_lines)]
+async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
+    let ctx = McpContext::new(cx, 1);
+    let project_key = format!("{storage_root}/workspace");
+    std::fs::create_dir_all(&project_key).unwrap();
+    for agent in ["GreenCastle", "BlueLake", "RedFox"] {
+        setup_project_and_agent(&ctx, &project_key, agent).await;
+    }
+    let parent = if is_reply {
+        let original = send_with_key(
+            &ctx,
+            &project_key,
+            "GreenCastle",
+            "BlueLake",
+            "Parent",
+            "Original body",
+            None,
+        )
+        .await
+        .unwrap();
+        Some(
+            serde_json::from_str::<Value>(&original).unwrap()["deliveries"][0]["payload"]["id"]
+                .as_i64()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let source = Path::new(&project_key).join("source.bin");
+    let original_bytes = b"accepted attachment bytes";
+    std::fs::write(&source, original_bytes).unwrap();
+    let body = "The accepted body and attachment must survive retries.";
+    let fresh = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("fresh attachment send");
+    let fresh: Value = serde_json::from_str(&fresh).unwrap();
+    assert!(
+        !fresh["deliveries"][0]["payload"]["attachments"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "fresh delivery must contain the accepted attachment"
+    );
+    mcp_agent_mail_storage::wbq_flush();
+    let files = snapshot_delivery_files(&storage_root);
+    let inbox = inbox_snapshot(&ctx, &project_key).await;
+    let accepted_id = fresh["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+    let mut expected_ids: Vec<_> = parent.into_iter().chain([accepted_id]).collect();
+    expected_ids.sort_unstable();
+    let canonical = canonical_message_paths(&storage_root);
+    assert_eq!(canonical.keys().copied().collect::<Vec<_>>(), expected_ids);
+    assert_eq!(
+        count_canonical_messages(&storage_root),
+        if is_reply { 2 } else { 1 }
+    );
+    if let Some(parent_id) = parent {
+        let digest_name = format!("{parent_id}.md");
+        let digests: Vec<_> = files
+            .iter()
+            .filter(|(path, _)| {
+                path.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "threads")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name == digest_name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            digests.len(),
+            1,
+            "the first reply must create its separate thread digest"
+        );
+        assert!(
+            std::str::from_utf8(digests[0].1)
+                .unwrap()
+                .contains(&format!("__{accepted_id}.md"))
+        );
+    }
+
+    let retained = source.with_extension("retained.bin");
+    std::fs::rename(&source, &retained).unwrap();
+    let replay = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("retry must not reopen a missing original attachment");
+    assert_exact_replay(&fresh, &replay);
+    let conflict = attachment_request(&ctx, &project_key, &source, parent, "changed body", None)
+        .await
+        .expect_err("a changed request must conflict before checking missing source files");
+    assert_error_type(&conflict, "IDEMPOTENCY_KEY_CONFLICT");
+
+    std::fs::write(&source, b"new bytes at the old source path").unwrap();
+    let replay = attachment_request(&ctx, &project_key, &source, parent, body, None)
+        .await
+        .expect("retry must use the accepted attachment metadata");
+    assert_exact_replay(&fresh, &replay);
+    mcp_agent_mail_storage::wbq_flush();
+    assert_eq!(canonical_message_paths(&storage_root), canonical);
+    assert_eq!(snapshot_delivery_files(&storage_root), files);
+    assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+    assert_eq!(std::fs::read(retained).unwrap(), original_bytes);
+    assert_eq!(
+        std::fs::read(source).unwrap(),
+        b"new bytes at the old source path"
+    );
+}
+
+#[test]
+fn send_message_attachment_replay_ignores_missing_and_changed_sources() {
+    run_with_storage(|cx, storage_root| attachment_replay_case(cx, storage_root, false));
+}
+
+#[test]
+fn reply_message_attachment_replay_ignores_missing_and_changed_sources() {
+    run_with_storage(|cx, storage_root| attachment_replay_case(cx, storage_root, true));
+}
+
+#[test]
+fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() {
+    run_with_storage_env(
+        &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
+        |cx, storage_root| async move {
+            let ctx = McpContext::new(cx, 1);
+            let project_key = format!("{storage_root}/workspace");
+            std::fs::create_dir_all(&project_key).unwrap();
+            let token = setup_project_and_agent(&ctx, &project_key, "GreenCastle").await;
+            for agent in ["BlueLake", "RedFox"] {
+                setup_project_and_agent(&ctx, &project_key, agent).await;
+            }
+            let source = Path::new(&project_key).join("private.bin");
+            std::fs::write(&source, b"private attachment").unwrap();
+            let body = "Private accepted body";
+            let fresh_send =
+                attachment_request(&ctx, &project_key, &source, None, body, Some(&token))
+                    .await
+                    .expect("verified fresh send");
+            let fresh_send: Value = serde_json::from_str(&fresh_send).unwrap();
+            let parent = fresh_send["message_id"].as_i64().unwrap();
+            let fresh_reply = attachment_request(
+                &ctx,
+                &project_key,
+                &source,
+                Some(parent),
+                body,
+                Some(&token),
+            )
+            .await
+            .expect("verified fresh reply");
+            let fresh_reply: Value = serde_json::from_str(&fresh_reply).unwrap();
+            mcp_agent_mail_storage::wbq_flush();
+            let files = snapshot_delivery_files(&storage_root);
+            let inbox = inbox_snapshot(&ctx, &project_key).await;
+            std::fs::rename(&source, source.with_extension("retained.bin")).unwrap();
+
+            for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
+                for (proof, expected) in [
+                    (None, "SENDER_TOKEN_REQUIRED"),
+                    (
+                        Some("incorrect-registration-token"),
+                        "SENDER_TOKEN_MISMATCH",
+                    ),
+                ] {
+                    let error =
+                        attachment_request(&ctx, &project_key, &source, parent, body, proof)
+                            .await
+                            .expect_err(
+                                "a prior accepted key must not bypass current sender proof",
+                            );
+                    assert_error_type(&error, expected);
+                }
+                let replay =
+                    attachment_request(&ctx, &project_key, &source, parent, body, Some(&token))
+                        .await
+                        .expect("verified replay after the source was moved");
+                assert_exact_replay(&fresh, &replay);
+                assert_eq!(fresh["receipt_mode"], "redacted");
+                assert_eq!(fresh["verified_sender"], true);
+                for field in [
+                    "subject",
+                    "body_md",
+                    "attachments",
+                    "deliveries",
+                    "to",
+                    "cc",
+                    "bcc",
+                ] {
+                    assert!(
+                        fresh.get(field).is_none(),
+                        "redacted receipt exposed {field}"
+                    );
+                }
+            }
+            mcp_agent_mail_storage::wbq_flush();
+            assert_eq!(snapshot_delivery_files(&storage_root), files);
+            assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+        },
+    );
 }
 
 #[test]

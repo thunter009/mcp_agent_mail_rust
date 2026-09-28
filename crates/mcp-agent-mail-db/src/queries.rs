@@ -43,6 +43,26 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
 static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
 
+/// Serialize in-process message inserts (br-5e8ew): id election and the insert
+/// transaction. Owned guard because the section spans async database and
+/// archive I/O; the borrowed guard is thread-affine, which would make the
+/// public future non-Send.
+async fn lock_message_write_serializer(
+    cx: &Cx,
+) -> std::result::Result<asupersync::sync::OwnedMutexGuard<()>, asupersync::sync::LockError> {
+    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx).await
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the message write serializer was held when each post-commit
+    /// visibility probe on this thread started (br-kp1in.32 regression test).
+    static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Fresh durability-probe connections opened on this thread (br-v0ucm).
+    static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // =============================================================================
 // ATC Leader Lease types
 // =============================================================================
@@ -101,7 +121,7 @@ fn sha256_hex(data: &str) -> String {
 struct TrackedConnection<'conn> {
     inner: &'conn crate::DbConn,
     transaction_write_intent: TransactionWriteIntent,
-    retire_after_deferred_checkpoint: Option<&'conn AtomicBool>,
+    retire_on_drop: Option<&'conn AtomicBool>,
 }
 
 impl<'conn> TrackedConnection<'conn> {
@@ -109,23 +129,23 @@ impl<'conn> TrackedConnection<'conn> {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
-            retire_after_deferred_checkpoint: None,
+            retire_on_drop: None,
         }
     }
 
     fn with_retirement_signal(
         inner: &'conn crate::DbConn,
-        retire_after_deferred_checkpoint: &'conn AtomicBool,
+        retire_on_drop: &'conn AtomicBool,
     ) -> Self {
         Self {
             inner,
             transaction_write_intent: TransactionWriteIntent::default(),
-            retire_after_deferred_checkpoint: Some(retire_after_deferred_checkpoint),
+            retire_on_drop: Some(retire_on_drop),
         }
     }
 
-    fn retire_after_deferred_checkpoint(&self) {
-        if let Some(signal) = self.retire_after_deferred_checkpoint {
+    fn retire_on_drop(&self) {
+        if let Some(signal) = self.retire_on_drop {
             signal.store(true, Ordering::Release);
         }
     }
@@ -1077,11 +1097,9 @@ const MAX_IN_CLAUSE_ITEMS: usize = 500;
 // very large IN-clause updates on file_reservations. Keep release-path chunks
 // conservative until the engine-side planner/executor bug is fixed.
 const MAX_RELEASE_RESERVATION_CHUNK_ITEMS: usize = 128;
-// release_reservations executes both:
-// - SELECT ... WHERE project_id, agent_id, filters...
-// - UPDATE ... SET released_ts = ? WHERE project_id, agent_id, filters...
-// The UPDATE has one extra bind (released_ts), so total binds are:
-// 3 + reservation_ids.len() + paths.len()
+// The largest selection reserves binds for project_id, agent_id, and the
+// optional creation cutoff used by durable release replay. Final writes use
+// per-id eligibility checks, independently of the selection's filter size.
 const RELEASE_RESERVATION_BASE_BIND_PARAMS: usize = 3;
 const MAX_RELEASE_RESERVATION_FILTER_ITEMS: usize =
     SQLITE_MAX_BIND_PARAMS - RELEASE_RESERVATION_BASE_BIND_PARAMS;
@@ -1257,18 +1275,19 @@ fn recent_contact_union_sql(item_count: usize) -> &'static str {
 /// A contended fail-fast post-commit checkpoint leaves the durable commit on
 /// the connection worker until that worker closes. The flag lets the tracked
 /// transaction request retirement without taking ownership away from its
-/// caller. Detaching closes only this checkout; pool waiters recheck capacity
-/// on their bounded 100ms acquisition loop.
+/// caller. Reads can also retire a handle whose pager snapshot cannot advance
+/// on a new transaction. Detaching closes only this checkout; pool waiters
+/// recheck capacity on their bounded 100ms acquisition loop.
 struct RetirablePooledHandle {
     inner: Option<sqlmodel_pool::PooledConnection<crate::DbConn>>,
-    retire_after_deferred_checkpoint: AtomicBool,
+    retire_on_drop: AtomicBool,
 }
 
 impl RetirablePooledHandle {
     fn new(inner: sqlmodel_pool::PooledConnection<crate::DbConn>) -> Self {
         Self {
             inner: Some(inner),
-            retire_after_deferred_checkpoint: AtomicBool::new(false),
+            retire_on_drop: AtomicBool::new(false),
         }
     }
 
@@ -1300,10 +1319,7 @@ impl Drop for RetirablePooledHandle {
         let Some(pooled) = self.inner.take() else {
             return;
         };
-        if !self
-            .retire_after_deferred_checkpoint
-            .load(Ordering::Acquire)
-        {
+        if !self.retire_on_drop.load(Ordering::Acquire) {
             drop(pooled);
             return;
         }
@@ -1314,7 +1330,7 @@ impl Drop for RetirablePooledHandle {
             tracing::warn!(
                 db_path = %db_path,
                 error = %error,
-                "deferred_checkpoint_connection_retirement_failed"
+                "pooled_connection_retirement_failed"
             );
         }
     }
@@ -1668,7 +1684,7 @@ impl TrackedConnectionSource for RetirablePooledHandle {
     }
 
     fn retirement_signal(&self) -> Option<&AtomicBool> {
-        Some(&self.retire_after_deferred_checkpoint)
+        Some(&self.retire_on_drop)
     }
 }
 
@@ -1685,7 +1701,8 @@ fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'
 
 /// Whether `BEGIN CONCURRENT` is enabled (MVCC page-level writes).
 ///
-/// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `false`.
+/// Read once from `Config::fsqlite_concurrent_mode` (`FSQLITE_CONCURRENT_MODE`,
+/// honoring `.env` like the pool's autocommit pragma does); defaults to `false`.
 /// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).
 /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in to `BEGIN CONCURRENT`.
 ///
@@ -1697,8 +1714,7 @@ fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'
 /// been fixed.  Single-writer mode (`BEGIN IMMEDIATE`) is recommended
 /// for all deployments.
 static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let enabled = mcp_agent_mail_core::Config::get().fsqlite_concurrent_mode;
     if enabled {
         tracing::warn!(
             "FSQLITE_CONCURRENT_MODE=true: BEGIN CONCURRENT is enabled. \
@@ -1827,7 +1843,7 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                     );
                 }
                 if retire {
-                    tracked.retire_after_deferred_checkpoint();
+                    tracked.retire_on_drop();
                 }
             }
             Outcome::Ok(())
@@ -1925,20 +1941,34 @@ macro_rules! try_in_tx {
 const DURABILITY_PROBE_MAX_RETRIES: u32 = 3;
 
 /// Execute a durability probe query from a fresh connection when file-backed.
-///
-/// This avoids false positives where the writer connection can still observe
-/// transient state that is not yet durable/visible from independent handles.
-///
-/// Transient `SQLITE_BUSY` / `database is locked` errors are retried up to
-/// [`DURABILITY_PROBE_MAX_RETRIES`] times with exponential backoff so that a
-/// concurrent WAL checkpoint does not cause the caller to see a spurious
-/// `DATABASE_ERROR busy` for a mutation that already committed successfully.
 async fn durability_probe_query(
     cx: &Cx,
     pool: &DbPool,
     sql: &str,
     params: &[Value],
 ) -> Outcome<Vec<SqlRow>, DbError> {
+    durability_probe_queries(cx, pool, &[(sql, params)])
+        .await
+        .map(|mut rows| rows.pop().unwrap_or_default())
+}
+
+/// Execute durability probe queries, in order, on one fresh connection when
+/// file-backed.
+///
+/// This avoids false positives where the writer connection can still observe
+/// transient state that is not yet durable/visible from independent handles.
+/// One handle serves every statement: each fresh open rescans the whole WAL
+/// (br-v0ucm), so a probe must not open more than it needs.
+///
+/// Transient `SQLITE_BUSY` / `database is locked` errors are retried up to
+/// [`DURABILITY_PROBE_MAX_RETRIES`] times with exponential backoff so that a
+/// concurrent WAL checkpoint does not cause the caller to see a spurious
+/// `DATABASE_ERROR busy` for a mutation that already committed successfully.
+async fn durability_probe_queries(
+    cx: &Cx,
+    pool: &DbPool,
+    statements: &[(&str, &[Value])],
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
     if pool.sqlite_path() == ":memory:" {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -1947,7 +1977,7 @@ async fn durability_probe_query(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
-        return map_sql_outcome(traw_query(cx, &tracked, sql, params).await);
+        return run_probe_statements(cx, &tracked, statements).await;
     }
 
     for attempt in 0..=DURABILITY_PROBE_MAX_RETRIES {
@@ -1961,13 +1991,16 @@ async fn durability_probe_query(
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
         };
+        #[cfg(test)]
+        DURABILITY_PROBE_OPENS.with(|opens| opens.set(opens.get() + 1));
         if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
+            crate::close_db_conn(probe_conn, "durability probe connection init failed");
             return Outcome::Err(DbError::Sqlite(format!(
                 "durability probe connection init failed: {e}"
             )));
         }
         let probe_tracked = tracked(&probe_conn);
-        let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
+        let out = run_probe_statements(cx, &probe_tracked, statements).await;
         crate::close_db_conn(probe_conn, "durability_probe_query connection");
 
         match &out {
@@ -1990,6 +2023,23 @@ async fn durability_probe_query(
     Outcome::Err(DbError::Internal(
         "durability probe retry loop fell through".to_string(),
     ))
+}
+
+async fn run_probe_statements(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    statements: &[(&str, &[Value])],
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for (sql, params) in statements {
+        match map_sql_outcome(traw_query(cx, tracked, sql, params).await) {
+            Outcome::Ok(rows) => results.push(rows),
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    Outcome::Ok(results)
 }
 
 /// Check if a durability-probe error is a transient busy/locked condition
@@ -2086,16 +2136,15 @@ struct WriterPostCommitCounts {
     recipient_count: Option<i64>,
 }
 
-async fn message_visibility_probe_query(
+async fn message_visibility_probe_queries(
     cx: &Cx,
     pool: &DbPool,
-    sql: &str,
-    params: &[Value],
+    statements: &[(&str, &[Value])],
     mode: MessageVisibilityProbeMode,
-) -> Outcome<Vec<SqlRow>, DbError> {
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
     match mode {
         MessageVisibilityProbeMode::FreshHandle => {
-            durability_probe_query(cx, pool, sql, params).await
+            durability_probe_queries(cx, pool, statements).await
         }
         #[cfg(test)]
         MessageVisibilityProbeMode::PooledHandle => {
@@ -2106,7 +2155,7 @@ async fn message_visibility_probe_query(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
             let tracked = tracked(&*conn);
-            map_sql_outcome(traw_query(cx, &tracked, sql, params).await)
+            run_probe_statements(cx, &tracked, statements).await
         }
     }
 }
@@ -2208,20 +2257,27 @@ async fn verify_message_recipients_visible_with_probe_mode(
 ) -> Outcome<(), DbError> {
     let message_count_sql = "SELECT COUNT(*) FROM messages WHERE id = ? AND project_id = ?";
     let message_count_params = [Value::BigInt(message_id), Value::BigInt(project_id)];
-    let message_count_rows = match message_visibility_probe_query(
+    let recipient_sql = "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind";
+    let recipient_params = [Value::BigInt(message_id)];
+    let mut rows = match message_visibility_probe_queries(
         cx,
         pool,
-        message_count_sql,
-        &message_count_params,
+        &[
+            (message_count_sql, &message_count_params[..]),
+            (recipient_sql, &recipient_params[..]),
+        ],
         probe_mode,
     )
     .await
     {
-        Outcome::Ok(rows) => rows,
+        Outcome::Ok(rows) => rows.into_iter(),
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let message_count_rows = rows.next().unwrap_or_default();
+    let recipient_rows = rows.next().unwrap_or_default();
+
     let message_count = message_count_rows
         .first()
         .and_then(row_first_i64)
@@ -2231,23 +2287,6 @@ async fn verify_message_recipients_visible_with_probe_mode(
             "message row not visible after commit for message_id={message_id} project_id={project_id}"
         )));
     }
-
-    let recipient_sql = "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind";
-    let recipient_params = [Value::BigInt(message_id)];
-    let recipient_rows = match message_visibility_probe_query(
-        cx,
-        pool,
-        recipient_sql,
-        &recipient_params,
-        probe_mode,
-    )
-    .await
-    {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
 
     let actual = match decode_message_recipient_pairs(message_id, &recipient_rows) {
         Ok(actual) => actual,
@@ -2276,6 +2315,10 @@ async fn verify_message_recipients_visible_after_commit(
     message_id: i64,
     expected_recipients: &[(i64, &str)],
 ) -> Outcome<(), DbError> {
+    #[cfg(test)]
+    SERIALIZER_LOCKED_AT_PROBE.with(|seen| {
+        seen.borrow_mut().push(MESSAGE_WRITE_SERIALIZER.is_locked());
+    });
     let fresh_result = verify_message_recipients_visible_with_probe_mode(
         cx,
         pool,
@@ -3965,7 +4008,8 @@ async fn cleanup_committed_message_after_consistency_failure(
 /// Maximum retry attempts for MVCC write conflicts (`BEGIN CONCURRENT`
 /// page-level collisions) and plain `SQLite` write contention.
 ///
-/// Read once from `FSQLITE_CONCURRENT_RETRIES` env var; default 16.
+/// Read once from `Config::fsqlite_concurrent_retries` (`FSQLITE_CONCURRENT_RETRIES`,
+/// default 16, one parse shared with the rest of the config surface).
 ///
 /// History:
 ///   - 5  → 8: exponential backoff (25ms..2s) gets ~5s total budget to
@@ -3981,10 +4025,7 @@ async fn cleanup_committed_message_after_consistency_failure(
 ///     abandons the blocking thread. The retry count is unchanged; see
 ///     [`mvcc_backoff`] for the full budget arithmetic.
 static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-    std::env::var("FSQLITE_CONCURRENT_RETRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    u32::try_from(mcp_agent_mail_core::Config::get().fsqlite_concurrent_retries).unwrap_or(u32::MAX)
 });
 
 /// Global counter: total MVCC retries performed.
@@ -6336,6 +6377,62 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
+/// List canonical registered identities, including retired agents.
+///
+/// Discovery must resolve case variants exactly like `get_agent`: the first
+/// registered row owns the name even when a newer alias is active. Apply that
+/// identity rule before excluding permanent deregistrations. One statement
+/// observes identity and lifecycle state together; callers may partition the
+/// result into active and retired rosters without a second ledger read.
+pub async fn list_agent_roster(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    // Avoid per-row correlated aggregate/EXISTS fallbacks in the runtime
+    // engine. Canonicalize the ordered project rows in Rust, retaining the
+    // lifecycle ledger value from the same statement as the agent profile.
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+               a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+               a.reaper_exempt, a.registration_token, a.retired_at, d.agent_id \
+               FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+               WHERE a.project_id = ? ORDER BY a.id ASC";
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[Value::BigInt(project_id)]).await) {
+        Outcome::Ok(rows) => {
+            let mut seen_names = HashSet::new();
+            let mut agents: Vec<_> = rows
+                .iter()
+                .filter_map(|row| {
+                    let agent = decode_agent_row_indexed(row);
+                    if !seen_names.insert(agent.name.to_ascii_lowercase())
+                        || row.get(13).and_then(value_as_i64).is_some()
+                    {
+                        return None;
+                    }
+                    Some(agent)
+                })
+                .collect();
+            agents.sort_by(|left, right| {
+                right
+                    .last_active_ts
+                    .cmp(&left.last_active_ts)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            Outcome::Ok(agents)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 /// Load the bounded, recent agent population needed by the ATC operator.
 ///
 /// This deliberately performs one joined query for the entire mailbox. The
@@ -6650,26 +6747,154 @@ pub async fn get_agents_by_ids(
     Outcome::Ok(out)
 }
 
-/// Touch agent (deferred).
+/// Minimum spacing between two `last_active_ts` writes for one agent (GH#334).
 ///
-/// Enqueues a `last_active_ts` update into the in-memory batch queue.
-/// The actual DB write happens when the flush interval elapses or when
-/// `flush_deferred_touches` is called explicitly. This eliminates a DB
-/// round-trip on every single tool invocation.
-pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), DbError> {
-    let now = now_micros();
-    let cache_scope = cache_scope_for_pool(pool);
-    let should_flush = crate::cache::read_cache().enqueue_touch_scoped(&cache_scope, agent_id, now);
+/// `last_active_ts` feeds `list_agents` ordering and its day-granular
+/// `active_within_days` filter, so minute resolution is plenty. The throttle
+/// bounds activity writes to one single-row UPDATE per agent per minute per
+/// process, however many tool calls that agent makes.
+pub const AGENT_TOUCH_MIN_INTERVAL_MICROS: i64 = 60 * 1_000_000;
 
-    if should_flush {
-        flush_deferred_touches(cx, pool).await
+/// Retry budget for one activity write. A touch is best-effort metadata: under
+/// write contention it yields (the next call after the conflict retries) rather
+/// than spending the full MVCC backoff budget inside a tool call.
+const AGENT_TOUCH_MVCC_RETRIES: u32 = 1;
+
+/// Bound on remembered (database, agent) touch claims before stale ones are pruned.
+const AGENT_TOUCH_THROTTLE_PRUNE_AT: usize = 4096;
+
+/// Last activity write per (database, agent), in microseconds.
+static AGENT_TOUCH_THROTTLE: LazyLock<std::sync::Mutex<HashMap<(String, i64), i64>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Throttle key for a pool's database.
+///
+/// A file database is keyed by its path, not by the pool generation, so the
+/// query-only read pool and the write pool of one mailbox share one throttle
+/// and a pool rebuilt between calls does not reset it. The throttle can only
+/// suppress a write, never redirect one, so a recovery that renumbers agent
+/// ids at worst delays one agent's next touch by one interval. Every
+/// in-memory pool is a separate database, so it keeps its unique identity key.
+fn agent_touch_throttle_key(pool: &DbPool) -> String {
+    let path = pool.sqlite_path();
+    if path == ":memory:" {
+        pool.sqlite_identity_key()
     } else {
-        Outcome::Ok(())
+        path.to_string()
     }
 }
 
-/// Immediately flush all pending deferred touch updates to the DB.
-/// Call this on server shutdown or when precise `last_active_ts` is needed.
+fn agent_touch_throttle() -> std::sync::MutexGuard<'static, HashMap<(String, i64), i64>> {
+    AGENT_TOUCH_THROTTLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn agent_touch_elapsed(last: i64, now: i64) -> bool {
+    // A wall clock that stepped backwards must not suppress touches until it
+    // catches up again.
+    now < last || now - last >= AGENT_TOUCH_MIN_INTERVAL_MICROS
+}
+
+/// Whether [`touch_agent`] would write for this agent now.
+///
+/// Lets a read-only surface skip opening the write pool while the agent's
+/// last touch is still fresh. Advisory only: [`touch_agent`] claims atomically.
+#[must_use]
+pub fn agent_touch_due(pool: &DbPool, agent_id: i64) -> bool {
+    let key = (agent_touch_throttle_key(pool), agent_id);
+    agent_touch_throttle()
+        .get(&key)
+        .is_none_or(|&last| agent_touch_elapsed(last, now_micros()))
+}
+
+/// Record agent activity (`last_active_ts`), throttled write-through (GH#334).
+///
+/// Writes at most once per [`AGENT_TOUCH_MIN_INTERVAL_MICROS`] per agent and
+/// database; calls inside the interval return `Ok(false)` without touching
+/// the database. The write itself is one single-row
+/// `UPDATE agents SET last_active_ts = MAX(last_active_ts, ?)` on the given
+/// (write) pool, so nothing is left queued in memory: an agent that goes idle
+/// right after a call still has that call recorded, and a pool rebuilt between
+/// calls cannot strand a pending update under a retired pool generation.
+///
+/// Returns `Ok(true)` when the write committed. A failed write still counts
+/// against the interval, so it is retried by the first call after the interval
+/// rather than by every call against a contended database.
+pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool, DbError> {
+    let now = now_micros();
+    let key = (agent_touch_throttle_key(pool), agent_id);
+    {
+        let mut throttle = agent_touch_throttle();
+        if throttle
+            .get(&key)
+            .is_some_and(|&last| !agent_touch_elapsed(last, now))
+        {
+            return Outcome::Ok(false);
+        }
+        if throttle.len() >= AGENT_TOUCH_THROTTLE_PRUNE_AT {
+            throttle.retain(|_, last| !agent_touch_elapsed(*last, now));
+        }
+        throttle.insert(key, now);
+    }
+
+    let outcome =
+        run_with_mvcc_retry_with_budget(cx, "touch_agent", AGENT_TOUCH_MVCC_RETRIES, || async {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let tracked = tracked(&*conn);
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_execute(
+                        cx,
+                        &tracked,
+                        "UPDATE agents SET last_active_ts = MAX(last_active_ts, ?) WHERE id = ?",
+                        &[Value::BigInt(now), Value::BigInt(agent_id)],
+                    )
+                    .await,
+                )
+            );
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok(())
+        })
+        .await;
+
+    // A failed write keeps its claim: the touch is retried after the interval,
+    // not by every call, so a contended database is not hit harder.
+    match outcome {
+        Outcome::Ok(()) => {
+            // Evict a cached row rather than patching it: a patched copy could
+            // overwrite a concurrent writer's fresher row (e.g. a contact
+            // policy change). This costs one re-read per agent per interval.
+            let cache = crate::cache::read_cache();
+            let scope = cache_scope_for_pool(pool);
+            if let Some(agent) = cache.get_agent_by_id_scoped(&scope, agent_id) {
+                cache.invalidate_agent_scoped(
+                    &scope,
+                    agent.project_id,
+                    &agent.name,
+                    Some(agent_id),
+                );
+            }
+            Outcome::Ok(true)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Flush touches queued in the read cache's deferred-touch queue.
+///
+/// [`touch_agent`] writes through (throttled) and no longer enqueues here;
+/// this drains only entries a caller placed on the queue directly.
 pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
     let read_cache = crate::cache::read_cache();
     let cache_scope = cache_scope_for_pool(pool);
@@ -6983,18 +7208,26 @@ async fn get_agent_deregistered_at_in_tx(
 }
 
 /// Return the explicit deregistration timestamp for an agent, if present.
+///
+/// Every send and reply runs this for the sender and each recipient, so under
+/// concurrent writers it meets transient busy (including the WAL recovery
+/// fence, "recovery in progress"); it retries like the other idempotent reads
+/// instead of failing the whole send with `RESOURCE_BUSY` (br-fohxo).
 pub async fn get_agent_deregistered_at(
     cx: &Cx,
     pool: &DbPool,
     agent_id: i64,
 ) -> Outcome<Option<i64>, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    get_agent_deregistered_at_in_tx(cx, &tracked(&*conn), agent_id).await
+    run_read_with_mvcc_retry(cx, "get_agent_deregistered_at", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        get_agent_deregistered_at_in_tx(cx, &tracked(&*conn), agent_id).await
+    })
+    .await
 }
 
 /// Return the ids of deregistered agents in one project.
@@ -8106,8 +8339,8 @@ pub async fn create_message(
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
-	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, archive_metadata_json) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')";
         let params = [
             Value::BigInt(message_id),
             Value::BigInt(project_id),
@@ -8154,24 +8387,8 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(pool, &row) {
-        tracing::warn!(
-            message_id = row.id.unwrap_or_default(),
-            error = %error,
-            "message committed but incremental search indexing failed"
-        );
-    }
+    crate::search_service::note_message_ingested();
     Outcome::Ok(row)
-}
-
-fn index_created_message_best_effort(
-    pool: &DbPool,
-    row: &MessageRow,
-) -> std::result::Result<bool, String> {
-    let Some(message_id) = row.id else {
-        return Ok(false);
-    };
-    crate::search_v3::index_message(pool.sqlite_path(), message_id)
 }
 
 /// Elect the next canonical message id durably inside the caller's write
@@ -8311,8 +8528,8 @@ async fn elect_message_id_in_tx(
 /// recipient INSERTs) into a single transaction with 1 fsync.
 ///
 /// On MVCC write conflicts (`BEGIN CONCURRENT` page collision), the entire
-/// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 5)
-/// with exponential backoff (10–200 ms).
+/// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 16)
+/// with the exponential backoff described at `mvcc_backoff`.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients(
     cx: &Cx,
@@ -8336,6 +8553,7 @@ pub async fn create_message_with_recipients(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -8344,7 +8562,11 @@ pub async fn create_message_with_recipients(
     .await
 }
 
-/// Create a message with an optional topic and all recipients atomically.
+/// Create a message with an optional topic, exact reply parent and all recipients atomically.
+///
+/// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
+/// records authoritative absence, allowing a fresh threaded send to recover
+/// even if its first archive write and journal enqueue both fail.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -8355,6 +8577,7 @@ pub async fn create_message_with_recipients_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -8369,7 +8592,7 @@ pub async fn create_message_with_recipients_topic(
         body_md,
         thread_id,
         topic,
-        None,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -8476,6 +8699,7 @@ pub async fn create_message_with_recipients_idempotent(
         body_md,
         thread_id,
         None,
+        None,
         importance,
         ack_required,
         attachments,
@@ -8496,6 +8720,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     body_md: &str,
     thread_id: Option<&str>,
     topic: Option<&str>,
+    reply_to: Option<i64>,
     importance: &str,
     ack_required: bool,
     attachments: &str,
@@ -8511,7 +8736,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         body_md,
         thread_id,
         topic,
-        None,
+        reply_to,
         importance,
         ack_required,
         attachments,
@@ -8575,25 +8800,31 @@ async fn create_message_with_recipients_impl(
     recipients: &[(i64, &str)], // (agent_id, kind)
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
-    // Use the owned guard because this critical section intentionally spans
-    // async database and archive I/O. The borrowed guard is deliberately
-    // thread-affine, which would make this public future non-Send.
-    let _serializer_guard =
-        match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx)
-            .await
-        {
-            Ok(guard) => guard,
-            Err(asupersync::sync::LockError::Cancelled) => {
-                return Outcome::Cancelled(CancelReason::user(
-                    "create_message_with_recipients serializer lock cancelled",
-                ));
-            }
-            Err(error) => {
-                return Outcome::Err(DbError::Internal(format!(
-                    "create_message_with_recipients serializer lock failed: {error}"
-                )));
-            }
-        };
+    if reply_to.is_some_and(|parent| parent <= 0)
+        || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
+    {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a reply requires a positive immediate parent and a nonempty thread"
+                .to_string(),
+        });
+    }
+    // Held from id election through the insert transaction and the writer's own
+    // post-commit sample, then released before the fresh-handle visibility
+    // probe (br-kp1in.32).
+    let serializer_guard = match lock_message_write_serializer(cx).await {
+        Ok(guard) => guard,
+        Err(asupersync::sync::LockError::Cancelled) => {
+            return Outcome::Cancelled(CancelReason::user(
+                "create_message_with_recipients serializer lock cancelled",
+            ));
+        }
+        Err(error) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "create_message_with_recipients serializer lock failed: {error}"
+            )));
+        }
+    };
     // De-duplicate resolved recipient ids before any insert. The
     // `message_recipients` primary key is `(message_id, agent_id)` — `kind` is
     // NOT part of it — so the same agent appearing twice in `recipients` (e.g.
@@ -8783,6 +9014,12 @@ async fn create_message_with_recipients_impl(
         drop(conn);
         (row, writer_post_commit_counts)
     };
+    // The insert is committed and the writer sampled its own rows; the
+    // fresh-handle probe below opens its own connections per query and must not
+    // hold every other in-process send behind it. A probe miss still cannot
+    // delete a message the writer's sample confirmed (GH#179), and the rare
+    // compensating delete re-takes the serializer.
+    drop(serializer_guard);
 
     let Some(message_id) = row.id else {
         return Outcome::Err(DbError::Internal(
@@ -8840,6 +9077,9 @@ async fn create_message_with_recipients_impl(
                 error,
                 writer_post_commit_counts,
             );
+            // The compensating delete is serialized like the insert it undoes;
+            // if the lock wait is cancelled the ghost is still cleaned up.
+            let _cleanup_guard = lock_message_write_serializer(cx).await.ok();
             return Outcome::Err(
                 cleanup_message_after_post_commit_probe_failure(
                     cx,
@@ -9045,6 +9285,13 @@ async fn create_message_with_recipients_tx(
         tracked,
         elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
+    if reply_to == Some(message_id) {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "reply_to",
+            message: "a message cannot be its own reply parent".to_string(),
+        });
+    }
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -9087,6 +9334,13 @@ async fn create_message_with_recipients_tx(
     })
     .to_string();
 
+    // Persist before COMMIT and inside the idempotency gate. A replay neither
+    // invents a missing legacy parent nor rewrites the original lineage.
+    let archive_metadata_json = reply_to.map_or_else(
+        || "{}".to_string(),
+        |parent| serde_json::json!({"reply_to": parent}).to_string(),
+    );
+
     // Insert the message with an EXPLICIT id (mcp_agent_mail#176). We do not
     // rely on AUTOINCREMENT + a deterministic read-back here: the id was
     // allocated by the process-wide monotonic allocator in the caller, so it
@@ -9096,8 +9350,8 @@ async fn create_message_with_recipients_tx(
     // engine state. (Inserting an explicit id > the current sequence also
     // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-        (id, project_id, sender_id, thread_id, topic, reply_to, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        (id, project_id, sender_id, thread_id, topic, reply_to, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(message_id),
         Value::BigInt(project_id),
@@ -9112,6 +9366,7 @@ async fn create_message_with_recipients_tx(
         Value::BigInt(now),
         Value::Text(recipients_json_val.clone()),
         Value::Text(attachments.to_string()),
+        Value::Text(archive_metadata_json),
     ];
 
     try_in_tx!(
@@ -9236,6 +9491,84 @@ async fn create_message_with_recipients_tx(
 // for BEGIN/COMMIT/ROLLBACK) so the key record commits atomically with the
 // mutation it guards. See `crate::idempotency` for the durability rationale.
 
+/// Look up an already committed, unexpired idempotency result without mutating
+/// the database or waiting for a writer transaction.
+///
+/// `None` means the key is absent or expired. `Some(Ok(result))` is the original
+/// result, while `Some(Err(conflict))` rejects a changed request. A miss is only
+/// an optimization hint: the mutating entry point must still check and record
+/// the claim inside its own transaction to serialize concurrent first calls.
+/// Expired records are ignored here; pruning belongs to the write path.
+pub async fn lookup_idempotency_result<T: DeserializeOwned>(
+    cx: &Cx,
+    pool: &DbPool,
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<Option<std::result::Result<T, IdempotencyConflict>>, DbError> {
+    run_read_with_mvcc_retry(cx, "lookup_idempotency_result", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        };
+        let tracked = tracked(&*conn);
+        let result = async {
+            // Observe one read snapshot without the writer lock used by the
+            // mutation's authoritative claim check.
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
+            );
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
+                         WHERE project_id = ? AND tool = ? AND idempotency_key = ? AND expires_ts >= ?",
+                        &[
+                            Value::BigInt(claim.project_id),
+                            Value::Text(claim.tool.to_string()),
+                            Value::Text(claim.key.to_string()),
+                            Value::BigInt(now_micros()),
+                        ],
+                    )
+                    .await
+                )
+            );
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+
+            match decode_idempotency_check(rows.first(), claim) {
+                Ok(IdempotencyCheck::Proceed) => Outcome::Ok(None),
+                Ok(IdempotencyCheck::Replay(result_json)) => {
+                    match decode_idempotency_result(&result_json, claim.tool) {
+                        Ok(result) => Outcome::Ok(Some(Ok(result))),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Ok(IdempotencyCheck::Conflict(conflict)) => Outcome::Ok(Some(Err(conflict))),
+                Err(error) => Outcome::Err(error),
+            }
+        }
+        .await;
+        if let Outcome::Err(error) = &result
+            && is_mvcc_error(error)
+        {
+            // BEGIN/ROLLBACK cannot repair an opened pager whose visibility
+            // predates this connection's execution clock (br-9m5il). Returning
+            // it to the pool retries the same obsolete view until exhaustion.
+            // Rollback has completed above; retire only this failed checkout
+            // so the existing bounded retry obtains a fresh runtime handle.
+            tracked.retire_on_drop();
+        }
+        result
+    })
+    .await
+}
+
 /// Resolve an idempotency claim against `idempotency_keys` inside an already-open
 /// transaction.
 ///
@@ -9287,17 +9620,27 @@ async fn idempotency_check_in_tx(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let Some(row) = rows.first() else {
-        return Outcome::Ok(IdempotencyCheck::Proceed);
+    match decode_idempotency_check(rows.first(), claim) {
+        Ok(result) => Outcome::Ok(result),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+fn decode_idempotency_check(
+    row: Option<&SqlRow>,
+    claim: IdempotencyClaim<'_>,
+) -> std::result::Result<IdempotencyCheck, DbError> {
+    let Some(row) = row else {
+        return Ok(IdempotencyCheck::Proceed);
     };
-    let stored_fingerprint = row.get_as::<String>(0).unwrap_or_default();
-    let result_json = row.get_as::<String>(1).unwrap_or_default();
-    let original_created_ts = row.get_as::<i64>(2).unwrap_or(0);
+    let stored_fingerprint = row.get_as::<String>(0).map_err(|e| map_sql_error(&e))?;
+    let result_json = row.get_as::<String>(1).map_err(|e| map_sql_error(&e))?;
+    let original_created_ts = row.get_as::<i64>(2).map_err(|e| map_sql_error(&e))?;
 
     if stored_fingerprint == claim.fingerprint {
-        Outcome::Ok(IdempotencyCheck::Replay(result_json))
+        Ok(IdempotencyCheck::Replay(result_json))
     } else {
-        Outcome::Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
+        Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
             tool: claim.tool.to_string(),
             key: claim.key.to_string(),
             original_fingerprint: stored_fingerprint,
@@ -12433,6 +12776,231 @@ const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
        AND (r.read_ts IS NULL \
             OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
 
+/// Maximum message payload admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
+/// Maximum delivery fan-out admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_RECIPIENTS: usize = 1024;
+/// Maximum recipient-name bytes admitted to an archive observation.
+pub const MESSAGE_ARCHIVE_MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
+/// Maximum candidate IDs examined in one destructive retention pass.
+pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
+
+/// One bounded statement observes the complete archive source and its routing.
+///
+/// The message occupies one row, followed by its durable deliveries, so a large
+/// body is not repeated for every recipient. Archive verification and the final
+/// retention transaction use this same projection. The final identity/receipt
+/// columns also detect changes that do not alter a rendered recipient name.
+/// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
+/// then append the fixed recipient limit plus two rows as an overflow witness.
+pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
+SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
+       m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+       m.archive_metadata_json, \
+       p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
+       NULL AS recipient_id, NULL AS recipient_project_id, \
+       NULL AS recipient_name, NULL AS recipient_kind, \
+       m.sender_id, a.project_id AS sender_project_id, \
+       NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
+FROM messages m JOIN projects p ON p.id = m.project_id \
+JOIN agents a ON a.id = m.sender_id \
+WHERE m.id = ?1 AND \
+      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+      length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
+      length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
+      length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+      COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
+UNION ALL \
+SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, mr.agent_id, a.project_id, \
+       CASE WHEN length(CAST(a.name AS BLOB)) <= ?3 THEN a.name ELSE NULL END, \
+       CASE WHEN length(CAST(mr.kind AS BLOB)) <= 3 THEN mr.kind ELSE NULL END, \
+       NULL, NULL, \
+       CASE WHEN mr.read_ts IS NULL OR typeof(mr.read_ts) = 'integer' \
+            THEN mr.read_ts ELSE 'invalid_receipt' END, \
+       CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
+            THEN mr.ack_ts ELSE 'invalid_receipt' END \
+FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
+WHERE mr.message_id = ?1 \
+ORDER BY row_kind, recipient_id";
+
+const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
+
+fn message_archive_source_sql() -> String {
+    // The pinned compound-select executor requires a literal LIMIT. All
+    // request/source values remain bound parameters.
+    format!(
+        "{MESSAGE_ARCHIVE_SOURCE_SQL} LIMIT {}",
+        MESSAGE_ARCHIVE_MAX_RECIPIENTS + 2
+    )
+}
+
+fn message_archive_source_params(id: i64) -> [Value; 3] {
+    [
+        Value::BigInt(id),
+        Value::BigInt(MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES),
+        Value::BigInt(MESSAGE_ARCHIVE_MAX_RECIPIENT_NAME_BYTES),
+    ]
+}
+
+/// Immutable DB observation supplied to the archive verifier before pruning.
+///
+/// Capturing this value does not establish archive durability. Only pass it to
+/// [`prune_verified_settled_messages`] after verifying the canonical message,
+/// every mailbox copy, and attachment evidence against these exact rows.
+#[derive(Debug)]
+pub struct MessagePruneCandidate {
+    id: i64,
+    source_identity: String,
+    source_rows: Vec<SqlRow>,
+}
+
+impl MessagePruneCandidate {
+    #[must_use]
+    pub const fn id(&self) -> i64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn source_rows(&self) -> &[SqlRow] {
+        &self.source_rows
+    }
+}
+
+/// Bounded age/settlement candidates within one finite ID range. Failed
+/// archive proofs can be revisited after the caller completes this range.
+#[derive(Debug, Default)]
+pub struct MessagePruneIdPage {
+    pub ids: Vec<i64>,
+    pub ceiling: i64,
+    pub more: bool,
+}
+
+pub async fn list_prunable_message_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    older_than_us: i64,
+    after_id: i64,
+    ceiling: Option<i64>,
+    max_messages: usize,
+) -> Outcome<MessagePruneIdPage, DbError> {
+    if max_messages == 0 {
+        return Outcome::Ok(MessagePruneIdPage {
+            ceiling: ceiling.unwrap_or(0),
+            ..Default::default()
+        });
+    }
+    let limit = max_messages.min(MESSAGE_PRUNE_MAX_CANDIDATES);
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let ceiling = match ceiling {
+        Some(ceiling) => ceiling,
+        None => match map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                &[],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        },
+    };
+    let sql = format!(
+        "SELECT m.id FROM messages m WHERE m.id > ? AND m.id <= ? \
+         AND m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} ORDER BY m.id LIMIT ?"
+    );
+    let params = [
+        Value::BigInt(after_id.max(0)),
+        Value::BigInt(ceiling),
+        Value::BigInt(older_than_us),
+        Value::BigInt(i64::try_from(limit + 1).unwrap_or(i64::MAX)),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => Outcome::Ok(MessagePruneIdPage {
+            ids: rows.iter().take(limit).filter_map(row_first_i64).collect(),
+            ceiling,
+            more: rows.len() > limit,
+        }),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Capture exactly the bounded source projection that archive verification
+/// must inspect. Missing, oversized, or excessive-fan-out messages are retained.
+pub async fn capture_message_prune_candidate(
+    cx: &Cx,
+    pool: &DbPool,
+    id: i64,
+) -> Outcome<Option<MessagePruneCandidate>, DbError> {
+    if id <= 0 {
+        return Outcome::Ok(None);
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            &message_archive_source_sql(),
+            &message_archive_source_params(id),
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let complete = rows.len() <= MESSAGE_ARCHIVE_MAX_RECIPIENTS + 1
+        && rows.first().is_some_and(|row| {
+            row.get(0).and_then(value_as_i64) == Some(0)
+                && row.get(1).and_then(value_as_i64) == Some(id)
+        })
+        && rows.iter().skip(1).all(|row| {
+            [22, 23].into_iter().all(|index| {
+                row.get(index).is_some_and(|value| {
+                    matches!(value, Value::Null) || value_as_i64(value).is_some()
+                })
+            })
+        });
+    if !complete {
+        return Outcome::Ok(None);
+    }
+    Outcome::Ok(Some(MessagePruneCandidate {
+        id,
+        source_identity: pool.sqlite_identity_key(),
+        source_rows: rows,
+    }))
+}
+
+fn message_archive_source_matches(expected: &[SqlRow], current: &[SqlRow]) -> bool {
+    expected.len() == current.len()
+        && expected.iter().zip(current).all(|(expected, current)| {
+            (0..MESSAGE_ARCHIVE_SOURCE_COLUMNS).all(|index| {
+                expected.get(index).is_some() && expected.get(index) == current.get(index)
+            })
+        })
+}
+
 /// Count settled messages older than `older_than_us` (GH#273).
 ///
 /// "Settled" means read by every recipient and acked where the message
@@ -12478,84 +13046,56 @@ pub struct MessagePruneReport {
     pub more: bool,
 }
 
-/// Retention sweep: hard-`DELETE` settled messages older than `older_than_us`
-/// (GH#273, the demand-side twin of [`prune_released_file_reservations`]).
+/// Delete only the exact message observations already verified in the archive.
 ///
-/// A message is eligible when BOTH:
-///   1. it is settled — every recipient has `read_ts`, and every recipient
-///      has `ack_ts` when the message has `ack_required` — so unread or
-///      unacknowledged mail is NEVER pruned, AND
-///   2. `created_ts <= older_than_us`.
+/// The caller must verify committed canonical, outbox, inbox, and attachment
+/// evidence against each candidate's source rows, while holding its live-source
+/// write activity guard. This function then checks pool identity, age, settled
+/// receipts, and the entire source projection again inside the write transaction
+/// before removing any children. Changed candidates remain in SQLite for a later
+/// pass. An empty verified list authorizes no deletion.
 ///
-/// The per-project git archive (`projects/<slug>/messages/YYYY/MM/*.md` plus
-/// mailbox copies) retains the full message history independently, so the DB
-/// delete is non-destructive to the durable record — the same precedent as
-/// the file-reservation retention prune (GH#154).
-///
-/// Deletes are executed oldest-first in bounded batches of `batch_size`
-/// messages, each in its own transaction (fsqlite-friendly: bounded write
-/// sets, never one giant transaction), with at most `max_messages` messages
-/// removed per sweep. Rows referencing each pruned message are removed in
-/// FK-safe order inside the same transaction: signal receipts and delivery
-/// events first, then recipient rows, then the message itself (the
-/// `messages_ad` trigger clears `fts_messages`). Affected agents'
-/// `inbox_stats` are rebuilt in-transaction and their cached counts
-/// invalidated post-commit.
-pub async fn prune_settled_messages(
+/// Each bounded transaction removes signal receipts, delivery events,
+/// recipients, and messages in FK-safe order, rebuilds affected inbox counters,
+/// and invalidates their caches only after commit. `more` reports candidates
+/// skipped because their source or eligibility changed; the caller combines
+/// this with its bounded candidate page and unverified archive backlog.
+pub async fn prune_verified_settled_messages(
     cx: &Cx,
     pool: &DbPool,
     older_than_us: i64,
     batch_size: usize,
-    max_messages: usize,
+    candidates: &[MessagePruneCandidate],
 ) -> Outcome<MessagePruneReport, DbError> {
     let mut report = MessagePruneReport::default();
-    if max_messages == 0 {
+    if candidates.is_empty() {
         return Outcome::Ok(report);
     }
-    let batch_size = batch_size.clamp(1, MAX_IN_CLAUSE_ITEMS);
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-
-    // Select eligible ids first (mirrors prune_released_file_reservations —
-    // never trust a correlated DELETE), over-fetching by one so the report
-    // can state whether backlog remains past the per-sweep cap.
-    let select_sql = format!(
-        "SELECT m.id FROM messages m \
-         WHERE m.created_ts <= ? AND {SETTLED_MESSAGE_PREDICATE} \
-         ORDER BY m.id LIMIT ?"
+    if candidates.len() > MESSAGE_PRUNE_MAX_CANDIDATES {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "candidates",
+            message: "message retention candidate limit exceeded".to_string(),
+        });
+    }
+    let source_identity = pool.sqlite_identity_key();
+    let mut unique_ids = HashSet::with_capacity(candidates.len());
+    if candidates.iter().any(|candidate| {
+        candidate.source_identity != source_identity || !unique_ids.insert(candidate.id)
+    }) {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "candidates",
+            message: "message retention requires unique candidates from the same live pool"
+                .to_string(),
+        });
+    }
+    let batch_size = batch_size.clamp(1, MESSAGE_PRUNE_MAX_CANDIDATES);
+    let source_sql = message_archive_source_sql();
+    let eligibility_sql = format!(
+        "SELECT m.id FROM messages m WHERE m.id = ? AND m.created_ts <= ? \
+         AND {SETTLED_MESSAGE_PREDICATE}"
     );
-    let overfetch = i64::try_from(max_messages.saturating_add(1)).unwrap_or(i64::MAX);
-    let params = [Value::BigInt(older_than_us), Value::BigInt(overfetch)];
-    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let mut ids: Vec<i64> = Vec::with_capacity(rows.len().min(max_messages));
-    for row in &rows {
-        if let Some(id) = row_first_i64(row)
-            && ids.len() < max_messages
-        {
-            ids.push(id);
-        }
-    }
-    report.more = rows.len() > max_messages;
-    if ids.is_empty() {
-        return Outcome::Ok(report);
-    }
-    drop(conn);
 
-    for chunk in ids.chunks(batch_size) {
-        let ph = placeholders(chunk.len());
-        let chunk_params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
-
+    for chunk in candidates.chunks(batch_size) {
         let batch_outcome = run_with_mvcc_retry(cx, "prune_settled_messages_batch", || async {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
@@ -12564,7 +13104,60 @@ pub async fn prune_settled_messages(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
             let tracked = self::tracked(&*conn);
-            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+            // The source/eligibility check and cascade must serialize against
+            // payload edits and new recipients, including phantom insertions.
+            try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+            if pool.sqlite_identity_key() != source_identity {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::InvalidArgument {
+                    field: "candidates",
+                    message: "message retention source pool changed".to_string(),
+                });
+            }
+
+            let mut ids = Vec::with_capacity(chunk.len());
+            for candidate in chunk {
+                let eligible = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_query(
+                            cx,
+                            &tracked,
+                            &eligibility_sql,
+                            &[Value::BigInt(candidate.id), Value::BigInt(older_than_us)],
+                        )
+                        .await
+                    )
+                );
+                if eligible.first().and_then(row_first_i64) != Some(candidate.id) {
+                    continue;
+                }
+                let current = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_query(
+                            cx,
+                            &tracked,
+                            &source_sql,
+                            &message_archive_source_params(candidate.id),
+                        )
+                        .await
+                    )
+                );
+                if message_archive_source_matches(&candidate.source_rows, &current) {
+                    ids.push(candidate.id);
+                }
+            }
+            let skipped = ids.len() != chunk.len();
+            if ids.is_empty() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Ok((0, 0, Vec::new(), skipped));
+            }
+            let ph = placeholders(ids.len());
+            let chunk_params: Vec<Value> = ids.into_iter().map(Value::BigInt).collect();
 
             // Capture affected recipients before their rows are removed so
             // inbox_stats can be rebuilt from ground truth in this
@@ -12625,15 +13218,16 @@ pub async fn prune_settled_messages(
             }
 
             try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids))
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids, skipped))
         })
         .await;
 
         let chunk_agents = match batch_outcome {
-            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids)) => {
+            Outcome::Ok((messages_deleted, recipients_deleted, agent_ids, skipped)) => {
                 report.deleted_messages = report.deleted_messages.saturating_add(messages_deleted);
                 report.deleted_recipients =
                     report.deleted_recipients.saturating_add(recipients_deleted);
+                report.more |= skipped;
                 agent_ids
             }
             Outcome::Err(e) => return Outcome::Err(e),
@@ -13832,11 +14426,7 @@ async fn create_file_reservations_impl(
     reason: &str,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
-    let now = now_micros();
     let lease_extension = ttl_seconds.saturating_mul(1_000_000);
-    let expires = now.saturating_add(lease_extension);
-    let idempotency_expires_ts =
-        now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
     run_with_mvcc_retry(cx, "create_file_reservations", || async {
         let conn = match acquire_conn(cx, pool).await {
@@ -13851,6 +14441,16 @@ async fn create_file_reservations_impl(
         // Batch all reservation inserts in a single transaction (1 fsync instead of N).
         // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        // Date a new lease when its write attempt is admitted. A request may
+        // wait through an outage before obtaining this transaction; backdating
+        // it to request start would let an older queued release consume it.
+        // Retries also receive a fresh TTL and idempotency retention window.
+        // Renewing an existing lease below preserves its original created_ts.
+        let now = now_micros();
+        let expires = now.saturating_add(lease_extension);
+        let idempotency_expires_ts =
+            now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
         // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
         // matching prior key replays the original reservation rows without
@@ -13975,7 +14575,19 @@ async fn create_file_reservations_impl(
                         )));
                     };
                     row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
-                    let renew_params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+                    // Re-acquisition applies the new request's intent as well
+                    // as its TTL. In particular, shared -> exclusive must not
+                    // report a successful acquisition that still lets peers
+                    // acquire shared leases. The requested mode was checked
+                    // against every peer above in this same transaction.
+                    row.exclusive = i64::from(exclusive);
+                    row.reason = reason.to_string();
+                    let renew_params = [
+                        Value::BigInt(row.expires_ts),
+                        Value::BigInt(row.exclusive),
+                        Value::Text(row.reason.clone()),
+                        Value::BigInt(id),
+                    ];
                     try_in_tx!(
                         cx,
                         &tracked,
@@ -13983,7 +14595,8 @@ async fn create_file_reservations_impl(
                             traw_execute(
                                 cx,
                                 &tracked,
-                                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                                "UPDATE file_reservations \
+                                 SET expires_ts = ?, \"exclusive\" = ?, reason = ? WHERE id = ?",
                                 &renew_params,
                             )
                             .await
@@ -14357,6 +14970,13 @@ enum ReleaseReservationExpiryConstraint {
     Exact(i64),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReleaseReservationScope {
+    project_id: i64,
+    agent_id: i64,
+    created_at_or_before: Option<i64>,
+}
+
 fn release_reservation_chunk_plan(
     path_count: usize,
     reservation_id_count: usize,
@@ -14452,8 +15072,8 @@ fn apply_release_markers(
     reservations
 }
 
-/// Release file reservations
-#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+/// Release file reservations.
+#[allow(clippy::must_use_candidate)]
 pub fn release_reservations<'a>(
     cx: &'a Cx,
     pool: &'a DbPool,
@@ -14461,6 +15081,38 @@ pub fn release_reservations<'a>(
     agent_id: i64,
     paths: Option<&'a [&'a str]>,
     reservation_ids: Option<&'a [i64]>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
+> {
+    release_reservations_with_created_cutoff(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        reservation_ids,
+        None,
+    )
+}
+
+/// Release reservations that belonged to the request's scope at its creation
+/// cutoff.
+///
+/// Degraded release replay supplies the durable intent timestamp so an old
+/// release-all or path filter cannot release leases acquired afterward.
+///
+/// The final write transaction rechecks the owner and cutoff: candidate IDs
+/// selected before a concurrent replacement are never sufficient authority.
+/// `None` retains the ordinary direct-release behavior.
+#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+pub fn release_reservations_with_created_cutoff<'a>(
+    cx: &'a Cx,
+    pool: &'a DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&'a [&'a str]>,
+    reservation_ids: Option<&'a [i64]>,
+    created_at_or_before: Option<i64>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
 > {
@@ -14477,13 +15129,14 @@ pub fn release_reservations<'a>(
                 ReleaseReservationChunkTarget::ReservationIds => {
                     if let Some(ids) = reservation_ids {
                         for chunk in ids.chunks(chunk_size) {
-                            let rows = match release_reservations(
+                            let rows = match release_reservations_with_created_cutoff(
                                 cx,
                                 pool,
                                 project_id,
                                 agent_id,
                                 paths,
                                 Some(chunk),
+                                created_at_or_before,
                             )
                             .await
                             {
@@ -14499,13 +15152,14 @@ pub fn release_reservations<'a>(
                 ReleaseReservationChunkTarget::Paths => {
                     if let Some(pats) = paths {
                         for chunk in pats.chunks(chunk_size) {
-                            let rows = match release_reservations(
+                            let rows = match release_reservations_with_created_cutoff(
                                 cx,
                                 pool,
                                 project_id,
                                 agent_id,
                                 Some(chunk),
                                 reservation_ids,
+                                created_at_or_before,
                             )
                             .await
                             {
@@ -14544,6 +15198,10 @@ pub fn release_reservations<'a>(
             );
             let mut filter_params: Vec<Value> =
                 vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+            if let Some(cutoff) = created_at_or_before {
+                filter_sql.push_str(" AND created_ts <= ?");
+                filter_params.push(Value::BigInt(cutoff));
+            }
             append_release_reservation_filters(
                 &mut filter_sql,
                 &mut filter_params,
@@ -14614,13 +15272,25 @@ pub fn release_reservations<'a>(
             return Outcome::Ok(reservations);
         }
 
-        let released_markers =
-            match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
-                Outcome::Ok(markers) => markers,
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
+        let scope = ReleaseReservationScope {
+            project_id,
+            agent_id,
+            created_at_or_before,
+        };
+        let released_markers = match release_reservations_by_ids_with_constraints(
+            cx,
+            pool,
+            &target_ids,
+            ReleaseReservationExpiryConstraint::Any,
+            Some(scope),
+        )
+        .await
+        {
+            Outcome::Ok(markers) => markers,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
         Outcome::Ok(apply_release_markers(reservations, &released_markers))
     }) // Box::pin(async move {
@@ -14638,16 +15308,18 @@ async fn release_reservations_by_ids_matching_expiry(
         .map_or(ReleaseReservationExpiryConstraint::Any, |cutoff| {
             ReleaseReservationExpiryConstraint::OnOrBefore(cutoff)
         });
-    release_reservations_by_ids_with_expiry_constraint(cx, pool, ids, expiry_constraint).await
+    release_reservations_by_ids_with_constraints(cx, pool, ids, expiry_constraint, None).await
 }
 
 /// Internal release primitive that supports exact-match and cutoff-based
-/// expiry guards without changing the public DB API.
-async fn release_reservations_by_ids_with_expiry_constraint(
+/// expiry guards, plus transaction-time ownership/creation checks for scoped
+/// releases and durable release replay.
+async fn release_reservations_by_ids_with_constraints(
     cx: &Cx,
     pool: &DbPool,
     ids: &[i64],
     expiry_constraint: ReleaseReservationExpiryConstraint,
+    scope: Option<ReleaseReservationScope>,
 ) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
     if ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -14698,6 +15370,12 @@ async fn release_reservations_by_ids_with_expiry_constraint(
                 check_sql.push_str(" AND expires_ts = ?");
             }
         }
+        if let Some(scope) = scope {
+            check_sql.push_str(" AND project_id = ? AND agent_id = ?");
+            if scope.created_at_or_before.is_some() {
+                check_sql.push_str(" AND created_ts <= ?");
+            }
+        }
         check_sql.push_str(" LIMIT 1");
 
         // Record the release in both the base row and the sidecar ledger. The
@@ -14718,6 +15396,13 @@ async fn release_reservations_by_ids_with_expiry_constraint(
                 ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
                 | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
                     check_params.push(Value::BigInt(expiry_cutoff));
+                }
+            }
+            if let Some(scope) = scope {
+                check_params.push(Value::BigInt(scope.project_id));
+                check_params.push(Value::BigInt(scope.agent_id));
+                if let Some(cutoff) = scope.created_at_or_before {
+                    check_params.push(Value::BigInt(cutoff));
                 }
             }
             let eligible_rows = try_in_tx!(
@@ -14769,7 +15454,6 @@ pub async fn renew_reservations(
     paths: Option<&[&str]>,
     reservation_ids: Option<&[i64]>,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
-    let now = now_micros();
     let extend = extend_seconds.saturating_mul(1_000_000);
 
     // Retry the whole read-modify-write with an attempt-local connection.
@@ -14783,8 +15467,12 @@ pub async fn renew_reservations(
 
     let tracked = tracked(&*conn);
 
-    // Partial renewals cannot occur if the process crashes or is cancelled.
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    // Serialize admission with fresh grants and releases. A renewal queued
+    // behind checkout/writer contention must not revive a lease that expired
+    // while another holder acquired the path. Each retry gets a fresh cutoff
+    // only after admission, just like create_file_reservations.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        let now = now_micros();
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(
@@ -14859,8 +15547,19 @@ pub async fn renew_reservations(
             }
         };
 
+        let update_sql = format!(
+            "UPDATE file_reservations SET expires_ts = ? \
+             WHERE id = ? AND project_id = ? AND agent_id = ? \
+               AND expires_ts = ? AND expires_ts > ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
+        let verify_sql = format!(
+            "SELECT expires_ts FROM file_reservations \
+             WHERE id = ? AND project_id = ? AND agent_id = ? \
+               AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
         for row in &mut reservations {
-            let base = row.expires_ts.max(now);
+            let old_expires = row.expires_ts;
+            let base = old_expires.max(now);
             row.expires_ts = base.saturating_add(extend);
             let Some(id) = row.id else {
                 rollback_tx(cx, &tracked).await;
@@ -14869,13 +15568,37 @@ pub async fn renew_reservations(
                 ));
             };
 
-            let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
-            let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+            let params = [
+                Value::BigInt(row.expires_ts),
+                Value::BigInt(id),
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::BigInt(old_expires),
+                Value::BigInt(now),
+            ];
             try_in_tx!(
                 cx,
                 &tracked,
-                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &params).await)
             );
+            // The backend can under-report rows_affected. Require the actual
+            // stored expiry before returning a successful renewal to archive.
+            let stored = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(
+                    cx,
+                    &tracked,
+                    &verify_sql,
+                    &[Value::BigInt(id), Value::BigInt(project_id), Value::BigInt(agent_id)],
+                ).await)
+            );
+            if stored.first().and_then(row_first_i64) != Some(row.expires_ts) {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "renew_reservations: eligible lease expiry was not stored".to_string(),
+                ));
+            }
         }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
@@ -15386,10 +16109,15 @@ pub async fn request_contact(
             Outcome::Ok(_) => {}
             Outcome::Err(e) => {
                 if is_contact_pair_unique_violation(&e) {
+                    // br-xhfoz: an approval still in force (the predicate
+                    // `list_approved_contact_ids` uses) is the target's consent;
+                    // a repeated or concurrent request must not reset it to
+                    // pending. Expired approvals and pending links refresh.
                     let refresh_sql = "UPDATE agent_links \
                         SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
                         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
-                          AND status != 'blocked'";
+                          AND status != 'blocked' \
+                          AND (status != 'approved' OR (expires_ts IS NOT NULL AND expires_ts <= ?))";
                     let refresh_params = vec![
                         Value::Text(reason.to_string()),
                         Value::BigInt(now),
@@ -15398,6 +16126,7 @@ pub async fn request_contact(
                         Value::BigInt(from_agent_id),
                         Value::BigInt(to_project_id),
                         Value::BigInt(to_agent_id),
+                        Value::BigInt(now),
                     ];
                     let _updated_rows = try_in_tx!(
                         cx,
@@ -16120,11 +16849,12 @@ pub async fn force_release_reservation(
         .map_or(ReleaseReservationExpiryConstraint::Any, |expires_ts| {
             ReleaseReservationExpiryConstraint::Exact(expires_ts)
         });
-    match release_reservations_by_ids_with_expiry_constraint(
+    match release_reservations_by_ids_with_constraints(
         cx,
         pool,
         &[reservation_id],
         expiry_constraint,
+        None,
     )
     .await
     {
@@ -16226,6 +16956,54 @@ pub async fn list_product_projects(
             }
             Outcome::Ok(out)
         }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// GH#335: find an agent named `name` (case-insensitive) registered in another
+/// project that shares a product with `project_id`.
+///
+/// Returns the peer's `(project human_key, canonical agent name)`, or `None`
+/// when `project_id` is in no product or no linked project has that name.
+pub async fn find_agent_in_product_peer_projects(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+) -> Outcome<Option<(String, String)>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT a.name AS name, \
+                      COALESCE(NULLIF(TRIM(p.human_key), ''), '[unknown-project-' || a.project_id || ']') AS human_key \
+               FROM agents a \
+               LEFT JOIN projects p ON p.id = a.project_id \
+               WHERE a.project_id IN ( \
+                         SELECT peer.project_id FROM product_project_links peer \
+                         WHERE peer.product_id IN ( \
+                             SELECT mine.product_id FROM product_project_links mine \
+                             WHERE mine.project_id = ?)) \
+                 AND a.project_id <> ? \
+                 AND a.name = ? COLLATE NOCASE \
+               ORDER BY a.project_id ASC, a.id ASC LIMIT 1";
+    let params = [
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(|row| {
+            let name = row.get_named::<String>("name").ok()?;
+            let human_key = row.get_named::<String>("human_key").ok()?;
+            Some((human_key, name))
+        })),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -20428,6 +21206,48 @@ mod tests {
 
         assert!(matches!(result, Outcome::Ok(3)));
         assert_eq!(attempts.get(), 3, "must restart the whole transaction body");
+    }
+
+    /// br-fohxo: the WAL recovery fence is transient busy for idempotent reads
+    /// (`get_agent_deregistered_at` on every send); a non-busy error is not.
+    #[test]
+    fn run_read_with_mvcc_retry_retries_the_recovery_fence_only() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let attempts = std::cell::Cell::new(0_u32);
+        let result = rt.block_on(async {
+            run_read_with_mvcc_retry(&cx, "test_recovery_fence", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt < 3 {
+                        Outcome::Err(DbError::ResourceBusy(
+                            "Query error: database is busy (recovery in progress)".to_string(),
+                        ))
+                    } else {
+                        Outcome::Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+        assert!(matches!(result, Outcome::Ok(3)));
+        assert_eq!(attempts.get(), 3);
+
+        let attempts = std::cell::Cell::new(0_u32);
+        let result: Outcome<u32, DbError> = rt.block_on(async {
+            run_read_with_mvcc_retry(&cx, "test_non_busy", || {
+                attempts.set(attempts.get() + 1);
+                async { Outcome::Err(DbError::Sqlite("no such table: agents".to_string())) }
+            })
+            .await
+        });
+        assert!(matches!(result, Outcome::Err(DbError::Sqlite(_))));
+        assert_eq!(attempts.get(), 1, "a non-busy error is returned at once");
     }
 
     #[test]
@@ -24772,7 +25592,7 @@ mod tests {
     /// the boundary — cascades FK-safely through recipient/delivery/receipt
     /// rows, respects the per-sweep cap, and reports would-prune counts.
     #[test]
-    fn prune_settled_messages_eligibility_cascade_and_cap() {
+    fn prune_verified_settled_messages_eligibility_cascade_and_cap() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
@@ -24877,16 +25697,53 @@ mod tests {
                 .expect("count prunable");
             assert_eq!(would_prune, 3, "m1, m3, m6 are settled and past the horizon");
 
-            // Per-sweep cap: only the oldest eligible message goes, more=true.
-            let capped = prune_settled_messages(&cx, &pool, horizon, 500, 1)
+            let unverified = prune_verified_settled_messages(&cx, &pool, horizon, 500, &[])
+                .await
+                .into_result()
+                .expect("no archive proofs");
+            assert_eq!(unverified.deleted_messages, 0);
+
+            // The archive layer admits only verified observations from the
+            // bounded ID page. This DB fixture supplies that admission directly;
+            // storage tests exercise the real committed-archive gate.
+            let page = list_prunable_message_ids(&cx, &pool, horizon, 0, None, 1)
+                .await
+                .into_result()
+                .expect("capped candidate page");
+            assert_eq!(page.ids, vec![1]);
+            assert!(page.more, "eligible backlog remains past the candidate cap");
+            let first = capture_message_prune_candidate(&cx, &pool, 1)
+                .await
+                .into_result()
+                .expect("capture source")
+                .expect("complete source");
+            let capped = prune_verified_settled_messages(&cx, &pool, horizon, 500, &[first])
                 .await
                 .into_result()
                 .expect("capped prune");
             assert_eq!(capped.deleted_messages, 1);
-            assert!(capped.more, "eligible backlog remains past the cap");
+            assert!(!capped.more, "the verified source did not change");
 
             // Drain with a small batch size to exercise multi-batch commits.
-            let report = prune_settled_messages(&cx, &pool, horizon, 1, 500)
+            let next = list_prunable_message_ids(
+                &cx, &pool, horizon, 1, Some(page.ceiling), 500,
+            )
+            .await
+            .into_result()
+            .expect("remaining candidate page");
+            assert_eq!(next.ids, vec![3, 6]);
+            assert!(!next.more);
+            let mut verified = Vec::new();
+            for id in next.ids {
+                verified.push(
+                    capture_message_prune_candidate(&cx, &pool, id)
+                        .await
+                        .into_result()
+                        .expect("capture source")
+                        .expect("complete source"),
+                );
+            }
+            let report = prune_verified_settled_messages(&cx, &pool, horizon, 1, &verified)
                 .await
                 .into_result()
                 .expect("full prune");
@@ -24956,6 +25813,179 @@ mod tests {
                 )
                 .expect("count unread");
             assert_eq!(unread_b[0].get_named::<i64>("c").unwrap(), 1, "m2 stays unread for B");
+        });
+    }
+
+    async fn seed_message_prune_source_fixture(cx: &Cx, pool: &DbPool) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("seed connection");
+        for sql in [
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'prune-source', '/tmp/prune-source', 1), (2, 'other-source', '/tmp/other-source', 1)",
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1), (2, 1, 'GreenStone', 'test', 'test', 1, 1), (3, 1, 'AmberHill', 'test', 'test', 1, 1), (4, 2, 'RedPeak', 'test', 'test', 1, 1)",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, topic, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) VALUES (1, 1, 1, 'thread', 'topic', 'subject', 'body', 'normal', 1, 1, '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}', '[]', '{}')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', 2, 3)",
+            "INSERT INTO message_delivery_signal_receipts (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) VALUES (1, 2, 'signal_file', 'digest', 4)",
+        ] {
+            conn.execute_raw(sql).expect("seed retention source");
+        }
+    }
+
+    #[test]
+    fn prune_verified_messages_rechecks_source_and_settlement_before_cascade() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_verified_source_changes.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let cases = [
+                ("body", "UPDATE messages SET body_md = 'new body' WHERE id = 1", "UPDATE messages SET body_md = 'body' WHERE id = 1"),
+                ("subject", "UPDATE messages SET subject = 'new subject' WHERE id = 1", "UPDATE messages SET subject = 'subject' WHERE id = 1"),
+                ("thread", "UPDATE messages SET thread_id = 'new thread' WHERE id = 1", "UPDATE messages SET thread_id = 'thread' WHERE id = 1"),
+                ("topic", "UPDATE messages SET topic = 'new topic' WHERE id = 1", "UPDATE messages SET topic = 'topic' WHERE id = 1"),
+                ("importance", "UPDATE messages SET importance = 'urgent' WHERE id = 1", "UPDATE messages SET importance = 'normal' WHERE id = 1"),
+                ("attachment", "UPDATE messages SET attachments = '[{\"path\":\"new.bin\"}]' WHERE id = 1", "UPDATE messages SET attachments = '[]' WHERE id = 1"),
+                ("reply parent", "UPDATE messages SET archive_metadata_json = '{\"reply_to\":99}' WHERE id = 1", "UPDATE messages SET archive_metadata_json = '{}' WHERE id = 1"),
+                ("unknown reply authority", "UPDATE messages SET archive_metadata_json = NULL WHERE id = 1", "UPDATE messages SET archive_metadata_json = '{}' WHERE id = 1"),
+                ("recipient cache", "UPDATE messages SET recipients_json = '{}' WHERE id = 1", "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}' WHERE id = 1"),
+                ("message project", "UPDATE messages SET project_id = 2 WHERE id = 1", "UPDATE messages SET project_id = 1 WHERE id = 1"),
+                ("sender identity", "UPDATE messages SET sender_id = 4 WHERE id = 1", "UPDATE messages SET sender_id = 1 WHERE id = 1"),
+                ("sender name", "UPDATE agents SET name = 'NewSender' WHERE id = 1", "UPDATE agents SET name = 'BlueLake' WHERE id = 1"),
+                ("sender project", "UPDATE agents SET project_id = 2 WHERE id = 1", "UPDATE agents SET project_id = 1 WHERE id = 1"),
+                ("project slug", "UPDATE projects SET slug = 'new-slug' WHERE id = 1", "UPDATE projects SET slug = 'prune-source' WHERE id = 1"),
+                ("project key", "UPDATE projects SET human_key = '/tmp/new-key' WHERE id = 1", "UPDATE projects SET human_key = '/tmp/prune-source' WHERE id = 1"),
+                ("recipient name", "UPDATE agents SET name = 'NewRecipient' WHERE id = 2", "UPDATE agents SET name = 'GreenStone' WHERE id = 2"),
+                ("recipient project", "UPDATE agents SET project_id = 2 WHERE id = 2", "UPDATE agents SET project_id = 1 WHERE id = 2"),
+                ("BCC routing", "UPDATE message_recipients SET kind = 'bcc' WHERE message_id = 1", "UPDATE message_recipients SET kind = 'to' WHERE message_id = 1"),
+                ("new settled delivery", "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 3, 'cc', 2, 3)", "DELETE FROM message_recipients WHERE message_id = 1 AND agent_id = 3"),
+                ("read reset", "UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1", "UPDATE message_recipients SET read_ts = 2 WHERE message_id = 1"),
+                ("ack reset", "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 1", "UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1"),
+                ("read timestamp", "UPDATE message_recipients SET read_ts = 5 WHERE message_id = 1", "UPDATE message_recipients SET read_ts = 2 WHERE message_id = 1"),
+                ("ack timestamp", "UPDATE message_recipients SET ack_ts = 5 WHERE message_id = 1", "UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1"),
+                ("age", "UPDATE messages SET created_ts = 101 WHERE id = 1", "UPDATE messages SET created_ts = 1 WHERE id = 1"),
+                ("ack policy", "UPDATE messages SET ack_required = 0 WHERE id = 1", "UPDATE messages SET ack_required = 1 WHERE id = 1"),
+            ];
+            for (name, mutation, restore) in cases {
+                let candidate = capture_message_prune_candidate(&cx, &pool, 1)
+                    .await.into_result().expect("capture source").expect("complete source");
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("mutation connection");
+                conn.execute_raw(mutation).expect("change after archive verification");
+                let recipient_count = conn.query_sync("SELECT COUNT(*) FROM message_recipients WHERE message_id = 1", &[])
+                    .expect("recipient count")[0].get_as::<i64>(0).expect("integer count");
+                drop(conn);
+
+                let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &[candidate])
+                    .await.into_result().expect("recheck stale verification");
+                assert_eq!(report.deleted_messages, 0, "{name} invalidates archive proof");
+                assert_eq!(report.deleted_recipients, 0, "{name} preserves deliveries");
+                assert!(report.more, "{name} remains for another verification pass");
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("verify connection");
+                for (table, expected) in [
+                    ("messages", 1),
+                    ("message_recipients", recipient_count),
+                    ("message_delivery_signal_receipts", 1),
+                ] {
+                    let sql = format!("SELECT COUNT(*) FROM {table}");
+                    let count = conn.query_sync(&sql, &[]).expect("count preserved rows")[0]
+                        .get_as::<i64>(0).expect("integer count");
+                    assert_eq!(count, expected, "{name}: {table} remains intact");
+                }
+                conn.execute_raw(restore).expect("restore source for next case");
+            }
+
+            // A foreign sender is valid for contact notices. The proof binds
+            // that identity without imposing a new same-project restriction.
+            let conn = acquire_conn(&cx, &pool).await.into_result().expect("foreign sender");
+            conn.execute_raw("UPDATE messages SET sender_id = 4 WHERE id = 1").unwrap();
+            drop(conn);
+            let candidate = capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().unwrap().unwrap();
+            let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &[candidate])
+                .await.into_result().expect("unchanged source control");
+            assert_eq!(report.deleted_messages, 1);
+            assert_eq!(report.deleted_recipients, 1);
+            assert!(!report.more);
+        });
+    }
+
+    #[test]
+    fn prune_verified_messages_rejects_other_pool_and_keeps_unverified_rows() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_verified_pool.db");
+        let (_, other_pool, _other_dir) = setup_test_pool("prune_other_pool.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, archive_metadata_json) VALUES (2, 1, 1, 'unverified', 'only in SQLite', 1, '{}')").unwrap();
+            drop(conn);
+            let verified = [capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().unwrap().unwrap()];
+            assert!(matches!(
+                prune_verified_settled_messages(&cx, &other_pool, 100, 32, &verified).await,
+                Outcome::Err(DbError::InvalidArgument { field: "candidates", .. })
+            ));
+            let report = prune_verified_settled_messages(&cx, &pool, 100, 32, &verified)
+                .await.into_result().expect("verified source prune");
+            assert_eq!(report.deleted_messages, 1);
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT id, body_md FROM messages", &[]).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 2);
+            assert_eq!(rows[0].get_as::<String>(1).unwrap(), "only in SQLite");
+        });
+    }
+
+    #[test]
+    fn message_prune_candidates_are_bounded_and_finish_finite_rounds() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_candidate_bounds.db");
+        rt.block_on(async {
+            seed_message_prune_source_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            for id in 2..=40 {
+                conn.execute_raw(&format!("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES ({id}, 1, 1, 'old', 'body', 1)")).unwrap();
+            }
+            drop(conn);
+            let page = list_prunable_message_ids(&cx, &pool, 100, 0, None, 5000)
+                .await.into_result().expect("bounded page");
+            assert_eq!(page.ids, (1..=32).collect::<Vec<_>>());
+            assert_eq!(page.ceiling, 40);
+            assert!(page.more);
+
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (41, 1, 1, 'late old import', 'body', 1)").unwrap();
+            drop(conn);
+            let tail = list_prunable_message_ids(&cx, &pool, 100, 32, Some(page.ceiling), 5000)
+                .await.into_result().expect("finite round tail");
+            assert_eq!(tail.ids, (33..=40).collect::<Vec<_>>());
+            assert!(!tail.more, "later imports cannot prevent revisiting deferred rows");
+            let restarted = list_prunable_message_ids(&cx, &pool, 100, 0, None, 1)
+                .await.into_result().unwrap();
+            assert_eq!(restarted.ids, vec![1]);
+            assert_eq!(restarted.ceiling, 41);
+
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET ack_ts = 'not a timestamp' WHERE message_id = 1").unwrap();
+            drop(conn);
+            assert!(capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().expect("invalid receipt observation").is_none());
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET ack_ts = 3 WHERE message_id = 1").unwrap();
+            conn.execute_raw(&format!("UPDATE messages SET body_md = zeroblob({}) WHERE id = 1", MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES + 1)).unwrap();
+            drop(conn);
+            assert!(capture_message_prune_candidate(&cx, &pool, 1)
+                .await.into_result().expect("oversize observation").is_none());
+            assert!(capture_message_prune_candidate(&cx, &pool, 999)
+                .await.into_result().expect("missing observation").is_none());
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let exists = conn.query_sync("SELECT id FROM messages WHERE id = 1", &[]).unwrap();
+            assert_eq!(exists.len(), 1, "unverifiable payload retains its SQLite copy");
         });
     }
 
@@ -26189,6 +27219,350 @@ mod tests {
     }
 
     #[test]
+    fn release_reservations_created_cutoff_preserves_grant_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("release-cutoff-waiting-grant.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/release-cutoff-admission")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("agent");
+            let agent_id = agent.id.expect("agent id");
+            let held = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("hold only pool checkout");
+            let mut grant = std::pin::pin!(create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/after-outage.rs"],
+                3600,
+                true,
+                "pending while release is queued",
+            ));
+            {
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(
+                    matches!(grant.as_mut().poll(&mut context), Poll::Pending),
+                    "first acquisition must wait behind the sole held checkout"
+                );
+            }
+            let queued_release_ts = now_micros();
+            drop(held);
+            let granted =
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), grant)
+                    .await
+                    .expect("pending grant resumes within watchdog")
+                    .into_result()
+                    .expect("grant after release intent was queued");
+            assert_eq!(granted.len(), 1);
+            assert!(
+                granted[0].created_ts > queued_release_ts,
+                "a newly admitted lease cannot be backdated across a queued release"
+            );
+            assert_eq!(granted[0].expires_ts - granted[0].created_ts, 3_600_000_000);
+            let replayed = release_reservations_with_created_cutoff(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                None,
+                None,
+                Some(queued_release_ts),
+            )
+            .await
+            .into_result()
+            .expect("replay older release");
+            assert!(
+                replayed.is_empty(),
+                "waiting acquisition belongs to later work"
+            );
+            let active = get_active_reservations(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("new lease remains active");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, granted[0].id);
+        });
+    }
+
+    #[test]
+    fn release_reservations_created_cutoff_preserves_new_leases_and_chunk_filters() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        for filter in ["all", "paths", "chunked_ids", "chunked_paths"] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("release-cutoff-{filter}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project = ensure_project(&cx, &pool, "/tmp/release-cutoff")
+                    .await
+                    .into_result()
+                    .expect("project");
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    "BlueLake",
+                    "codex-cli",
+                    "gpt-5",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("agent");
+                let agent_id = agent.id.expect("agent id");
+                let cutoff = now_micros();
+                let rows = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &[
+                        "src/old.rs",
+                        "src/boundary.rs",
+                        "src/new.rs",
+                        "other/held.rs",
+                    ],
+                    3600,
+                    true,
+                    "cutoff regression",
+                )
+                .await
+                .into_result()
+                .expect("create real leases");
+                let ids: Vec<i64> = rows.iter().map(|row| row.id.expect("lease id")).collect();
+                {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("fixture connection");
+                    for (id, created) in
+                        ids.iter().zip([cutoff - 1, cutoff, cutoff + 1, cutoff - 1])
+                    {
+                        conn.execute_sync(
+                            "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+                            &[Value::BigInt(created), Value::BigInt(*id)],
+                        )
+                        .expect("set deterministic creation boundary");
+                    }
+                }
+                let path_filter = ["src/old.rs", "src/boundary.rs", "src/new.rs"];
+                let mut chunked_ids = vec![i64::MAX; MAX_RELEASE_RESERVATION_CHUNK_ITEMS];
+                chunked_ids.extend_from_slice(&ids[..3]);
+                let mut chunked_paths = vec!["absent.rs"; MAX_RELEASE_RESERVATION_CHUNK_ITEMS];
+                chunked_paths.extend_from_slice(&path_filter);
+                let paths = match filter {
+                    "paths" => Some(path_filter.as_slice()),
+                    "chunked_paths" => Some(chunked_paths.as_slice()),
+                    _ => None,
+                };
+                let released = release_reservations_with_created_cutoff(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    paths,
+                    (filter == "chunked_ids").then_some(chunked_ids.as_slice()),
+                    Some(cutoff),
+                )
+                .await
+                .into_result()
+                .expect("release only leases within intent boundary");
+                let mut released_ids: Vec<i64> = released.iter().filter_map(|row| row.id).collect();
+                released_ids.sort_unstable();
+                let mut expected = ids[..2].to_vec();
+                if filter == "all" {
+                    expected.push(ids[3]);
+                }
+                expected.sort_unstable();
+                assert_eq!(
+                    released_ids, expected,
+                    "creation cutoff with {filter} filter"
+                );
+                assert!(
+                    released
+                        .iter()
+                        .all(|row| row.released_ts.is_some_and(|ts| ts > 0))
+                );
+
+                let active = get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("remaining leases");
+                assert!(
+                    active.iter().any(|row| row.id == Some(ids[2])),
+                    "post-intent lease survives every filter, including recursive chunks"
+                );
+                // The unchanged direct API must still release this later lease
+                // when the agent explicitly requests release now.
+                let direct = release_reservations(&cx, &pool, project_id, agent_id, None, None)
+                    .await
+                    .into_result()
+                    .expect("ordinary direct release");
+                assert_eq!(direct.len(), active.len());
+            });
+        }
+    }
+
+    #[test]
+    fn release_reservations_created_cutoff_rechecks_stale_candidates_in_write_transaction() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("release-cutoff-final-write.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/release-cutoff-write")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("holder");
+            let peer = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("peer");
+            let holder_id = holder.id.expect("holder id");
+            let peer_id = peer.id.expect("peer id");
+            let rows = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/old.rs", "src/replaced.rs", "src/transferred.rs"],
+                3600,
+                true,
+                "stale candidate regression",
+            )
+            .await
+            .into_result()
+            .expect("original reservations");
+            let ids: Vec<i64> = rows.iter().map(|row| row.id.expect("lease id")).collect();
+            let cutoff = now_micros();
+            // The selected IDs are already known. Change one row to a later
+            // identity and another to a different owner before invoking the
+            // actual write primitive; a tool-side filter cannot protect this.
+            {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("fixture connection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+                    &[Value::BigInt(cutoff + 1), Value::BigInt(ids[1])],
+                )
+                .expect("replacement after selection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET agent_id = ? WHERE id = ?",
+                    &[Value::BigInt(peer_id), Value::BigInt(ids[2])],
+                )
+                .expect("owner changed after selection");
+            }
+            let released = release_reservations_by_ids_with_constraints(
+                &cx,
+                &pool,
+                &ids,
+                ReleaseReservationExpiryConstraint::Any,
+                Some(ReleaseReservationScope {
+                    project_id,
+                    agent_id: holder_id,
+                    created_at_or_before: Some(cutoff),
+                }),
+            )
+            .await
+            .into_result()
+            .expect("guarded write transaction");
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0].id, ids[0]);
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("verify connection");
+            let ledger = conn
+                .query_sync(
+                    "SELECT reservation_id FROM file_reservation_releases ORDER BY reservation_id",
+                    &[],
+                )
+                .expect("release ledger");
+            assert_eq!(
+                ledger.len(),
+                1,
+                "rejected candidates must not acquire release markers"
+            );
+            assert_eq!(
+                ledger[0].get_named::<i64>("reservation_id").unwrap(),
+                ids[0]
+            );
+            for id in &ids[1..] {
+                let row = conn
+                    .query_sync(
+                        "SELECT released_ts FROM file_reservations WHERE id = ?",
+                        &[Value::BigInt(*id)],
+                    )
+                    .expect("preserved lease");
+                assert_eq!(
+                    row[0].get_named::<Option<i64>>("released_ts").unwrap(),
+                    None
+                );
+            }
+        });
+    }
+
+    #[test]
     fn release_reservations_empty_id_filter_matches_nothing() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -27184,6 +28558,183 @@ mod tests {
             assert_eq!(active[0].id, Some(reservation_id));
             assert!(active[0].released_ts.is_none());
             assert_eq!(active[0].expires_ts, original_expires.saturating_sub(1));
+        });
+    }
+
+    #[test]
+    fn renew_reservations_does_not_revive_expired_lease_after_pool_wait() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_cx, pool, _dir) = setup_test_pool("renew-after-pool-wait.db");
+        let competing_pool = DbPool::new(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", pool.sqlite_path()),
+            storage_root: Some(pool.storage_root().to_path_buf()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("independent pool for competing holder");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/renew-after-pool-wait")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("holder");
+            let competitor = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("competing holder");
+            let holder_id = holder.id.expect("holder id");
+            let competitor_id = competitor.id.expect("competitor id");
+            let original = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/raced.rs"],
+                3600,
+                true,
+                "old lease",
+            )
+            .await
+            .into_result()
+            .expect("initial grant");
+            let old_id = original[0].id.expect("old reservation id");
+            // Initialize the independent pool before forcing the interleaving.
+            drop(
+                competing_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("competing connection"),
+            );
+
+            let held = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("hold sole checkout");
+            let ids = [old_id];
+            let paths = ["src/raced.rs"];
+            let mut renewal = std::pin::pin!(renew_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                600,
+                Some(&paths),
+                Some(&ids),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(renewal.as_mut().poll(&mut context), Poll::Pending),
+                "renewal must wait behind the held checkout"
+            );
+
+            // The old implementation has already sampled `now` at this point.
+            // Move expiry just after that poll without sleeping, then make a
+            // real competing grant before allowing the renewal to proceed.
+            let expired_at = now_micros().saturating_add(1);
+            held.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                &[Value::BigInt(expired_at), Value::BigInt(old_id)],
+            )
+            .expect("lease expires during checkout wait");
+            let granted = asupersync::time::timeout(
+                cx.now(),
+                std::time::Duration::from_secs(5),
+                create_file_reservations(
+                    &cx,
+                    &competing_pool,
+                    project_id,
+                    competitor_id,
+                    &["src/raced.rs"],
+                    3600,
+                    true,
+                    "new holder after expiry",
+                ),
+            )
+            .await
+            .expect("competing grant watchdog")
+            .into_result()
+            .expect("competing grant succeeds after expiry");
+            assert_eq!(granted.len(), 1);
+            assert!(granted[0].created_ts > expired_at);
+            drop(held);
+
+            let renewed =
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), renewal)
+                    .await
+                    .expect("pending renewal watchdog")
+                    .into_result()
+                    .expect("stale renewal safely completes");
+            assert!(
+                renewed.is_empty(),
+                "expired work must not become a second exclusive holder"
+            );
+            let active = get_active_reservations(&cx, &competing_pool, project_id)
+                .await
+                .into_result()
+                .expect("current exclusive ownership");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, granted[0].id);
+            assert_eq!(active[0].agent_id, competitor_id);
+
+            // Live same-row renewal still extends from its original expiry,
+            // preserving the reservation identity and creation timestamp.
+            let current_ids = [granted[0].id.expect("current reservation id")];
+            let current = renew_reservations(
+                &cx,
+                &competing_pool,
+                project_id,
+                competitor_id,
+                600,
+                Some(&paths),
+                Some(&current_ids),
+            )
+            .await
+            .into_result()
+            .expect("live holder renewal");
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].id, granted[0].id);
+            assert_eq!(current[0].created_ts, granted[0].created_ts);
+            assert_eq!(current[0].expires_ts, granted[0].expires_ts + 600_000_000);
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("old row unchanged");
+            let old = conn
+                .query_sync(
+                    "SELECT created_ts, expires_ts FROM file_reservations WHERE id = ?",
+                    &[Value::BigInt(old_id)],
+                )
+                .expect("read expired reservation");
+            assert_eq!(old[0].get_as::<i64>(0).unwrap(), original[0].created_ts);
+            assert_eq!(old[0].get_as::<i64>(1).unwrap(), expired_at);
         });
     }
 
@@ -29052,6 +30603,80 @@ mod tests {
         });
     }
 
+    /// br-v0ucm: every fresh FrankenSQLite open rescans the whole WAL, so the
+    /// post-commit visibility check must answer both of its questions (message
+    /// row, recipient rows) from ONE fresh handle, and still refuse a message
+    /// whose recipient rows are missing.
+    #[test]
+    fn message_visibility_probe_opens_one_fresh_handle_per_verification() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("message_visibility_probe_fresh.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'probe-project', '/tmp/am-message-fresh-visibility', 0); \
+                 INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'), \
+                        (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto'); \
+                 INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES (1, 1, 1, 'T', 'delivered', 'body', 'normal', 0, 0, '[]'), \
+                        (2, 1, 1, 'T', 'no recipient rows', 'body', 'normal', 0, 0, '[]'); \
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (1, 2, 'to', NULL, NULL);",
+            )
+            .expect("seed messages");
+        drop(init_conn);
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let opens = || DURABILITY_PROBE_OPENS.with(std::cell::Cell::get);
+        rt.block_on(async {
+            let before = opens();
+            verify_message_recipients_visible_after_commit(&cx, &pool, 1, 1, &[(2, "to")])
+                .await
+                .into_result()
+                .expect("delivered message is visible from a fresh handle");
+            assert_eq!(opens() - before, 1, "one fresh handle per verification");
+
+            let before = opens();
+            let err =
+                verify_message_recipients_visible_after_commit(&cx, &pool, 1, 2, &[(2, "to")])
+                    .await
+                    .into_result()
+                    .expect_err("missing recipient rows must be refused");
+            assert!(
+                err.to_string()
+                    .contains("message recipient rows not visible after commit"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(opens() - before, 1);
+        });
+    }
+
     #[test]
     fn create_message_with_recipients_pool_drop_closes_cleanly() {
         use asupersync::runtime::RuntimeBuilder;
@@ -29175,6 +30800,88 @@ mod tests {
             capture.drop_close_count(),
             0,
             "pooled connection teardown should close cleanly without drop_close warnings"
+        );
+    }
+
+    /// br-kp1in.32: the process-wide message serializer covers id election and
+    /// the insert transaction, not the fresh-handle visibility probe (two new
+    /// connections per send). Held through the probe, it kept release send
+    /// throughput flat at ~9-13 sends/s from 1 to 16 clients.
+    #[test]
+    fn message_serializer_is_released_before_the_post_commit_probe() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("serializer_scope.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 4,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow_mut().clear());
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let project = ensure_project(&cx, &pool, "/tmp/am-serializer-scope")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenCastle"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("serializer scope"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            for index in 0..3 {
+                let row = create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    ids[0],
+                    &format!("scope {index}"),
+                    "body",
+                    Some("SERIALIZER-SCOPE"),
+                    "normal",
+                    false,
+                    "[]",
+                    &[(ids[1], "to")],
+                )
+                .await
+                .into_result()
+                .expect("create message");
+                assert!(row.id.is_some(), "created message must include id");
+            }
+        });
+        let seen = SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow().clone());
+        assert_eq!(
+            seen.len(),
+            3,
+            "one post-commit probe per fresh send: {seen:?}"
+        );
+        // Another test in this process may hold the serializer at a probe
+        // instant; this call never does, so at least one probe sees it free.
+        // Holding the guard through the probe makes every entry `true`.
+        assert!(
+            seen.iter().any(|locked| !locked),
+            "every post-commit probe ran with the message serializer still held: {seen:?}"
         );
     }
 
@@ -29340,6 +31047,99 @@ mod tests {
                 "all committed messages must remain visible after concurrent writes"
             );
         });
+    }
+
+    /// br-kp1in.16: 16 and 32 concurrent autocommit writers (pinned MVCC
+    /// concurrent mode, production retry wrapper) lose no rows and leave a
+    /// database an independent C SQLite full `integrity_check` accepts.
+    #[test]
+    fn autocommit_writer_storm_loses_no_rows_and_keeps_integrity() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for writers in [16_usize, 32] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("autocommit_storm_{writers}.db"));
+            let cfg = crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: writers,
+                run_migrations: true,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool = crate::create_pool(&cfg).expect("create pool");
+            let per_writer = 8_usize;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+            // Spawn every writer before joining any: they meet at the barrier.
+            let mut handles = Vec::with_capacity(writers);
+            for writer in 0..writers {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("writer runtime");
+                    barrier.wait();
+                    let mut failures = Vec::new();
+                    for row in 0..per_writer {
+                        let slug = format!("storm-{writers}-{writer}-{row}");
+                        let outcome = rt.block_on(async {
+                            let cx = Cx::current().expect("runtime installs a context");
+                            run_with_mvcc_retry(&cx, "autocommit storm insert", || async {
+                                let conn = match acquire_conn(&cx, &pool).await {
+                                    Outcome::Ok(conn) => conn,
+                                    Outcome::Err(error) => return Outcome::Err(error),
+                                    Outcome::Cancelled(reason) => {
+                                        return Outcome::Cancelled(reason);
+                                    }
+                                    Outcome::Panicked(payload) => {
+                                        return Outcome::Panicked(payload);
+                                    }
+                                };
+                                match conn.execute_raw(&format!(
+                                    "INSERT INTO projects (slug, human_key, created_at) \
+                                         VALUES ('{slug}', '/tmp/{slug}', 0)"
+                                )) {
+                                    Ok(()) => Outcome::Ok(()),
+                                    Err(error) => Outcome::Err(map_sql_error(&error)),
+                                }
+                            })
+                            .await
+                        });
+                        if !matches!(outcome, Outcome::Ok(())) {
+                            failures.push(format!("{slug}: {outcome:?}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            let failures: Vec<String> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("writer thread"))
+                .collect();
+            assert!(failures.is_empty(), "{writers} writers: {failures:?}");
+            drop(pool);
+
+            let verify = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+                .expect("independent C SQLite connection");
+            let count = verify
+                .query_sync("SELECT count(*) FROM projects", &[])
+                .expect("count projects")
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok());
+            assert_eq!(
+                count,
+                Some(i64::try_from(writers * per_writer).expect("row count fits")),
+                "{writers} autocommit writers must lose no rows"
+            );
+            let integrity: Vec<String> = verify
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check")
+                .iter()
+                .filter_map(|row| row.get_as::<String>(0).ok())
+                .collect();
+            assert_eq!(integrity, vec!["ok".to_string()], "{writers} writers");
+        }
     }
 
     #[test]
@@ -29751,6 +31551,126 @@ mod tests {
             );
             assert_eq!(to_incoming[0].id, Some(first_id));
             assert_eq!(to_incoming[0].reason, "refreshed");
+        });
+    }
+
+    /// br-xhfoz: a repeated (or concurrent) request must not reset an approval
+    /// that is still in force to pending; an expired approval renews to
+    /// pending and a blocked link stays blocked.
+    #[test]
+    fn request_contact_keeps_an_approval_in_force() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("request_contact_keeps_approval.db");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-contact-keep-{}", now_micros()),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedPeak"] {
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("contact"),
+                    Some("contacts_only"),
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("register agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (from_id, to_id, blocked_id) = (ids[0], ids[1], ids[2]);
+            let request = |to: i64, reason: &'static str| {
+                request_contact(&cx, &pool, project_id, from_id, project_id, to, reason, 600)
+            };
+            let approved_ids = || async {
+                list_approved_contact_ids(&cx, &pool, project_id, from_id, &[to_id])
+                    .await
+                    .into_result()
+                    .expect("list approved contacts")
+            };
+
+            request(to_id, "initial")
+                .await
+                .into_result()
+                .expect("initial request");
+            let (_, approval) = respond_contact(
+                &cx, &pool, project_id, from_id, project_id, to_id, true, 3_600,
+            )
+            .await
+            .into_result()
+            .expect("approve");
+            assert_eq!(approved_ids().await, vec![to_id]);
+
+            let again = request(to_id, "again")
+                .await
+                .into_result()
+                .expect("repeated request");
+            assert_eq!(again.status, "approved", "an approval in force is kept");
+            assert_eq!(again.expires_ts, approval.expires_ts, "expiry is not reset");
+            assert_eq!(approved_ids().await, vec![to_id]);
+
+            // Negative: once the approval has expired, a request renews it to
+            // pending with a fresh expiry.
+            let expired_at = now_micros() - 1;
+            let conn = match pool.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+            };
+            conn.execute_sync(
+                "UPDATE agent_links SET expires_ts = ? WHERE id = ?",
+                &[
+                    Value::BigInt(expired_at),
+                    Value::BigInt(again.id.expect("link id")),
+                ],
+            )
+            .expect("expire the approval");
+            drop(conn);
+            assert!(
+                approved_ids().await.is_empty(),
+                "an expired approval is not in force"
+            );
+            let renewed = request(to_id, "renewed")
+                .await
+                .into_result()
+                .expect("renewal request");
+            assert_eq!(renewed.status, "pending");
+            assert_eq!(renewed.reason, "renewed");
+            assert!(renewed.expires_ts.is_some_and(|ts| ts > expired_at));
+
+            // A blocked link stays blocked.
+            request(blocked_id, "first")
+                .await
+                .into_result()
+                .expect("request to be blocked");
+            respond_contact(
+                &cx, &pool, project_id, from_id, project_id, blocked_id, false, 0,
+            )
+            .await
+            .into_result()
+            .expect("block");
+            let still_blocked = request(blocked_id, "retry")
+                .await
+                .into_result()
+                .expect("request against a blocked link");
+            assert_eq!(still_blocked.status, "blocked");
         });
     }
 
@@ -31648,6 +33568,7 @@ mod tests {
                 "body A",
                 Some("THREAD-A"),
                 Some("br-search.1"),
+                None,
                 "normal",
                 false,
                 "[]",
@@ -32400,6 +34321,7 @@ mod tests {
                 "topic body",
                 Some("topic-thread"),
                 Some("Br-Abc.1"),
+                None,
                 "normal",
                 false,
                 "[]",
@@ -33646,10 +35568,11 @@ mod tests {
             set_agent_last_active_for_test(&cx, &pool_a, first_agent_id, 0).await;
             set_agent_last_active_for_test(&cx, &pool_b, second_agent_id, 0).await;
 
-            touch_agent(&cx, &pool_a, first_agent_id)
-                .await
-                .into_result()
-                .expect("queue deferred touch in pool a");
+            crate::cache::read_cache().enqueue_touch_scoped(
+                &cache_scope_for_pool(&pool_a),
+                first_agent_id,
+                now_micros(),
+            );
 
             flush_deferred_touches(&cx, &pool_b)
                 .await
@@ -33668,6 +35591,115 @@ mod tests {
             assert!(
                 read_agent_last_active_for_test(&cx, &pool_a, first_agent_id).await > 0,
                 "pool a flush should still apply its own deferred touch"
+            );
+        });
+    }
+
+    /// GH#334: `touch_agent` writes `last_active_ts` through immediately, at
+    /// most once per interval per agent and database file, with the throttle
+    /// shared by every pool (write or query-only) of that file.
+    #[test]
+    fn touch_agent_writes_through_and_throttles_per_database_file() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("touch_agent_throttle.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/touch-agent-throttle")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project.id.expect("project id"),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+            // Prime the agent cache so the eviction on write is exercised.
+            let _ = get_agent_by_id(&cx, &pool, agent_id).await;
+            set_agent_last_active_for_test(&cx, &pool, agent_id, 1).await;
+
+            assert!(agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("first touch");
+            assert!(wrote, "the first touch must write");
+            let touched = read_agent_last_active_for_test(&cx, &pool, agent_id).await;
+            assert!(
+                touched > 1,
+                "the touch must be durable at once, got {touched}"
+            );
+            assert!(
+                crate::cache::read_cache()
+                    .get_agent_by_id_scoped(&cache_scope_for_pool(&pool), agent_id)
+                    .is_none(),
+                "the cached row with the old timestamp must be evicted"
+            );
+
+            // Within the interval: no write, even from another pool of the file.
+            set_agent_last_active_for_test(&cx, &pool, agent_id, 1).await;
+            assert!(!agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("throttled touch");
+            assert!(!wrote, "a touch inside the interval must be skipped");
+            let read_cfg = crate::pool::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    dir.path().join("touch_agent_throttle.db").display()
+                ),
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let read_pool = crate::create_query_only_pool(&read_cfg).expect("query-only pool");
+            assert!(
+                !agent_touch_due(&read_pool, agent_id),
+                "a read pool of the same file must share the throttle"
+            );
+            assert_eq!(
+                read_agent_last_active_for_test(&cx, &pool, agent_id).await,
+                1
+            );
+
+            // Once the interval has elapsed, the next touch writes again.
+            agent_touch_throttle().insert(
+                (agent_touch_throttle_key(&pool), agent_id),
+                now_micros() - AGENT_TOUCH_MIN_INTERVAL_MICROS - 1,
+            );
+            assert!(agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("touch after interval");
+            assert!(wrote, "a touch after the interval must write");
+            assert!(read_agent_last_active_for_test(&cx, &pool, agent_id).await > 1);
+
+            // last_active_ts never moves backwards.
+            let latest = read_agent_last_active_for_test(&cx, &pool, agent_id).await;
+            set_agent_last_active_for_test(&cx, &pool, agent_id, latest + 10_000_000_000).await;
+            agent_touch_throttle().remove(&(agent_touch_throttle_key(&pool), agent_id));
+            touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("touch behind a newer value");
+            assert_eq!(
+                read_agent_last_active_for_test(&cx, &pool, agent_id).await,
+                latest + 10_000_000_000
             );
         });
     }

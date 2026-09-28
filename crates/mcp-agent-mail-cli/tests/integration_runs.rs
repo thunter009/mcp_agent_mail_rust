@@ -665,6 +665,275 @@ fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
 }
 
 #[test]
+fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        &env.hostile_repo.display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    insert_message(
+        &conn,
+        1,
+        1,
+        1,
+        "idle recovery",
+        "Retain this accepted message.",
+    );
+    insert_recipient(&conn, 1, 2);
+    conn.execute_raw(
+        "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"],\"cc\":[],\"bcc\":[]}', attachments = '[]' WHERE id = 1",
+    ).unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    assert_idle_stdio_reconciles(&env, "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md", 1);
+}
+
+#[test]
+fn serve_stdio_recovers_accepted_send_after_archive_failure_and_restart() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        &env.hostile_repo.display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    conn.execute_raw("UPDATE agents SET contact_policy = 'open'")
+        .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    // Real filesystem failures, confined to this private mailbox. Leave the
+    // canonical messages directory readable for the ID-floor safety scan;
+    // obstruct the outbox so materialization fails after the DB accepts mail.
+    let project = env.storage_root.join("projects/idle-recovery");
+    std::fs::create_dir_all(project.join("agents/BlueLake")).unwrap();
+    let blocked_outbox = project.join("agents/BlueLake/outbox");
+    let blocked_journal = env.storage_root.join(".archive_backlog");
+    std::fs::write(&blocked_outbox, b"preserve archive obstruction").unwrap();
+    std::fs::write(&blocked_journal, b"preserve journal obstruction").unwrap();
+    let stdout_path = env.tmp.path().join("failed-send.stdout");
+    let stderr_path = env.tmp.path().join("failed-send.stderr");
+    let mut child = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("RUST_LOG", "warn")
+        .current_dir(env.hostile_repo())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("start server with obstructed archive");
+    let input = format!(
+        "{}\n{}\n{}\n",
+        initialize_request(),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        tool_call(
+            2,
+            "send_message",
+            json!({
+                "project_key": env.hostile_repo.display().to_string(),
+                "sender_name": "BlueLake", "to": ["GreenStone"],
+                "subject": "idle recovery", "body_md": "Retain this accepted message."
+            })
+        )
+    );
+    let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut accepted = None;
+    let mut failed_materialization = false;
+    while sent.is_ok() && Instant::now() < deadline {
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        accepted = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|response| response["id"] == 2);
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        failed_materialization = stderr.contains("[wbq-drain] op failed after retries");
+        if accepted.as_ref().is_some_and(|response| {
+            response.get("error").is_some() || response["result"]["isError"] == true
+        }) {
+            break;
+        }
+        if accepted.is_some() && failed_materialization || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Abruptly stop the owned process after the accepted reply and observed
+    // failed archive write, retaining the DB and both obstruction witnesses.
+    let _ = child.kill();
+    child.wait().expect("reap failed-archive server");
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        sent.is_ok(),
+        "send request write failed: {sent:?}; {stderr}"
+    );
+    assert!(accepted.is_some(), "no send_message response: {stderr}");
+    let accepted = accepted.expect("send_message response");
+    assert!(accepted.get("error").is_none(), "{accepted}; {stderr}");
+    assert_ne!(accepted["result"]["isError"], true, "{accepted}; {stderr}");
+    let payload: Value =
+        serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["count"], 1, "{payload}");
+    let message_id = payload["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+    assert!(
+        failed_materialization,
+        "archive failure was not observed: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_outbox).unwrap(),
+        b"preserve archive obstruction"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_journal).unwrap(),
+        b"preserve journal obstruction"
+    );
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync("SELECT id, created_ts, body_md FROM messages", &[])
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one accepted message survives the stop"
+    );
+    assert_eq!(rows[0].get_named::<i64>("id").unwrap(), message_id);
+    assert_eq!(
+        rows[0].get_named::<String>("body_md").unwrap(),
+        "Retain this accepted message."
+    );
+    let created_ts = rows[0].get_named::<i64>("created_ts").unwrap();
+    conn.close_sync().unwrap();
+    std::fs::rename(
+        &blocked_outbox,
+        env.tmp.path().join("outbox-obstruction.saved"),
+    )
+    .unwrap();
+    std::fs::rename(
+        &blocked_journal,
+        env.tmp.path().join("journal-obstruction.saved"),
+    )
+    .unwrap();
+
+    // Respect the production 30-second grace period; never age or rewrite the
+    // accepted DB row just to make the recovery test pass.
+    let wait_us = created_ts
+        .saturating_add(31_000_000)
+        .saturating_sub(mcp_agent_mail_db::now_micros());
+    if wait_us > 0 {
+        thread::sleep(Duration::from_micros(u64::try_from(wait_us).unwrap()));
+    }
+    let created = chrono::DateTime::from_timestamp_micros(created_ts).unwrap();
+    let filename = format!(
+        "{}__idle-recovery__{message_id}.md",
+        created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
+    );
+    assert_idle_stdio_reconciles(&env, &filename, message_id);
+}
+
+fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) {
+    let stdout_path = env.tmp.path().join("stdio.stdout");
+    let stderr_path = env.tmp.path().join("stdio.stderr");
+    let mut child = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "true")
+        .env("RETENTION_REPORT_ENABLED", "false")
+        .env("QUOTA_ENABLED", "false")
+        .current_dir(env.hostile_repo())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("start real stdio server");
+    // No tool call, resend or read can trigger recovery in this session.
+    let input = format!(
+        "{}\n{}\n",
+        initialize_request(),
+        json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })
+    );
+    let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let project = env.storage_root.join("projects/idle-recovery");
+    let paths = [
+        format!("messages/{filename}"),
+        format!("agents/BlueLake/outbox/{filename}"),
+        format!("agents/GreenStone/inbox/{filename}"),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut committed = false;
+    while sent.is_ok() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if paths.iter().all(|path| project.join(path).is_file()) {
+            committed = paths.iter().all(|path| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(["show", &format!("HEAD:projects/idle-recovery/{path}")])
+                    .output()
+                    .is_ok_and(|out| {
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout)
+                                .contains("Retain this accepted message.")
+                    })
+            });
+            if committed {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Reap our child before assertions, including the regression timeout path.
+    drop(child.stdin.take());
+    let _ = child.kill();
+    child.wait().expect("reap stdio server");
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(sent.is_ok(), "initialize write failed: {sent:?}; {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| serde_json::from_str::<Value>(line)
+                .is_ok_and(|response| response["id"] == 1 && response.get("result").is_some())),
+        "MCP initialization failed: {stdout}; {stderr}"
+    );
+    assert!(
+        committed,
+        "idle stdio did not commit all archive copies: {stderr}"
+    );
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync(
+            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+            &[SqlValue::BigInt(message_id)],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    conn.close_sync().unwrap();
+}
+
+#[test]
 fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
@@ -1814,7 +2083,11 @@ fn agent_start_json_missing_agent_uses_shell_safe_placeholder() {
     let env = TestEnv::new();
     let project = env.tmp.path().display().to_string();
     let mut env_vars = env.base_env();
+    // Empty, not absent: `run_am` inherits the caller's environment, and an
+    // agent's shell exports AGENT_NAME (br-3w116).
     env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+    env_vars.push(("AGENT_NAME".to_string(), String::new()));
+    env_vars.push(("AGENT_MAIL_AGENT".to_string(), String::new()));
 
     let out = run_am(
         &env_vars,
@@ -1939,7 +2212,10 @@ fn agent_start_fix_idempotently_registers_identity() {
 fn agent_start_fix_blocks_without_safe_prerequisites() {
     let env = TestEnv::new();
     let mut env_vars = env.base_env();
+    // Empty, not absent: see agent_start_json_missing_agent_uses_shell_safe_placeholder.
     env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+    env_vars.push(("AGENT_NAME".to_string(), String::new()));
+    env_vars.push(("AGENT_MAIL_AGENT".to_string(), String::new()));
 
     let out = run_am(
         &env_vars,
@@ -2550,8 +2826,13 @@ fn projects_mark_identity_no_commit_writes_marker_file() {
     std::fs::create_dir_all(&project).expect("create project dir");
 
     let project_str = project.to_string_lossy().to_string();
+    let mut child_env = env.base_env();
+    child_env.push((
+        "GIT_CEILING_DIRECTORIES".to_string(),
+        env.tmp.path().canonicalize().unwrap().display().to_string(),
+    ));
     let out = run_am(
-        &env.base_env(),
+        &child_env,
         Some(env.tmp.path()),
         &["projects", "mark-identity", &project_str, "--no-commit"],
         None,
@@ -3456,7 +3737,7 @@ fn doctor_support_bundle_adversarial_redaction_writes_report() {
         "leaked_forbidden_labels": leaked.clone(),
         "retained_present": retained_present,
         "missing_retained_labels": missing_retained.clone(),
-        "repro": "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs doctor_support_bundle_adversarial_redaction_writes_report -- --nocapture"
+        "repro": "rch exec -- cargo test -p mcp-agent-mail-cli --test it integration_runs::doctor_support_bundle_adversarial_redaction_writes_report -- --nocapture"
     });
     write_json_artifact(&run_root, "redaction_report.json", &report);
     write_text_artifact(
@@ -3689,6 +3970,21 @@ fn robot_search_locked_live_index_returns_private_results_with_refresh_alert() {
         robot_search_index_state(&result, "locked index health"),
         "fresh"
     );
+    // br-kp1in.18: a writer held by another process (the running server) is
+    // the normal state; the index is stale for a moment, never "unavailable",
+    // and nothing is raised as an error on a healthy system.
+    assert_ne!(
+        robot_search_index_state(&result, "locked index health"),
+        "unavailable"
+    );
+    assert!(
+        !result["_alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert["severity"] == "error"),
+        "a writer held elsewhere must not raise an error alert: {result}"
+    );
     assert!(
         result["_alerts"].as_array().unwrap().iter().any(|alert| {
             let summary = alert["summary"].as_str().unwrap_or_default();
@@ -3830,8 +4126,8 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
     write_text_artifact(
         &run_root,
         "repro.txt",
-        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
-         startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct -- --nocapture\n",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test it \
+         integration_runs::startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct -- --nocapture\n",
     );
     write_text_artifact(
         &run_root,
@@ -4959,7 +5255,7 @@ fn robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only() {
     write_text_artifact(
         &run_root,
         "repro.txt",
-        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only -- --nocapture\n",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test it integration_runs::robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only -- --nocapture\n",
     );
     eprintln!(
         "stale handoff dashboard artifact root: {}",
@@ -5984,6 +6280,11 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
 fn check_serve_http_client_config_setup(setup: bool) {
     let env = TestEnv::new();
     let project = env.hostile_repo();
+    // Bound real Git discovery even when RCH nests fixtures in its checkout.
+    // Do not use discovery environment overrides: the secret writer correctly
+    // rejects those because they could hide a tracked credential destination.
+    init_git_repo(&env.home_dir);
+    init_git_repo(project);
     // Detection keys Claude installation off its config root, not ~/.claude.json.
     std::fs::create_dir_all(env.home_dir.join(".claude/projects")).unwrap();
     std::fs::create_dir_all(env.xdg_config_home.join("claude-code/projects")).unwrap();
@@ -6368,5 +6669,103 @@ fn doctor_repair_dry_run_exits_zero() {
         "expected success for doctor repair --dry-run\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---- Service install: descriptor limit (br-kp1in.17) ----
+
+/// `am service install` renders `LimitNOFILE=65536` into the systemd user unit,
+/// and re-running it over a unit from an older release (the installer's upgrade
+/// path runs exactly this) replaces that unit instead of keeping its limit-less
+/// content, then reloads and restarts so the new limit takes effect. A fake
+/// `systemctl` on PATH records the calls; no real service is touched.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
+    let env = TestEnv::new();
+    let fake_bin = env.tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+    let systemctl_log = env.tmp.path().join("systemctl.log");
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n",
+            systemctl_log.display()
+        ),
+    )
+    .expect("write fake systemctl");
+    set_executable(&systemctl);
+    let runtime_dir = env.tmp.path().join("run");
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+
+    let mut service_env = env.base_env();
+    service_env.extend(env.hermetic_env());
+    service_env.retain(|(key, _)| key != "PATH");
+    service_env.extend([
+        (
+            "PATH".to_string(),
+            format!("{}:/usr/local/bin:/usr/bin:/bin", fake_bin.display()),
+        ),
+        (
+            "XDG_RUNTIME_DIR".to_string(),
+            runtime_dir.display().to_string(),
+        ),
+        (
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            format!("unix:path={}/bus", runtime_dir.display()),
+        ),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    let unit_path = env.home_dir.join(".config/systemd/user/agent-mail.service");
+    let install = || {
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999", "--no-auth"],
+        );
+        assert!(
+            out.status.success(),
+            "service install failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&unit_path).expect("rendered unit")
+    };
+
+    let fresh = install();
+    assert_eq!(
+        fresh.matches("\nLimitNOFILE=65536\n").count(),
+        1,
+        "fresh unit: {fresh}"
+    );
+
+    // An older release's unit: same service, no descriptor limit.
+    let older = fresh.replace("LimitNOFILE=65536\n", "");
+    assert!(
+        !older.contains("LimitNOFILE"),
+        "fixture must lack the limit"
+    );
+    std::fs::write(&unit_path, &older).expect("write older unit");
+    std::fs::write(&systemctl_log, "").expect("reset systemctl log");
+
+    let upgraded = install();
+    assert_eq!(
+        upgraded.matches("\nLimitNOFILE=65536\n").count(),
+        1,
+        "upgraded unit: {upgraded}"
+    );
+    let calls = std::fs::read_to_string(&systemctl_log).expect("systemctl log");
+    let daemon_reload = calls
+        .lines()
+        .position(|line| line == "--user daemon-reload")
+        .unwrap_or_else(|| panic!("no daemon-reload: {calls}"));
+    let restart = calls
+        .lines()
+        .position(|line| line == "--user restart agent-mail.service")
+        .unwrap_or_else(|| panic!("no restart: {calls}"));
+    assert!(
+        daemon_reload < restart,
+        "reload must precede restart: {calls}"
     );
 }

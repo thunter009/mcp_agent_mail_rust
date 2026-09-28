@@ -328,7 +328,12 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). A manual local source build expects [`../frankensearch-rel-0332`](https://github.com/Dicklesworthstone/frankensearch), pinned to `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. The gated directory keeps a live `../frankensearch` checkout from silently changing the build. Its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`. Use the exact revisions recorded by the checked-out release workflow; `install.sh --from-source` resolves those pins automatically. `beads_rust =0.5.4` and the remaining dependencies -- asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolve from crates.io. A Beads sibling checkout is unnecessary for a manual build.
+Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses FrankenSQLite 0.4.4 through SQLModel 0.5.0 on Asupersync 0.5.0, with an immutable engine revision retaining SQL binding and schema-prefix fixes omitted from the release. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate, patched FrankenSQLite 0.3.18 dependency, with default features disabled.
+
+The current engine pin also includes NOCASE consistency, `INSERT ... SELECT`
+UPSERT parameter binding, and Linux retained-descriptor fixes. See
+[`UPGRADE_LOG.md`](UPGRADE_LOG.md) for qualification results and remaining
+release gates; these changes are not part of the published v0.3.36 binaries.
 
 ### Platforms
 
@@ -390,7 +395,9 @@ macro_prepare_thread(project_key="/abs/path/to/repo", thread_id="FEAT-123",
 macro_file_reservation_cycle(project_key="/abs/path/to/repo", agent_name="GreenCastle",
                              paths=["src/auth/**"], ttl_seconds=3600, auto_release=true)
 
-# Contact handshake between agents in different projects
+# Contact handshake between agents in different projects (records the link;
+# a welcome message is only delivered within one project — across projects the
+# response carries welcome_skipped_reason instead)
 macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
                         target="BlueLake", to_project="/abs/path/to/other/repo",
                         auto_accept=true, welcome_subject="Coordination channel",
@@ -719,6 +726,16 @@ grant without a second lease or archive write and mark the response
 the configured retention window, and are optional; this is not a blanket
 idempotency claim for every mutating tool.
 
+On replay, `granted` contains the original IDs and expiries, even after release
+or expiry; it does not reacquire those paths. `conflicts` is a current snapshot.
+A partial or empty original grant stays partial or empty; use a new key for a
+new acquisition attempt. Fresh reacquisition of an active lease reuses its ID
+and applies the requested exclusive/shared mode and reason after checking peers.
+
+Keys recorded before the normalized path-set fingerprint update can return
+`IDEMPOTENCY_KEY_CONFLICT` after an upgrade, even within their retention window.
+The original grants remain unchanged; inspect them before making a new attempt.
+
 ### 25 MCP Resources
 
 Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.
@@ -798,7 +815,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
-| `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
+| `am robot reservations` | Reservation view with conflict/expiry awareness; JSON entries carry absolute `granted_ts`/`expires_ts` (RFC 3339 UTC) and integer `remaining_seconds`/`granted_age_seconds` next to the humanized `remaining` | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
 | `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
@@ -948,7 +965,7 @@ sequenceDiagram
 ### Across Different Repos
 
 - **Option A (single project bus):** Register both repos under the same `project_key`. Keep reservation patterns specific (`frontend/**` vs `backend/**`).
-- **Option B (separate projects):** Each repo has its own `project_key`. Use `macro_contact_handshake` to link agents, then message directly. Keep a shared `thread_id` across repos.
+- **Option B (separate projects):** Each repo has its own `project_key`. Contact links (`request_contact`/`respond_contact` or `macro_contact_handshake`) record the cross-project relationship, and the product bus gives cross-project search and inbox views. `send_message` itself delivers only within one project: naming a contact from another project, or an agent registered in another project linked to the same product, is refused with `CROSS_PROJECT_RECIPIENT` rather than delivered (no same-name placeholder is created). For direct messages between repos, use Option A.
 
 ### External Git Coordination (opt-in)
 
@@ -1078,13 +1095,13 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
 | `HTTP_ALLOWED_HOSTS` | (none) | Comma-separated extra `Host:` header values the HTTP listener accepts, in addition to the bind host, its loopback variant, and `localhost`. Set this (or pass repeatable `serve-http --allowed-host <HOST>`) to reach the `/mail` web UI via a hostname or reverse proxy instead of getting an HTTP 421. Empty by default (loopback-only). |
-| `DATABASE_URL` | `sqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
+| `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` | SQLite connection URL. Unset, the database lives inside `STORAGE_ROOT`; an explicit relative path is resolved against the working directory |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB` | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
-| `LOG_LEVEL` | `info` | Minimum log level |
+| `LOG_LEVEL` | `info` | Minimum level for Agent Mail's own logs: `trace`, `debug`, `info`, `warn`, `error` or `off` (`WARNING`/`CRITICAL` accepted). Dependencies log at `warn` unless `LOG_LEVEL` is stricter. `RUST_LOG`, when set, replaces it for `mcp-agent-mail` (and for `am` with `AM_ALLOW_DEBUG_STARTUP_LOGS=1`) |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
 | `AM_TUI_TOAST_ENABLED` | `true` | Enable toast notifications |
@@ -1108,7 +1125,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
 | `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
 | `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
-| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
+| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `16777216` | `journal_size_limit` WAL truncation cap (16 MiB); an automatic checkpoint over the cap truncates the WAL |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
 | `AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` | `2000` | Most commits the pre-push guard inspects per pushed ref (newest first); past it the scan is truncated and fails closed. `0` removes the bound |
@@ -1271,7 +1288,7 @@ This table resolves the three-way ambiguity:
 | `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` | Canonical env file (installer writes here) | `~/.config/mcp-agent-mail/config.env` on most Linux systems |
 | `$XDG_CONFIG_HOME/mcp-agent-mail/.env` | Compatibility env file | Checked when `config.env` is absent |
 | `~/.mcp_agent_mail/.env` | Legacy env file | Checked after XDG paths |
-| `./storage.sqlite3` | Runtime database (`DATABASE_URL` default) | Relative to working directory, or absolute if configured |
+| `<STORAGE_ROOT>/storage.sqlite3` | Runtime database (`DATABASE_URL` default) | Inside the archive root unless `DATABASE_URL` is set |
 
 The `STORAGE_ROOT` resolution logic: if the legacy path `~/.mcp_agent_mail_git_mailbox_repo/`
 exists on disk, it is used for backward compatibility. Otherwise the XDG data
@@ -1528,8 +1545,8 @@ Release evidence for robot/doctor fields must prove the installed `am` binary, n
 
 ```bash
 AM_INSTALLED_BINARY_PARITY_BIN=/path/to/installed/am \
-  rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
-  installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-cli --test it \
+  integration_runs::installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
 ```
 
 The gate writes `tests/artifacts/installed_binary_parity/<run>/parity_report.json` with one pass/fail row per required JSON path, redacted source/installed values, value-mismatch status, and redacted command metadata. If the candidate lacks fields that source tests rely on, or returns different required values, the report is red and the release is not closed. A local direct `am doctor check --json` or `am robot ... --format json` probe is useful for quick inspection, but it is not sufficient release evidence unless paired with this parity report and an `rch exec -- ...` cargo proof.
@@ -1652,7 +1669,7 @@ cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
 cargo bench -p mcp-agent-mail-db --bench search_v3_bench
 
 # Load / soak validation
-cargo test -p mcp-agent-mail-db --test sustained_load -- --ignored --nocapture
+cargo test -p mcp-agent-mail-db --test it sustained_load:: -- --ignored --nocapture
 ```
 
 Hardware, kernel, and build profile matter. Treat these as checked-in reference baselines, not universal promises.
@@ -1783,7 +1800,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local search dependency.** A manual source build expects `../frankensearch-rel-0332` and its `../fast_cmaes` workspace sibling when running workspace-wide Cargo metadata. Match the immutable revisions in the checked-out release workflow; `install.sh --from-source` fetches those pins automatically. The remaining dependencies, including `beads_rust` and `franken-agent-detection`, resolve from crates.io.
+- **Pinned Git dependencies.** Current `main` fetches FrankenSearch, FastMCP, and patched FrankenSQLite from immutable Git revisions. Source builds require access to those repositories as well as crates.io; use `cargo build --locked`. Earlier release tags may require sibling checkouts; `install.sh --from-source` provisions their recorded revisions.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
@@ -1802,7 +1819,7 @@ A: No. One server handles multiple projects. Each project is identified by its a
 A: Agent Mail generates memorable adjective+noun names (e.g., `GreenCastle`, `BlueLake`, `RedHarbor`) when agents register. Agents can also specify a name explicitly.
 
 **Q: Can agents in different repos talk to each other?**
-A: Yes. Use `request_contact` / `respond_contact` (or `macro_contact_handshake`) to establish a link between agents in different projects, then message directly. The product bus enables cross-project search and inbox queries.
+A: Yes, by sharing one `project_key` for both repos (Option A under "Across Different Repos"); direct `send_message` delivery is scoped to one project. With separate projects, contact links record the relationship and the product bus provides cross-project search and inbox queries, but a `send_message` naming an agent from another project is refused (`CROSS_PROJECT_RECIPIENT`) instead of being delivered.
 
 **Q: Does this work with Claude Code's Max subscription?**
 A: Yes. You can use a Max account with Agent Mail. Each agent session connects to the same MCP server regardless of subscription tier.

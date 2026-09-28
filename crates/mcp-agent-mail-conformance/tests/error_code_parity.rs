@@ -246,10 +246,17 @@ fn error_code_catalog_is_stable() {
         "ARCHIVE_ERROR",
         "AUTHENTICATION_REQUIRED",
         "BROADCAST_DISABLED",
+        // Build-slot acquisition distinguishes contention from invalid
+        // persisted state; both retain the common typed error envelope.
+        "BUILD_SLOT_BUSY",
+        "BUILD_SLOT_STATE_INVALID",
         "CONFIGURATION_ERROR",
         "CONFLICT",
         "CONTACT_BLOCKED",
         "CONTACT_REQUIRED",
+        // br-kp1in.15: send_message refuses a recipient that exists only in
+        // another project instead of minting a same-name local placeholder.
+        "CROSS_PROJECT_RECIPIENT",
         "CURSOR_AHEAD",
         "CURSOR_EXPIRED",
         "DATABASE_CORRUPTION",

@@ -546,8 +546,9 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
     };
 
     let project_key = project_key.to_string();
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
     rt.block_on(async move {
-        let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+        let ctx = McpContext::new(cx, 1);
         let mut steps: Vec<StepResult> = Vec::new();
 
         // 1: ensure_project
@@ -1019,7 +1020,7 @@ fn tools_call_request(name: &str, arguments: Value, id: i64) -> fastmcp::JsonRpc
 /// Run the MCP decode self-test against the (scratch) global config + pool.
 /// Reused by the inner child and by in-process tests.
 fn run_mcp_selftest_in_process(project_key: &str) -> McpSelftestReport {
-    use fastmcp::{Cx, JsonRpcMessage, StdioTransport, Transport};
+    use fastmcp::{JsonRpcMessage, StdioTransport, Transport};
     use std::io::Cursor;
 
     let mut checks: Vec<CheckResult> = Vec::new();
@@ -1028,7 +1029,7 @@ fn run_mcp_selftest_in_process(project_key: &str) -> McpSelftestReport {
 
     // Check 1: a valid `initialize` frame must decode as a request.
     {
-        let cx = Cx::for_request();
+        let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
         match serde_json::to_vec(&build_initialize_request(1)) {
             Ok(mut bytes) => {
                 bytes.push(b'\n');
@@ -1065,7 +1066,7 @@ fn run_mcp_selftest_in_process(project_key: &str) -> McpSelftestReport {
 
     // Check 2: the L2 malformed frame MUST be rejected as a protocol error.
     {
-        let cx = Cx::for_request();
+        let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
         let mut transport =
             StdioTransport::new(Cursor::new(L2_MALFORMED_FIXTURE.to_vec()), Vec::new());
         match transport.recv(&cx) {
@@ -1261,20 +1262,14 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
     let output = writer.clone();
     let transport = StdioTransport::new(Cursor::new(input), writer);
 
-    // Run the session on a runtime-backed context rather than an out-of-band
-    // `Cx::for_request()`, so anything that discovers drivers via
-    // `Cx::current()` finds real ones.
-    //
-    // Note this alone did NOT fix the GH#203 hang, and code under test must
-    // not rely on this runtime's timers for forward progress: fastmcp's tool
-    // dispatch re-enters `block_on` on its own private current-thread runtime,
-    // and in that nested topology runtime timer wheels are not reliably
-    // pumped (confirmed by gdb: a 25 ms `asupersync::time::timeout` parked
-    // for 45+ s inside `list_agents`). The actual fix was making the
-    // archive-read gate's wait loops condvar-based and timer-free; see
-    // `mcp-agent-mail-tools/src/archive_read.rs` (`Slot::wake`).
+    // The synchronous transport polls handlers on its caller's context and
+    // may park while they await scheduled work. Keep separate runtime workers
+    // available: running this transport inside a current-thread root future
+    // prevents that same scheduler from progressing the awaited work.
+    // The parent process still enforces the unchanged hard timeout.
     let handle = std::thread::spawn(move || -> Result<(), String> {
-        let rt = RuntimeBuilder::current_thread()
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .build()
             .map_err(|e| format!("build selftest runtime: {e}"))?;
         rt.block_on(async {

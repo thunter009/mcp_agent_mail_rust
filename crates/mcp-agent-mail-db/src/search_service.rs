@@ -165,6 +165,19 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
     }
 }
 
+/// A message (or a message edit) was committed to the source database.
+///
+/// Delivery never writes the lexical index: `search_v3::search_database`
+/// catches the index up from the committed rows (change clock + marker)
+/// before every query, so an index commit per delivery only added a fresh
+/// connection and a Tantivy commit (several fdatasyncs) to the reply path —
+/// more than half of a steady-state single send (br-kp1in.32). Cached result
+/// sets must still be dropped now, or they keep serving pre-delivery
+/// false-negatives until their TTL expires (GH#227).
+pub fn note_message_ingested() {
+    invalidate_search_cache(InvalidationTrigger::SourceIngest);
+}
+
 /// Test-only: current epoch of the (force-initialized) global search cache,
 /// so sibling modules can assert that a delivery path bumped it (GH#227).
 #[cfg(test)]
@@ -996,7 +1009,9 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LexicalBackfillHealth {
-    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `in_memory`, or `unavailable`.
+    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `unverified`
+    /// (another process owns the index writer, so this process could not
+    /// refresh or verify it), `in_memory`, or `unavailable`.
     pub state: String,
     /// Current SQLite identity used to scope the process-global lexical bridge.
     pub db_identity: String,
@@ -1082,8 +1097,9 @@ fn read_lexical_backfill_state_file(
 
 /// How the process-global lexical index relates to one pool's database.
 ///
-/// Only [`Self::Foreign`] short-circuits a search to the SQL scan (GH#162):
-/// the index demonstrably belongs to *another* database that still exists
+/// Only [`Self::Foreign`] requires an isolated lexical index (or the SQL
+/// fallback in builds without Tantivy): the index demonstrably belongs to
+/// *another* database that still exists
 /// (a reconstructed-archive snapshot pool while the bridge serves the live
 /// mailbox, or vice versa). [`Self::Rebind`] means the index belongs to an
 /// earlier generation of *this* mailbox, a vanished database, or a previous
@@ -1172,6 +1188,35 @@ fn lexical_backfill_health_with_affinity(
         .ok()
         .and_then(|state| state.get(&sqlite_key).cloned());
     if let Some(Err(error)) = cached_bootstrap {
+        // br-kp1in.18: another process (normally the running server) owning
+        // the index writer is not a broken index. This process just could not
+        // verify or refresh it: unverified, neither fresh nor unavailable.
+        if crate::search_v3::is_writer_held_elsewhere(&error) {
+            return (
+                LexicalBackfillHealth {
+                    state: "unverified".to_string(),
+                    db_identity: db_identity.clone(),
+                    index_dir: index_dir_display,
+                    indexed_messages: 0,
+                    source_messages: None,
+                    skipped_messages: 0,
+                    last_backfill_at_micros: None,
+                    rebuild_in_progress: false,
+                    active_db_identity: active_db_identity.clone(),
+                    stale_reason: Some(format!(
+                        "this process could not refresh the live lexical index because \
+                         another process (normally the running server, which maintains it) \
+                         holds its writer: {error}"
+                    )),
+                    safe_remediation: Some(
+                        "Check live index freshness through the running server (`am robot health`); \
+                         searches from this process use a private snapshot"
+                            .to_string(),
+                    ),
+                },
+                LexicalIndexAffinity::Drift,
+            );
+        }
         return (
             LexicalBackfillHealth {
                 state: "unavailable".to_string(),
@@ -1571,11 +1616,26 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     }
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
-    crate::search_v3::with_backfill_source_retry(|| {
-        crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
-    })
-    .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    let backfill =
+        || crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()));
+    #[cfg(feature = "tantivy-engine")]
+    let result = crate::search_v3::with_backfill_source_retry(backfill);
+    // The feature-disabled bridge already defines a no-op backfill. It has no
+    // native source connection to retry and no Tantivy retry helper to call.
+    #[cfg(not(feature = "tantivy-engine"))]
+    let result = backfill();
+    result.map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
+    Ok(())
+}
+
+fn observe_live_lexical_source(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    #[cfg(feature = "tantivy-engine")]
+    crate::search_v3::observe_live_source_revision(&lexical_backfill_database_url(pool))
+        .map_err(|err| map_bridge_bootstrap_error(&err))?;
     Ok(())
 }
 
@@ -1605,9 +1665,13 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         && bridge_ready
         && has_run_lexical_backfill(&sqlite_key)?
     {
-        // Startup completion does not establish continuing freshness. This
-        // checks the durable source clock and only scans rows when it moved.
-        run_lexical_backfill_for_pool(pool)?;
+        // Startup completion does not establish continuing freshness, but every
+        // lexical query catches the index up itself (search_v3::search_database).
+        // Here only the source revision is observed, so a moved clock empties
+        // cached result sets before the cache is consulted. br-ekdk1: a full
+        // catch-up here ran twice per query and serialized every search under
+        // the init guard (search p50 ~2.8 s under sustained sends).
+        observe_live_lexical_source(pool)?;
         return Ok(());
     }
 
@@ -1670,56 +1734,80 @@ static SEMANTIC_BRIDGE: OnceLock<Option<Arc<SemanticBridge>>> = OnceLock::new();
 #[cfg(feature = "hybrid")]
 #[derive(Debug)]
 struct AutoInitSemanticEmbedder {
-    info: ModelInfo,
+    selected: OnceLock<ModelInfo>,
+    unavailable: ModelInfo,
     hash_fallback: HashEmbedder,
 }
 
 #[cfg(feature = "hybrid")]
 impl AutoInitSemanticEmbedder {
     fn new() -> Self {
-        let dimension = get_two_tier_context().config().fast_dimension;
         Self {
-            info: ModelInfo::new(
-                "auto-init-semantic-fast",
-                "Auto-Init Semantic Fast",
-                ModelTier::Fast,
-                dimension,
+            selected: OnceLock::new(),
+            unavailable: ModelInfo::new(
+                "unavailable",
+                "Semantic model unavailable",
+                ModelTier::Hash,
+                0,
                 4096,
-            )
-            .with_available(true),
+            ),
             hash_fallback: HashEmbedder::new(),
         }
+    }
+
+    fn selected_model(&self) -> &ModelInfo {
+        if let Some(info) = self.selected.get() {
+            return info;
+        }
+        let ctx = get_two_tier_context();
+        let available = ctx
+            .fast_info()
+            .map(|info| (info, ModelTier::Fast))
+            .or_else(|| ctx.quality_info().map(|info| (info, ModelTier::Quality)));
+        available.map_or(&self.unavailable, |(info, tier)| {
+            // Successful model discovery is sticky. Both document and query
+            // embeddings use this identity, including if another tier appears
+            // later or an embedding attempt transiently fails.
+            self.selected.get_or_init(|| {
+                ModelInfo::new(&info.id, &info.id, tier, info.dimension, 4096).with_available(true)
+            })
+        })
     }
 }
 
 #[cfg(feature = "hybrid")]
 impl Embedder for AutoInitSemanticEmbedder {
     fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
+        let info = self.selected_model();
+        if !info.available {
+            return self.hash_fallback.embed(text);
+        }
         let ctx = get_two_tier_context();
         let start = std::time::Instant::now();
-        if let Ok(vector) = ctx.embed_fast(text) {
-            return Ok(EmbeddingResult::new(
-                vector,
-                self.info.id.clone(),
-                ModelTier::Fast,
-                start.elapsed(),
-                crate::search_canonical::content_hash(text),
-            ));
+        let vector = match info.tier {
+            ModelTier::Fast => ctx.embed_fast(text)?,
+            ModelTier::Quality => ctx.embed_quality(text)?,
+            ModelTier::Hash => return self.hash_fallback.embed(text),
+        };
+        if vector.len() != info.dimension {
+            return Err(crate::search_error::SearchError::InvalidQuery(format!(
+                "Model {} returned dimension {}, expected {}",
+                info.id,
+                vector.len(),
+                info.dimension
+            )));
         }
-        if let Ok(vector) = ctx.embed_quality(text) {
-            return Ok(EmbeddingResult::new(
-                vector,
-                "auto-init-semantic-quality".to_string(),
-                ModelTier::Quality,
-                start.elapsed(),
-                crate::search_canonical::content_hash(text),
-            ));
-        }
-        self.hash_fallback.embed(text)
+        Ok(EmbeddingResult::new(
+            vector,
+            info.id.clone(),
+            info.tier,
+            start.elapsed(),
+            crate::search_canonical::content_hash(text),
+        ))
     }
 
     fn model_info(&self) -> &ModelInfo {
-        &self.info
+        self.selected_model()
     }
 }
 
@@ -1728,6 +1816,8 @@ impl Embedder for AutoInitSemanticEmbedder {
 pub struct SemanticBridge {
     /// The vector index holding document embeddings.
     index: Arc<RwLock<VectorIndex>>,
+    /// Shared, model-pinned embedder for both documents and queries.
+    embedder: Arc<dyn Embedder>,
     /// The model registry for obtaining embedders.
     registry: Arc<RwLock<ModelRegistry>>,
     /// Queue of pending embedding work.
@@ -1754,12 +1844,10 @@ impl SemanticBridge {
         let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
         let job_config = EmbeddingJobConfig::default();
         let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
-        let runner = Arc::new(EmbeddingJobRunner::new(
-            job_config,
-            queue.clone(),
-            embedder,
-            index.clone(),
-        ));
+        let runner = Arc::new(
+            EmbeddingJobRunner::new(job_config, queue.clone(), embedder.clone(), index.clone())
+                .with_model_binding(),
+        );
         let worker_cfg = RefreshWorkerConfig {
             refresh_interval_ms: 250,
             rebuild_on_startup: false,
@@ -1777,6 +1865,7 @@ impl SemanticBridge {
 
         Self {
             index,
+            embedder,
             registry,
             queue,
             runner,
@@ -1785,19 +1874,11 @@ impl SemanticBridge {
         }
     }
 
-    /// Create a semantic bridge with default configuration (384-dim for `MiniLM`).
+    /// Create the queue and worker without loading a model on the caller.
+    /// The first real embedding binds the empty index's model and dimension.
     #[must_use]
     pub fn default_config() -> Self {
-        let ctx = get_two_tier_context();
-        let mut config = VectorIndexConfig::default();
-        config.dimension = ctx.fast_info().map_or_else(
-            || {
-                ctx.quality_info()
-                    .map_or(config.dimension, |info| info.dimension)
-            },
-            |info| info.dimension,
-        );
-        Self::new(config)
+        Self::new(VectorIndexConfig::default())
     }
 
     /// Get a reference to the vector index (for reads).
@@ -1823,15 +1904,21 @@ impl SemanticBridge {
     /// Check if the bridge has any real embedder (beyond hash fallback).
     #[must_use]
     pub fn has_real_embedder(&self) -> bool {
-        self.registry().has_real_embedder() || get_two_tier_context().is_available()
+        let info = self.embedder.model_info();
+        if !self.embedder.is_ready() || info.tier == ModelTier::Hash {
+            return false;
+        }
+        let index = self.index();
+        index
+            .bound_model_id()
+            .is_none_or(|id| id == info.id && index.config().dimension == info.dimension)
     }
 
     /// Search for semantically similar documents.
     ///
     /// Embeds the query text and performs vector similarity search.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
-        let embedder = AutoInitSemanticEmbedder::new();
-        let embedding = match embedder.embed(&query.text) {
+        let embedding = match self.embedder.embed(&query.text) {
             Ok(result) => result,
             Err(e) => {
                 tracing::warn!(
@@ -1849,12 +1936,30 @@ impl SemanticBridge {
             );
             return Vec::new();
         }
+        let selected = self.embedder.model_info();
+        // `ModelInfo` names its identity `id`; an embedding records it as `model_id`.
+        let same_model = embedding.model_id == selected.id;
+        if !same_model
+            || embedding.tier != selected.tier
+            || embedding.dimension != selected.dimension
+            // Equivalent to comparing with `selected.dimension`: the previous
+            // clause already requires both dimensions to agree.
+            || embedding.vector.len() != embedding.dimension
+            || embedding.vector.iter().any(|value| !value.is_finite())
+        {
+            return Vec::new();
+        }
 
         // Build filter from query
-        let filter = build_vector_filter(query);
+        let filter = build_vector_filter(query).with_model(&embedding.model_id);
 
         // Search the index
         let index = self.index();
+        if index.bound_model_id() != Some(embedding.model_id.as_str())
+            || index.config().dimension != embedding.dimension
+        {
+            return Vec::new();
+        }
         let hits = match index.search(&embedding.vector, limit, Some(&filter)) {
             Ok(h) => h,
             Err(e) => {
@@ -1995,12 +2100,13 @@ fn build_vector_filter(query: &SearchQuery) -> VectorFilter {
         filter = filter.with_project(pid);
     }
 
-    let doc_kinds = vec![match query.doc_kind {
-        DocKind::Message => SearchDocKind::Message,
-        DocKind::Agent => SearchDocKind::Agent,
-        DocKind::Project => SearchDocKind::Project,
-        DocKind::Thread => SearchDocKind::Thread,
-    }];
+    let doc_kinds = match query.doc_kind {
+        DocKind::Message => vec![SearchDocKind::Message],
+        DocKind::Agent => vec![SearchDocKind::Agent],
+        DocKind::Project => vec![SearchDocKind::Project],
+        // Thread queries hydrate matching messages from their canonical IDs.
+        DocKind::Thread => vec![SearchDocKind::Message, SearchDocKind::Thread],
+    };
     filter = filter.with_doc_kinds(doc_kinds);
     filter
 }
@@ -2247,11 +2353,21 @@ pub fn enqueue_semantic_document(
     title: &str,
     body: &str,
 ) -> bool {
-    // Avoid heavyweight model initialization on normal write paths.
-    // If semantic indexing has not been initialized, skip enqueue and let
-    // lexical search remain available.
-    let Some(bridge) = get_semantic_bridge() else {
-        return false;
+    // Preserve explicitly initialized bridges. Automatic startup requires the
+    // runtime opt-in and only creates a queue/worker; model I/O stays off the
+    // write caller. Mail sent before the first search must not be discarded.
+    let bridge = match get_semantic_bridge() {
+        Some(bridge) => bridge,
+        None if mcp_agent_mail_core::Config::get()
+            .search_rollout
+            .semantic_enabled =>
+        {
+            let Some(bridge) = get_or_init_semantic_bridge() else {
+                return false;
+            };
+            bridge
+        }
+        None => return false,
     };
     bridge.enqueue_document(
         doc_id,
@@ -2879,6 +2995,81 @@ fn try_two_tier_search_with_cx(
     } else {
         None
     }
+}
+
+/// Retrieve semantic candidates from the progressive index and the live job index.
+/// Normal message/agent writes feed `SemanticBridge`; those completed embeddings
+/// must be available to hybrid and auto searches as well as explicit semantic mode.
+#[cfg(feature = "hybrid")]
+fn semantic_search_with_cx(cx: &Cx, query: &SearchQuery, limit: usize) -> TwoTierSearchOutcome {
+    let mut outcome = try_two_tier_search_with_cx(cx, query, limit).unwrap_or_default();
+    outcome.results.retain(|result| {
+        query
+            .project_id
+            .is_none_or(|id| result.project_id == Some(id))
+            && (result.doc_kind == query.doc_kind
+                || (query.doc_kind == DocKind::Thread && result.doc_kind == DocKind::Message))
+    });
+    if cx.checkpoint().is_ok()
+        && let Some(bridge) = get_or_init_semantic_bridge()
+    {
+        outcome.results =
+            fuse_semantic_candidates(outcome.results, bridge.search(query, limit), limit);
+    }
+    if cx.checkpoint().is_err() {
+        outcome.results.clear();
+    }
+    outcome
+}
+
+/// Merge ranked semantic sources without comparing their raw score scales.
+/// A document present in both indexes receives one reciprocal-rank contribution
+/// from each; duplicate identities within a source never increase its weight.
+#[cfg(feature = "hybrid")]
+fn fuse_semantic_candidates(
+    mut progressive: Vec<SearchResult>,
+    mut live: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    if progressive.is_empty() {
+        live.truncate(limit);
+        return live;
+    }
+    if live.is_empty() {
+        progressive.truncate(limit);
+        return progressive;
+    }
+    let mut fused: HashMap<(DocKind, Option<i64>, i64), SearchResult> = HashMap::new();
+    for source in [progressive, live] {
+        let mut seen = HashSet::new();
+        for (rank, mut result) in source.into_iter().take(limit).enumerate() {
+            let key = (result.doc_kind, result.project_id, result.id);
+            if !seen.insert(key) {
+                continue;
+            }
+            let rank = f64::from(u32::try_from(rank.saturating_add(1)).unwrap_or(u32::MAX));
+            let contribution = 1.0 / (crate::search_fusion::DEFAULT_RRF_K + rank);
+            result.score = Some(contribution);
+            fused
+                .entry(key)
+                .and_modify(|existing| {
+                    existing.score = Some(existing.score.unwrap_or(0.0) + contribution);
+                })
+                .or_insert(result);
+        }
+    }
+    let mut results = fused.into_values().collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        right
+            .score
+            .unwrap_or(0.0)
+            .total_cmp(&left.score.unwrap_or(0.0))
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.doc_kind.as_str().cmp(right.doc_kind.as_str()))
+            .then_with(|| left.project_id.cmp(&right.project_id))
+    });
+    results.truncate(limit);
+    results
 }
 
 #[cfg(feature = "hybrid")]
@@ -4310,21 +4501,19 @@ pub async fn execute_search(
         return resp;
     }
 
-    // A private snapshot has its own source authority even when its reported
-    // mailbox identity matches the live pool. Keep lexical syntax and ranking
+    // A private snapshot or another mailbox has its own source authority even
+    // when it shares the live index directory. Keep lexical syntax and ranking
     // in a private Tantivy index; never backfill the shared live index from an
-    // older materialization. Semantic indexes remain bound to the live source,
-    // so snapshot reads use their own lexical candidates.
+    // older or foreign materialization. Semantic indexes remain bound to the
+    // live source, so these reads use their own lexical candidates.
     #[cfg(feature = "tantivy-engine")]
-    if needs_lexical_freshness && pool.search_identity_path() != pool.sqlite_path() {
-        let mut snapshot_query = query.clone();
-        snapshot_query.limit = Some(pagination_fetch_limit(
-            query,
-            lexical_candidate_limit(query),
-        ));
+    if needs_lexical_freshness
+        && (pool.search_identity_path() != pool.sqlite_path()
+            || lexical_index_is_foreign_to_pool(pool))
+    {
         let raw_results = match crate::search_v3::search_private_snapshot(
             &lexical_backfill_database_url(pool),
-            &snapshot_query,
+            query,
         ) {
             Ok(results) => results,
             Err(error) => return Outcome::Err(map_bridge_bootstrap_error(&error)),
@@ -4336,25 +4525,23 @@ pub async fn execute_search(
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             };
-        let raw_results = apply_cursor_window(raw_results, query);
-        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+        let raw_results = trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
         let explain = query
             .explain
             .then(|| build_v3_query_explain(query, SearchEngine::Lexical, None));
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_private_tantivy", latency_us);
+        }
+        global_metrics().search.record_v3_query(latency_us, false);
         return finish_scoped_response(raw_results, query, options, assistance, explain);
     }
 
-    // GH#162: When reads are served from a reconstructed archive snapshot
-    // (durability_state=degraded_read_only), the process-global Search V3 lexical
-    // bridge stays bound to the *live* database, so this pool's lexical index is
-    // foreign/empty and the Tantivy candidate path would silently return [] for
-    // messages that exist in the snapshot's relational tables. `state == "stale"`
-    // from `lexical_backfill_health` is exactly the "index belongs to a different
-    // database than this pool" signal (path / identity / active-bridge mismatch).
-    // Fall back to the SQL message scan (same path the Legacy engine uses), which
-    // reads straight from THIS pool, so plain-keyword search keeps returning real
-    // results through the degraded window. Count drift ("partial"/"delayed") is NOT
-    // foreign and is handled by the existing backfill-on-empty retry below.
+    // Builds without Tantivy retain the GH#162 SQL fallback for a foreign
+    // lexical index. Read only this pool; a shared index owned by another
+    // mailbox must never supply its candidates. Tantivy-enabled builds use
+    // the isolated index above to preserve phrase, Boolean and prefix syntax.
+    #[cfg(not(feature = "tantivy-engine"))]
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
@@ -4431,13 +4618,7 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        let mut lexical_query = query.clone();
-        lexical_query.limit = Some(pagination_fetch_limit(
-            query,
-            lexical_candidate_limit(query),
-        ));
-
-        let candidates = match try_tantivy_search(pool, &lexical_query) {
+        let candidates = match try_tantivy_search(pool, query) {
             Ok(results) => results,
             Err(error) => return Outcome::Err(error),
         };
@@ -4459,7 +4640,7 @@ pub async fn execute_search(
                         );
                         return Outcome::Err(err);
                     }
-                    match try_tantivy_search(pool, &lexical_query) {
+                    match try_tantivy_search(pool, query) {
                         Ok(Some(rerun_results)) => raw_results = rerun_results,
                         Ok(None) => {}
                         Err(error) => return Outcome::Err(error),
@@ -4475,8 +4656,8 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
-            let raw_results = apply_cursor_window(raw_results, query);
-            let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+            let raw_results =
+                trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -4508,14 +4689,7 @@ pub async fn execute_search(
         #[cfg(feature = "hybrid")]
         {
             let candidate_limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-            let mut raw_results = try_two_tier_search_with_cx(cx, query, candidate_limit)
-                .map_or_else(Vec::new, |outcome| outcome.results);
-
-            if raw_results.is_empty()
-                && let Some(bridge) = get_or_init_semantic_bridge()
-            {
-                raw_results = bridge.search(query, candidate_limit);
-            }
+            let mut raw_results = semantic_search_with_cx(cx, query, candidate_limit).results;
             raw_results =
                 match canonicalize_message_results(cx, pool, query, raw_results, false).await {
                     Outcome::Ok(results) => results,
@@ -4569,6 +4743,10 @@ pub async fn execute_search(
         candidate_query.limit = Some(pagination_fetch_limit(query, legacy_candidate_limit(query)));
         let plan = derive_hybrid_execution_plan(cx, &candidate_query, engine);
         let mut lexical_query = candidate_query.clone();
+        // A hybrid cursor contains fused scores, not lexical BM25 scores.
+        // Candidate retrieval starts at the beginning; only the final fused
+        // ranking can apply that cursor.
+        lexical_query.cursor = None;
         lexical_query.limit = Some(pagination_fetch_limit(
             query,
             plan.derivation.budget.lexical_limit,
@@ -4586,10 +4764,12 @@ pub async fn execute_search(
         let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
             (Vec::new(), None)
         } else {
-            try_two_tier_search_with_cx(cx, &candidate_query, plan.derivation.budget.semantic_limit)
-                .map_or((Vec::new(), None), |outcome| {
-                    (outcome.results, Some(outcome.telemetry))
-                })
+            let outcome = semantic_search_with_cx(
+                cx,
+                &candidate_query,
+                plan.derivation.budget.semantic_limit,
+            );
+            (outcome.results, Some(outcome.telemetry))
         };
         #[cfg(not(feature = "hybrid"))]
         let semantic_results: Vec<SearchResult> = Vec::new();
@@ -4665,7 +4845,8 @@ pub async fn execute_search(
 ///
 /// True is the reconstructed-archive-snapshot case (GH#162): the process-global
 /// Tantivy bridge cannot serve this pool, so lexical / hybrid candidate retrieval
-/// must fall back to a SQL message scan. Only [`LexicalIndexAffinity::Foreign`]
+/// must use an isolated index or the feature-disabled SQL fallback.
+/// Only [`LexicalIndexAffinity::Foreign`]
 /// counts — a marker or active bridge bound to another *existing* database.
 /// An index bound to an earlier generation of this same mailbox, to a vanished
 /// database, or to a previous pool generation in this process is
@@ -5060,11 +5241,10 @@ mod tests {
     /// different database — otherwise cached pre-delivery result sets keep
     /// serving confident false-negatives until the TTL expires.
     #[test]
-    fn gh227_index_message_invalidates_search_cache_without_bridge() {
+    fn gh227_message_ingestion_invalidates_search_cache_without_bridge() {
         let cache = global_search_cache();
         let epoch_before = cache.current_epoch();
-        let result = crate::search_v3::index_message(":memory:", 733);
-        assert!(result.is_ok(), "index_message must not fail the send path");
+        note_message_ingested();
         assert!(
             cache.current_epoch() > epoch_before,
             "ingestion must bump the search cache epoch regardless of bridge state"
@@ -5614,6 +5794,95 @@ mod tests {
         reset_lexical_bootstrap_tracking();
     }
 
+    /// br-ekdk1: the step before the result cache only observes the source
+    /// revision (a moved clock empties cached result sets) and indexes
+    /// nothing; the query's own catch-up in `search_database` finds the row.
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    fn bridge_readiness_observes_the_source_without_catching_up() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "observe.sqlite3");
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/search-observe")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let insert = |id: i64, word: &str| {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, 'body', 1000000)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(sender.id.unwrap()),
+                        Value::Text(word.to_string()),
+                    ],
+                )
+                .unwrap();
+            };
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Lexical),
+                ..Default::default()
+            };
+            insert(1, "kestrelone");
+            let first = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("kestrelone", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(first.results.len(), 1);
+
+            insert(2, "kestreltwo");
+            let bridge = crate::search_v3::get_bridge().unwrap();
+            let indexed = || {
+                bridge
+                    .search(&SearchQuery::messages("kestreltwo", project_id))
+                    .len()
+            };
+            let epoch_before = global_search_cache().current_epoch();
+            ensure_lexical_bridge_initialized(&pool).unwrap();
+            assert_eq!(indexed(), 0, "readiness indexes nothing");
+            assert!(
+                global_search_cache().current_epoch() > epoch_before,
+                "a moved source clock empties cached result sets"
+            );
+            let second = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("kestreltwo", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(second.results.len(), 1, "the query's catch-up finds it");
+            assert_eq!(indexed(), 1);
+        });
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+    }
+
     #[cfg(all(unix, feature = "tantivy-engine"))]
     #[test]
     fn execute_search_refuses_replaced_source_behind_retained_pool() {
@@ -5726,12 +5995,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
+    fn execute_search_keeps_results_when_lexical_index_is_foreign_snapshot() {
         // GH#162: while reads are served from a reconstructed archive snapshot, the
         // process-global Search V3 lexical bridge stays bound to the *live* DB, so
         // this pool's lexical index is foreign (lexical_backfill_health == "stale").
         // A plain-keyword Lexical-engine search must still return the matching
-        // message via the SQL fallback instead of silently returning [].
+        // message through its own source instead of silently returning [].
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5743,7 +6012,7 @@ mod tests {
             .expect("build runtime");
 
         runtime.block_on(async {
-            let cx = Cx::for_testing();
+            let cx = Cx::current().expect("runtime installs foreign-index search context");
             let project = match crate::queries::ensure_project(
                 &cx,
                 &pool,
@@ -5827,10 +6096,192 @@ mod tests {
                     .iter()
                     .any(|row| row.result.id == message.id.unwrap_or(0)),
                 "plain-keyword search over a foreign-lexical-index (snapshot) pool must \
-                 return the matching message via the SQL fallback, got {} results",
+                 return the matching message from its own source, got {} results",
                 response.results.len()
             );
         });
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    #[cfg(feature = "tantivy-engine")]
+    fn foreign_mailbox_search_preserves_lexical_syntax_scope_and_live_index() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("foreign mailbox fixture");
+        let owner_pool = temp_file_pool(root.path(), "owner.sqlite3");
+        let foreign_pool = temp_file_pool(root.path(), "foreign.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("search runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs search context");
+            for pool in [&owner_pool, &foreign_pool] {
+                let conn = pool.acquire(&cx).await.expect("seed mailbox connection");
+                conn.execute_raw(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                     (1, 'first', '/data/projects/first', 1), \
+                     (2, 'second', '/data/projects/second', 1)",
+                )
+                .expect("seed projects");
+                conn.execute_raw(
+                    "INSERT INTO agents \
+                     (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+                     (1, 1, 'RedPeak', 'test', 'test', 1, 1), \
+                     (2, 2, 'BlueLake', 'test', 'test', 1, 1)",
+                )
+                .expect("seed senders");
+            }
+            let owner = owner_pool.acquire(&cx).await.expect("owner connection");
+            owner
+                .execute_raw(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (1, 1, 1, 'ownerarchive', 'owner-only content', 100)",
+                )
+                .expect("seed owner message");
+            drop(owner);
+            let foreign = foreign_pool
+                .acquire(&cx)
+                .await
+                .expect("foreign connection");
+            foreign
+                .execute_raw(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, subject, body_md, created_ts, thread_id, topic) \
+                     VALUES \
+                     (1, 1, 1, 'alpha beta', 'foreign exact content', 100, 'thread-one', 'release'), \
+                     (2, 1, 1, 'alpha intervening beta', 'non-phrase content', 200, NULL, NULL), \
+                     (3, 2, 2, 'alpha beta gamma', 'other project content', 300, NULL, NULL), \
+                     (4, 1, 1, 'alphabetic delta', 'prefix content', 400, NULL, NULL), \
+                     (5, 1, 1, 'alpha beta gamma', 'excluded content', 500, NULL, NULL)",
+                )
+                .expect("seed foreign messages with overlapping IDs");
+            drop(foreign);
+
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Lexical),
+                ..Default::default()
+            };
+            let owner_query = SearchQuery::messages("ownerarchive", 1);
+            let initial = execute_search(&cx, &owner_pool, &owner_query, &options)
+                .await
+                .expect("initialize owner index");
+            assert_eq!(initial.results.len(), 1);
+            let owner_bridge = crate::search_v3::get_bridge().expect("owner bridge");
+            let marker = owner_bridge.index_dir().join("backfill_state.json");
+            let metadata = owner_bridge.index_dir().join("meta.json");
+            let marker_before = std::fs::read(&marker).expect("owner marker");
+            let metadata_before = std::fs::read(&metadata).expect("owner metadata");
+            let cache_epoch_before = global_search_cache().current_epoch();
+            assert!(
+                lexical_index_is_foreign_to_pool(&foreign_pool),
+                "both existing mailboxes share an index owned by the first"
+            );
+
+            let cases: &[(&str, Option<i64>, &[i64])] = &[
+                ("\"alpha beta\"", None, &[1, 3, 5]),
+                ("\"alpha beta\" NOT gamma", None, &[1]),
+                ("alphabet*", None, &[4]),
+                ("\"alpha beta\"", Some(1), &[1, 5]),
+                ("ownerarchive", None, &[]),
+                ("latearrival", None, &[]),
+            ];
+            for &(text, project_id, expected) in cases {
+                let query = SearchQuery {
+                    text: text.to_string(),
+                    project_id,
+                    explain: true,
+                    ..Default::default()
+                };
+                let response = execute_search(&cx, &foreign_pool, &query, &options)
+                    .await
+                    .expect("foreign lexical search");
+                let mut ids: Vec<_> = response.results.iter().map(|r| r.result.id).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "query {text:?} in {project_id:?}");
+                assert!(response.results.iter().all(|r| r.result.score.is_some()));
+                if let Some(hit) = response.results.iter().find(|r| r.result.id == 1) {
+                    assert_eq!(hit.result.body, "foreign exact content");
+                    assert_eq!(hit.result.topic.as_deref(), Some("release"));
+                    assert_eq!(hit.result.thread_id.as_deref(), Some("thread-one"));
+                }
+            }
+
+            let scoped_options = SearchOptions {
+                scope_ctx: Some(ScopeContext {
+                    viewer: Some(ViewerIdentity {
+                        project_id: 1,
+                        agent_id: 1,
+                    }),
+                    viewer_project_ids: vec![1],
+                    ..default_scope_context()
+                }),
+                ..options.clone()
+            };
+            let scoped = execute_search(
+                &cx,
+                &foreign_pool,
+                &SearchQuery {
+                    text: "\"alpha beta\"".to_string(),
+                    ..Default::default()
+                },
+                &scoped_options,
+            )
+            .await
+            .expect("foreign search applies caller scope");
+            let mut scoped_ids: Vec<_> = scoped.results.iter().map(|r| r.result.id).collect();
+            scoped_ids.sort_unstable();
+            assert_eq!(scoped_ids, [1, 5]);
+            assert_eq!(
+                scoped.audit_summary.expect("scope audit").denied_count,
+                1,
+                "other-project result must remain denied"
+            );
+
+            let foreign = foreign_pool
+                .acquire(&cx)
+                .await
+                .expect("update foreign source");
+            foreign
+                .execute_raw("UPDATE messages SET subject = 'latearrival' WHERE id = 4")
+                .expect("commit new source content");
+            drop(foreign);
+            let refreshed = execute_search(
+                &cx,
+                &foreign_pool,
+                &SearchQuery {
+                    text: "latearrival".to_string(),
+                    explain: true,
+                    ..Default::default()
+                },
+                &options,
+            )
+            .await
+            .expect("foreign index observes committed edits after an earlier miss");
+            assert_eq!(refreshed.results.len(), 1);
+            assert_eq!(refreshed.results[0].result.id, 4);
+            assert_eq!(std::fs::read(&marker).expect("owner marker"), marker_before);
+            assert_eq!(
+                std::fs::read(&metadata).expect("owner metadata"),
+                metadata_before
+            );
+            assert_eq!(global_search_cache().current_epoch(), cache_epoch_before);
+            assert!(Arc::ptr_eq(
+                &crate::search_v3::get_bridge().expect("owner bridge retained"),
+                &owner_bridge
+            ));
+            let owner_after = execute_search(&cx, &owner_pool, &owner_query, &options)
+                .await
+                .expect("owner still searches its own index");
+            assert_eq!(owner_after.results.len(), 1);
+            assert_eq!(owner_after.results[0].result.body, "owner-only content");
+        });
+        crate::search_v3::reset_bridge_for_tests();
         reset_lexical_bootstrap_tracking();
     }
 
@@ -8551,11 +9002,8 @@ mod tests {
     #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_enqueue_auto_initializes_bridge_and_tracks_dedup() {
-        // The bridge must be initialized before enqueue_semantic_document will
-        // accept documents (it deliberately avoids heavyweight auto-init on
-        // normal write paths).  If the OnceLock was already set by a previous
-        // test in the same process, init_semantic_bridge_default returns Err
-        // — that's fine; the bridge is usable either way.
+        // Explicit initialization remains usable even if automatic semantic
+        // indexing is disabled by the rollout configuration.
         let _ = init_semantic_bridge_default();
 
         assert!(enqueue_semantic_document(
@@ -8586,6 +9034,9 @@ mod tests {
     #[derive(Debug)]
     struct FixedSemanticTestEmbedder {
         info: ModelInfo,
+        ready: std::sync::atomic::AtomicBool,
+        model_changed: std::sync::atomic::AtomicBool,
+        output_dimension: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(feature = "hybrid")]
@@ -8600,6 +9051,9 @@ mod tests {
                     4096,
                 )
                 .with_available(true),
+                ready: std::sync::atomic::AtomicBool::new(true),
+                model_changed: std::sync::atomic::AtomicBool::new(false),
+                output_dimension: std::sync::atomic::AtomicUsize::new(dimension),
             }
         }
     }
@@ -8607,9 +9061,24 @@ mod tests {
     #[cfg(feature = "hybrid")]
     impl Embedder for FixedSemanticTestEmbedder {
         fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
+            if !self.is_ready() {
+                return HashEmbedder::new().embed(text);
+            }
+            let model_id = if self
+                .model_changed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                "another-model-same-dimension".to_string()
+            } else {
+                self.info.id.clone()
+            };
             Ok(EmbeddingResult::new(
-                vec![0.42_f32; self.info.dimension],
-                self.info.id.clone(),
+                vec![
+                    0.42_f32;
+                    self.output_dimension
+                        .load(std::sync::atomic::Ordering::Acquire)
+                ],
+                model_id,
                 ModelTier::Fast,
                 Duration::from_millis(1),
                 crate::search_canonical::content_hash(text),
@@ -8619,18 +9088,26 @@ mod tests {
         fn model_info(&self) -> &ModelInfo {
             &self.info
         }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(std::sync::atomic::Ordering::Acquire)
+        }
     }
 
     #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_bridge_pipeline_runs_enqueue_process_and_index_search() {
-        let bridge = SemanticBridge::new_with_embedder(
-            VectorIndexConfig {
-                dimension: 4,
-                ..Default::default()
-            },
-            Arc::new(FixedSemanticTestEmbedder::new(4)),
-        );
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let bridge =
+            SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder.clone());
+        bridge.refresh_worker.shutdown();
+        let worker = bridge.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            worker.join().unwrap();
+        }
 
         assert!(bridge.enqueue_document(
             7001,
@@ -8641,9 +9118,21 @@ mod tests {
         ));
         let before = bridge.queue_stats();
         assert_eq!(before.pending_count, 1);
+        assert!(!bridge.has_real_embedder());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.queue_stats().pending_count, 1);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.index().config().dimension, 384);
 
+        let cache_epoch = global_search_cache().current_epoch();
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
         let processed = bridge.refresh_worker.run_cycle();
         assert_eq!(processed, 1);
+        assert!(global_search_cache().current_epoch() > cache_epoch);
+        assert_eq!(bridge.index().config().dimension, 4);
+        assert_eq!(bridge.index().bound_model_id(), Some("fixed-semantic-test"));
 
         let after = bridge.queue_stats();
         assert_eq!(after.pending_count, 0);
@@ -8662,6 +9151,395 @@ mod tests {
             hits.iter().any(|hit| hit.doc_id == 7001),
             "indexed document should be retrievable from vector index"
         );
+        let query = SearchQuery::messages("Bridge Body", 77);
+        assert_eq!(bridge.search(&query, 8)[0].id, 7001);
+        let thread_query = SearchQuery {
+            doc_kind: DocKind::Thread,
+            ..query.clone()
+        };
+        assert_eq!(bridge.search(&thread_query, 8)[0].id, 7001);
+        assert!(
+            bridge
+                .search(&SearchQuery::messages("Bridge Body", 78), 8)
+                .is_empty()
+        );
+
+        // Equal dimensions do not make a different model's vectors comparable.
+        embedder
+            .model_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(bridge.search(&query, 8).is_empty());
+        assert!(bridge.enqueue_document(7002, SearchDocKind::Message, Some(77), "new", "body"));
+        assert_eq!(bridge.runner.process_batch().unwrap().retryable, 1);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 1);
+        assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
+        assert_eq!(bridge.index().len(), 1);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_bridge_rejects_unselected_model_before_first_index_write() {
+        for (wrong_model, dimension) in [(true, 4), (false, 3)] {
+            let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+            embedder
+                .model_changed
+                .store(wrong_model, std::sync::atomic::Ordering::Release);
+            embedder
+                .output_dimension
+                .store(dimension, std::sync::atomic::Ordering::Release);
+            let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
+            bridge.refresh_worker.shutdown();
+            let worker = bridge.worker.lock().unwrap().take();
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            assert!(bridge.enqueue_document(7003, SearchDocKind::Message, Some(77), "new", "body"));
+            assert_eq!(bridge.runner.process_batch().unwrap().retryable, 1);
+            assert_eq!(bridge.metrics_snapshot().total_succeeded, 0);
+            assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
+            assert_eq!(bridge.index().bound_model_id(), None);
+            assert_eq!(bridge.index().config().dimension, 384);
+            assert!(bridge.index().is_empty());
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_candidates_fuse_both_sources_without_raw_score_comparison() {
+        let progressive = scored_results_to_search_results(vec![
+            make_scored(1, 1000.0),
+            make_scored(2, 900.0),
+            make_scored(2, 800.0),
+        ]);
+        let live = scored_results_to_search_results(vec![make_scored(2, 0.8), make_scored(3, 0.7)]);
+        let fused = fuse_semantic_candidates(progressive, live, 8);
+        assert_eq!(
+            fused.iter().map(|result| result.id).collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+        assert!((fused[0].score.unwrap() - (1.0 / 61.0 + 1.0 / 62.0)).abs() < f64::EPSILON);
+        let tied = fuse_semantic_candidates(
+            scored_results_to_search_results(vec![make_scored(8, 1000.0)]),
+            scored_results_to_search_results(vec![make_scored(7, 0.1)]),
+            1,
+        );
+        assert_eq!(tied.len(), 1);
+        assert_eq!(tied[0].id, 7);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    #[ignore = "requires registered potion bytes; set AM_TEST_POTION_DIR and run explicitly"]
+    #[allow(clippy::too_many_lines)]
+    fn semantic_bridge_recovers_queued_documents_after_real_model_installation() {
+        use crate::search_model2vec::MODEL_POTION_128M;
+        use crate::search_vector_index::{IndexEntry, VectorMetadata};
+
+        const CHILD: &str = "AM_TEST_SEMANTIC_RECOVERY_CHILD";
+        const VERIFIED: &str =
+            "real late model completed queued jobs and scoped semantic/hybrid/auto search";
+        let model_source = PathBuf::from(
+            std::env::var("AM_TEST_POTION_DIR")
+                .expect("AM_TEST_POTION_DIR must name the registered potion model directory"),
+        );
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let broken = root.path().join("broken");
+            std::fs::create_dir(&broken).unwrap();
+            for file in ["tokenizer.json", "model.safetensors"] {
+                std::fs::write(broken.join(file), b"incomplete installation").unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "search_service::tests::semantic_bridge_recovers_queued_documents_after_real_model_installation",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("AM_TEST_POTION_DIR", model_source.canonicalize().unwrap())
+                .env("FRANKENSEARCH_MODEL_DIR", &broken)
+                .env_remove("FRANKENSEARCH_DATA_DIR")
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
+                .env("AM_SEARCH_RERANK_ENABLED", "false")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "isolated real bridge recovery failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains(VERIFIED),
+                "child ran no recovery proof: {stdout}"
+            );
+            println!("{VERIFIED}");
+            return;
+        }
+
+        assert!(get_semantic_bridge().is_none());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_SEARCH_SEMANTIC_ENABLED", "false")],
+            || {
+                assert!(!enqueue_semantic_document(
+                    DocKind::Message,
+                    7099,
+                    Some(1),
+                    "disabled",
+                    "body"
+                ));
+                assert!(get_semantic_bridge().is_none());
+            },
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "late-model.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (project_id, scope, bridge) = runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/late-model-visible")
+                .await.into_result().unwrap();
+            let foreign = crate::queries::ensure_project(&cx, &pool, "/late-model-foreign")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let foreign_id = foreign.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let blocked = crate::queries::register_agent(
+                &cx, &pool, project_id, "RedStone", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let outsider = crate::queries::register_agent(
+                &cx, &pool, foreign_id, "GreenField", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let scope = ScopeContext {
+                viewer: Some(ViewerIdentity { project_id, agent_id: sender.id.unwrap() }),
+                viewer_project_ids: vec![project_id],
+                sender_policies: vec![SenderPolicy {
+                    project_id,
+                    agent_id: blocked.id.unwrap(),
+                    policy: ContactPolicyKind::BlockAll,
+                }],
+                approved_contacts: Vec::new(),
+                recipient_map: Vec::new(),
+            };
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            assert!(get_semantic_bridge().is_none());
+            for (id, pid, sender_id, subject, body) in [
+                (7101, project_id, sender.id.unwrap(), "mailbox recovery", "repair the mail delivery service"),
+                (7102, project_id, blocked.id.unwrap(), "restricted sender", "privateblockedpayload"),
+                (7103, foreign_id, outsider.id.unwrap(), "foreign project", "privateforeignpayload"),
+            ] {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, ?, 1000000)",
+                    &[Value::BigInt(id), Value::BigInt(pid), Value::BigInt(sender_id),
+                      Value::Text(subject.to_string()), Value::Text(body.to_string())],
+                ).unwrap();
+                assert!(enqueue_semantic_document(DocKind::Message, id, Some(pid), subject, body));
+            }
+            let bridge = get_semantic_bridge().expect("the first enabled write initializes its queue");
+            assert_eq!(bridge.queue_stats().total_enqueued, 3);
+            let query = SearchQuery::messages("mailbox recovery", project_id);
+            for engine in [SearchEngine::Lexical, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                assert_eq!(response.results.len(), 1, "lexical fallback before model: {engine:?}");
+                assert_eq!(response.results[0].result.id, 7101);
+            }
+            // Cache an empty semantic response and lexical miss before promotion.
+            let semantic_query = SearchQuery::messages("restore communications", project_id);
+            for engine in [SearchEngine::Semantic, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &semantic_query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                assert!(response.results.is_empty());
+            }
+            (project_id, scope, bridge)
+        });
+        let context = get_two_tier_context();
+        assert_eq!(context.availability(), TwoTierAvailability::None);
+        assert_eq!(bridge.index().config().dimension, 384);
+        assert_eq!(bridge.index().bound_model_id(), None);
+        assert!(!bridge.has_real_embedder());
+        assert_eq!(bridge.queue_stats().pending_count, 3);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.metrics_snapshot().total_failed, 0);
+        let cache_epoch = global_search_cache().current_epoch();
+
+        let installed = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("mcp-agent-mail/models")
+            .join(MODEL_POTION_128M);
+        std::fs::create_dir_all(&installed).unwrap();
+        for file in ["tokenizer.json", "model.safetensors"] {
+            std::fs::copy(model_source.join(file), installed.join(file)).unwrap();
+        }
+        // The production worker, discovery cooldown, queue and runner all remain
+        // live. No global reset, model substitution or manual index insertion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while bridge.metrics_snapshot().total_succeeded < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live indexing did not recover: {:?}",
+                bridge.metrics_snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(Arc::ptr_eq(&bridge, &get_semantic_bridge().unwrap()));
+        assert!(std::ptr::eq(context, get_two_tier_context()));
+        assert!(bridge.has_real_embedder());
+        assert_eq!(bridge.queue_stats().pending_count, 0);
+        assert_eq!(bridge.queue_stats().retry_count, 0);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.metrics_snapshot().total_failed, 0);
+        assert!(global_search_cache().current_epoch() > cache_epoch);
+        let info = context.fast_info().unwrap();
+        assert_eq!(info.id, MODEL_POTION_128M);
+        assert_eq!(info.dimension, 256);
+        let embedding = bridge.embedder.embed("restore communications").unwrap();
+        assert!(!embedding.is_hash_only());
+        assert_eq!(embedding.model_id, info.id);
+        assert_eq!(embedding.dimension, info.dimension);
+        assert!(embedding.vector.iter().all(|value| value.is_finite()));
+        assert!(
+            (embedding
+                .vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                - 1.0)
+                .abs()
+                < 0.000_01
+        );
+        {
+            let mut index = bridge.index_mut();
+            assert_eq!(index.config().dimension, info.dimension);
+            assert_eq!(index.bound_model_id(), Some(info.id.as_str()));
+            assert_eq!(index.len(), 3);
+            for id in [7101, 7102, 7103] {
+                let entry = index.get(id, SearchDocKind::Message).unwrap();
+                assert_eq!(entry.metadata.model_id, info.id);
+                assert_eq!(entry.vector.len(), info.dimension);
+            }
+            assert!(
+                index
+                    .upsert(IndexEntry::new(
+                        &embedding.vector,
+                        VectorMetadata::new(7198, SearchDocKind::Message, "foreign-model")
+                    ))
+                    .is_err()
+            );
+            assert!(
+                index
+                    .upsert(IndexEntry::new(
+                        &[0.5; 384],
+                        VectorMetadata::new(7199, SearchDocKind::Message, &info.id)
+                    ))
+                    .is_err()
+            );
+            assert_eq!(index.len(), 3);
+        }
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let query = SearchQuery::messages("restore communications", project_id);
+            for engine in [
+                SearchEngine::Semantic,
+                SearchEngine::Hybrid,
+                SearchEngine::Auto,
+            ] {
+                let response = execute_search(
+                    &cx,
+                    &pool,
+                    &query,
+                    &SearchOptions {
+                        scope_ctx: Some(scope.clone()),
+                        search_engine: Some(engine),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert_eq!(
+                    response.results.len(),
+                    1,
+                    "real semantic candidates must serve {engine:?}"
+                );
+                assert_eq!(response.results[0].result.id, 7101);
+                assert_eq!(
+                    response.results[0].result.body,
+                    "repair the mail delivery service"
+                );
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("privateblockedpayload"));
+                assert!(!wire.contains("privateforeignpayload"));
+            }
+            let lexical = execute_search(
+                &cx,
+                &pool,
+                &query,
+                &SearchOptions {
+                    search_engine: Some(SearchEngine::Lexical),
+                    ..Default::default()
+                },
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert!(
+                lexical.results.is_empty(),
+                "semantic proof must not be satisfied by lexical hits"
+            );
+
+            // Populate both real indexes: one shared document, one progressive
+            // only document and one newer live-job-only document. A non-empty
+            // progressive result set must not hide accepted live write jobs.
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            for (id, subject, body) in [
+                (7104, "routing repair", "fix the message transport"),
+                (7105, "sender queue", "latest mailbox status"),
+            ] {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, ?, 2000000)",
+                    &[Value::BigInt(id), Value::BigInt(project_id),
+                      Value::BigInt(scope.viewer.unwrap().agent_id),
+                      Value::Text(subject.to_string()), Value::Text(body.to_string())],
+                ).unwrap();
+            }
+            let progressive = get_or_init_two_tier_bridge().unwrap();
+            progressive.add_document(7101, DocKind::Message, Some(project_id),
+                "mailbox recovery repair the mail delivery service").unwrap();
+            progressive.add_document(7104, DocKind::Message, Some(project_id),
+                "routing repair fix the message transport").unwrap();
+            assert!(enqueue_semantic_document(DocKind::Message, 7105, Some(project_id),
+                "sender queue", "latest mailbox status"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while bridge.metrics_snapshot().total_succeeded < 4 {
+                assert!(std::time::Instant::now() < deadline, "new live job failed to complete");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(progressive.index().len(), 2);
+            for engine in [SearchEngine::Semantic, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                let mut ids = response.results.iter().map(|row| row.result.id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, [7101, 7104, 7105], "both real semantic indexes must contribute once: {engine:?}");
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("privateblockedpayload"));
+                assert!(!wire.contains("privateforeignpayload"));
+            }
+        });
+        println!("{VERIFIED}");
     }
 
     #[cfg(feature = "hybrid")]
@@ -8674,20 +9552,14 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
-    fn semantic_bridge_default_dimension_matches_auto_init_context() {
-        let ctx = get_two_tier_context();
-        let expected_dimension = ctx.fast_info().map_or_else(
-            || {
-                ctx.quality_info().map_or_else(
-                    || VectorIndexConfig::default().dimension,
-                    |info| info.dimension,
-                )
-            },
-            |info| info.dimension,
-        );
-
+    fn semantic_bridge_default_defers_model_selection() {
         let bridge = SemanticBridge::default_config();
-        assert_eq!(bridge.index().config().dimension, expected_dimension);
+        assert_eq!(
+            bridge.index().config().dimension,
+            VectorIndexConfig::default().dimension
+        );
+        assert_eq!(bridge.index().bound_model_id(), None);
+        assert!(bridge.index().is_empty());
     }
 
     #[cfg(feature = "hybrid")]

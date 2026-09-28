@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{Read, Write};
@@ -30,6 +31,20 @@ pub enum SetupError {
 
     #[error("unknown agent platform: {0}")]
     UnknownPlatform(String),
+
+    /// Namespace publication occurred, but its file flush was not confirmed.
+    /// This never promises power-loss durability of directory entries.
+    #[cfg(windows)]
+    #[error(
+        "Windows setup {state} at {path}; file durability is unconfirmed; recovery artifact: {retained:?}: {source}"
+    )]
+    WindowsPublicationUnconfirmed {
+        state: &'static str,
+        path: PathBuf,
+        retained: Option<PathBuf>,
+        #[source]
+        source: Box<SetupError>,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -1365,45 +1380,332 @@ pub fn ensure_gitignore_entries(
 // TOML section merge
 // ---------------------------------------------------------------------------
 
+/// Keys the desired HTTP section owns outright, not only the keys present in
+/// a particular invocation. If the server switches from stdio to HTTP, or
+/// from bearer auth to no-auth, preserving an omitted managed key leaves
+/// Codex on a conflicting transport or stale credential and makes setup's
+/// status/self-heal loop unable to converge.
+const TOML_SETUP_MANAGED_KEYS: [&str; 12] = [
+    "url",
+    "httpUrl",
+    "startup_timeout_sec",
+    "http_headers",
+    "env_http_headers",
+    "bearer_token_env_var",
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "environment",
+    "transport",
+];
+
+const TOML_CANONICAL_SERVER_TABLE: &str = "mcp_servers.mcp_agent_mail";
+const TOML_ALIAS_SERVER_TABLE: &str = "mcp_servers.\"mcp-agent-mail\"";
+const TOML_ALIAS_SERVER_KEY: &str = "mcp-agent-mail";
+
+fn toml_setup_managed_key(key: &str, target_keys: &HashSet<&str>) -> bool {
+    target_keys.contains(key) || TOML_SETUP_MANAGED_KEYS.contains(&key)
+}
+
 /// Merge or append a TOML section, replacing keys in the target section.
 ///
 /// Codex's canonical spelling is `mcp_agent_mail`; rewrite the quoted hyphen
 /// alias when setup encounters it so clients do not retain two server names.
+///
+/// A parseable document is merged structurally through `toml_edit`, so a
+/// managed key is replaced however the client last serialized it: as an
+/// inline value, as a standard sub-table such as
+/// `[mcp_servers.mcp_agent_mail.http_headers]` (Codex rewrites every server
+/// entry in that form on `codex mcp add`/`remove`), or as dotted keys.
+/// Unmanaged keys and sub-tables (`tools.*`) survive in place. A document
+/// that does not parse, for example one an earlier setup left with a
+/// duplicated `http_headers` definition, falls back to a line-oriented merge
+/// that also drops descendant tables of managed keys, so a rerun converges
+/// on valid TOML instead of corrupting the file again (GH #328). Whatever
+/// the path, output that does not parse is an error rather than a write.
 fn merge_toml_section(
     existing: Option<&str>,
     section_header: &str,
     key_values: &[(String, String)],
-) -> String {
-    use std::collections::HashSet;
-
-    let mut section_lines = Vec::with_capacity(key_values.len() + 1);
-    section_lines.push(section_header.to_string());
-    section_lines.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-
-    match existing {
+) -> Result<String, SetupError> {
+    let merged = match existing {
         Some(text) if !text.trim().is_empty() => {
-            let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
-            let mut merged = Vec::new();
-            let mut in_target_section = false;
-            let mut saw_target_section = false;
-            let mut preserved_target_lines = Vec::new();
-            let mut preserved_target_keys = HashSet::new();
+            merge_toml_section_document(text, section_header, key_values)
+                .unwrap_or_else(|| merge_toml_section_lines(text, section_header, key_values))
+        }
+        _ => {
+            // No existing file — create fresh.
+            let mut section = section_header.to_string();
+            for (key, value) in key_values {
+                section.push('\n');
+                section.push_str(key);
+                section.push_str(" = ");
+                section.push_str(value);
+            }
+            section.push('\n');
+            section
+        }
+    };
+    match toml::from_str::<toml::Value>(&merged) {
+        Ok(_) => Ok(merged),
+        Err(error) => Err(SetupError::Other(toml_merge_refusal(
+            section_header,
+            existing,
+            &error,
+        ))),
+    }
+}
 
-            for raw_line in text.lines() {
-                if let Some(section) = parse_toml_section_header(raw_line) {
-                    in_target_section = toml_section_matches_target(section, section_header);
-                    saw_target_section |= in_target_section;
-                    if !in_target_section {
-                        merged.push(raw_line.to_string());
+/// Explain why a merged TOML document was not written. When the input was
+/// already unparseable outside the managed section, say so: the user has to
+/// repair the file, and rerunning setup will not help.
+fn toml_merge_refusal(
+    section_header: &str,
+    existing: Option<&str>,
+    error: &toml::de::Error,
+) -> String {
+    existing
+        .and_then(|text| toml::from_str::<toml::Value>(text).err())
+        .map_or_else(
+            || format!("refusing to write {section_header}: merged TOML does not parse: {error}"),
+            |existing_error| {
+                format!(
+                    "refusing to write {section_header}: the existing config is not valid TOML \
+                     outside the section setup manages, so setup cannot repair it \
+                     ({existing_error}); fix the file by hand and rerun setup"
+                )
+            },
+        )
+}
+
+/// Split a `[a.b."c-d"]` header into its key path.
+fn parse_toml_header_path(section_header: &str) -> Option<Vec<String>> {
+    let inner = section_header
+        .trim()
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim();
+    let keys = toml_edit::Key::parse(inner).ok()?;
+    if keys.is_empty() {
+        return None;
+    }
+    Some(keys.iter().map(|key| key.get().to_string()).collect())
+}
+
+/// Structural merge for documents `toml_edit` can parse. Returns `None` when
+/// the document, the header, or a managed value does not parse, or when a
+/// parent of the target holds a non-table value; the caller then falls back
+/// to the line-oriented merge.
+fn merge_toml_section_document(
+    text: &str,
+    section_header: &str,
+    key_values: &[(String, String)],
+) -> Option<String> {
+    use toml_edit::{DocumentMut, Item, Table, TableLike, Value as TomlValue};
+
+    let mut doc: DocumentMut = text.parse().ok()?;
+    let target_path = parse_toml_header_path(section_header)?;
+    let (target_key, parent_path) = target_path.split_last()?;
+    let alias_key = (target_path
+        .iter()
+        .map(String::as_str)
+        .eq(["mcp_servers", "mcp_agent_mail"]))
+    .then_some(TOML_ALIAS_SERVER_KEY);
+
+    let mut values = Vec::with_capacity(key_values.len());
+    for (key, raw) in key_values {
+        let value: TomlValue = raw.parse().ok()?;
+        values.push((key.as_str(), value));
+    }
+    let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
+
+    let mut parent: &mut dyn TableLike = doc.as_table_mut();
+    for segment in parent_path {
+        let item = parent.entry(segment).or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        });
+        parent = item.as_table_like_mut()?;
+    }
+
+    // Fold the quoted alias into the canonical entry, then drop it, so the
+    // client never retains two server names.
+    let alias_entries: Vec<(String, Item)> = alias_key
+        .and_then(|alias| parent.remove(alias))
+        .and_then(|item| {
+            item.as_table_like().map(|table| {
+                table
+                    .iter()
+                    .map(|(key, item)| (key.to_string(), item.clone()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    let target_item = parent
+        .entry(target_key)
+        .or_insert_with(|| Item::Table(Table::new()));
+    if target_item.as_table_like().is_none() {
+        *target_item = Item::Table(Table::new());
+    }
+    if let Some(table) = target_item.as_table_mut() {
+        table.set_implicit(false);
+    }
+    let target = target_item.as_table_like_mut()?;
+
+    // Drop every managed key however it was serialized: inline value,
+    // standard sub-table, or dotted keys all live under the same entry.
+    let stale: Vec<String> = target
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| toml_setup_managed_key(key, &target_keys))
+        .collect();
+    for key in &stale {
+        target.remove(key);
+    }
+    for (key, item) in alias_entries {
+        if !toml_setup_managed_key(&key, &target_keys) && !target.contains_key(&key) {
+            target.insert(&key, item);
+        }
+    }
+    for (key, value) in values {
+        target.insert(key, Item::Value(value));
+    }
+
+    let mut out = doc.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// How a `[header]` relates to the section setup manages.
+enum TomlSectionRelation {
+    /// The target table itself, in either spelling.
+    Target,
+    /// A descendant table such as `[target.http_headers]` or
+    /// `[target.tools.x]`; carries the first child key.
+    Descendant(String),
+    Other,
+}
+
+fn toml_section_relation(section: &str, section_header: &str) -> TomlSectionRelation {
+    // Arrays of tables keep one extra bracket pair after the header strip.
+    let section = section.trim().trim_matches(['[', ']']).trim();
+    let target = section_header.trim().trim_matches(['[', ']']).trim();
+    let mut spellings = vec![target];
+    if target == TOML_CANONICAL_SERVER_TABLE {
+        spellings.push(TOML_ALIAS_SERVER_TABLE);
+    }
+    for spelling in spellings {
+        if section == spelling {
+            return TomlSectionRelation::Target;
+        }
+        if let Some(rest) = section
+            .strip_prefix(spelling)
+            .and_then(|rest| rest.strip_prefix('.'))
+        {
+            return TomlSectionRelation::Descendant(toml_first_key_segment(rest).to_string());
+        }
+    }
+    TomlSectionRelation::Other
+}
+
+/// First segment of a dotted key, unquoted. `http_headers.Authorization`
+/// yields `http_headers`; `"quoted.name".x` yields `quoted.name`.
+fn toml_first_key_segment(key: &str) -> &str {
+    let key = key.trim();
+    for quote in ['"', '\''] {
+        if let Some(rest) = key.strip_prefix(quote) {
+            if let Some(end) = rest.find(quote) {
+                return &rest[..end];
+            }
+            return rest;
+        }
+    }
+    key.split('.').next().unwrap_or(key).trim()
+}
+
+/// Which part of the document the line-oriented merge is currently reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlMergeCursor {
+    Other,
+    Target,
+    DropDescendant,
+    KeepDescendant,
+}
+
+/// Line-oriented merge for documents `toml_edit` rejects. Keeps every
+/// unrelated line verbatim, coalesces both spellings of the target table into
+/// one canonical section, drops descendant tables of managed keys (the
+/// duplicate `http_headers` shape from GH #328), and re-emits unmanaged
+/// descendant tables after the rebuilt target section.
+fn merge_toml_section_lines(
+    text: &str,
+    section_header: &str,
+    key_values: &[(String, String)],
+) -> String {
+    let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
+    let canonical_prefix = section_header.trim().trim_matches(['[', ']']).trim();
+
+    let mut merged = Vec::new();
+    let mut cursor = TomlMergeCursor::Other;
+    let mut saw_target_section = false;
+    let mut preserved_target_lines = Vec::new();
+    let mut preserved_target_keys = HashSet::new();
+    let mut preserved_descendant_lines: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            match toml_section_relation(section, section_header) {
+                TomlSectionRelation::Target => {
+                    cursor = TomlMergeCursor::Target;
+                    saw_target_section = true;
+                }
+                TomlSectionRelation::Descendant(child) => {
+                    saw_target_section = true;
+                    if toml_setup_managed_key(&child, &target_keys) {
+                        cursor = TomlMergeCursor::DropDescendant;
+                    } else {
+                        cursor = TomlMergeCursor::KeepDescendant;
+                        // Re-spell an alias descendant under the canonical
+                        // table so the document keeps a single server name.
+                        let rewritten = if canonical_prefix == TOML_CANONICAL_SERVER_TABLE {
+                            raw_line.replacen(
+                                TOML_ALIAS_SERVER_TABLE,
+                                TOML_CANONICAL_SERVER_TABLE,
+                                1,
+                            )
+                        } else {
+                            raw_line.to_string()
+                        };
+                        if !preserved_descendant_lines.is_empty()
+                            && !preserved_descendant_lines
+                                .last()
+                                .is_some_and(String::is_empty)
+                        {
+                            preserved_descendant_lines.push(String::new());
+                        }
+                        preserved_descendant_lines.push(rewritten);
                     }
-                    continue;
                 }
-
-                if !in_target_section {
+                TomlSectionRelation::Other => {
+                    cursor = TomlMergeCursor::Other;
                     merged.push(raw_line.to_string());
-                    continue;
                 }
+            }
+            continue;
+        }
 
+        match cursor {
+            TomlMergeCursor::Other => merged.push(raw_line.to_string()),
+            TomlMergeCursor::DropDescendant => {}
+            TomlMergeCursor::KeepDescendant => {
+                preserved_descendant_lines.push(raw_line.to_string());
+            }
+            TomlMergeCursor::Target => {
                 // Coalesce every matching spelling of the target table into
                 // one canonical section. Keeping the aliases in place would
                 // emit duplicate TOML table headers when both spellings were
@@ -1414,63 +1716,49 @@ fn merge_toml_section(
                     continue;
                 };
                 let key = lhs.trim();
-                // The desired HTTP section owns every transport/auth key, not
-                // only the keys present in this particular invocation. If the
-                // server switches from stdio to HTTP, or from bearer auth to
-                // no-auth, preserving an omitted managed key leaves Codex on a
-                // conflicting transport or stale credential and makes setup's
-                // status/self-heal loop unable to converge.
-                let setup_managed_key = target_keys.contains(key)
-                    || matches!(
-                        key,
-                        "url"
-                            | "httpUrl"
-                            | "startup_timeout_sec"
-                            | "http_headers"
-                            | "env_http_headers"
-                            | "bearer_token_env_var"
-                            | "command"
-                            | "args"
-                            | "cwd"
-                            | "env"
-                            | "environment"
-                            | "transport"
-                    );
-                if !setup_managed_key && preserved_target_keys.insert(key.to_string()) {
+                // A dotted key such as `http_headers.Authorization` belongs
+                // to the managed `http_headers` entry.
+                let owner = toml_first_key_segment(key);
+                if !toml_setup_managed_key(owner, &target_keys)
+                    && preserved_target_keys.insert(key.to_string())
+                {
                     preserved_target_lines.push(raw_line.to_string());
                 }
             }
-
-            if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
-                merged.push(String::new());
-            }
-            if saw_target_section {
-                merged.push(section_header.to_string());
-                merged.extend(preserved_target_lines);
-                merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-            } else {
-                merged.extend(section_lines);
-            }
-
-            let mut out = merged.join("\n");
-            if text.ends_with('\n') || !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out
-        }
-        _ => {
-            // No existing file — create fresh.
-            let mut section = section_lines.join("\n");
-            section.push('\n');
-            section
         }
     }
-}
 
-fn toml_section_matches_target(section: &str, section_header: &str) -> bool {
-    let target = section_header.trim_matches(['[', ']']);
-    section == target
-        || (target == "mcp_servers.mcp_agent_mail" && section == "mcp_servers.\"mcp-agent-mail\"")
+    while preserved_target_lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+    {
+        preserved_target_lines.pop();
+    }
+    while preserved_descendant_lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty())
+    {
+        preserved_descendant_lines.pop();
+    }
+
+    if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
+        merged.push(String::new());
+    }
+    merged.push(section_header.to_string());
+    if saw_target_section {
+        merged.extend(preserved_target_lines);
+    }
+    merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
+    if !preserved_descendant_lines.is_empty() {
+        merged.push(String::new());
+        merged.extend(preserved_descendant_lines);
+    }
+
+    let mut out = merged.join("\n");
+    if text.ends_with('\n') || !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn strip_toml_inline_comment(line: &str) -> &str {
@@ -1693,7 +1981,7 @@ fn omp_provider_home(params: &SetupParams) -> Option<PathBuf> {
     .ok()
 }
 
-fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, PathBuf), PathBuf> {
+fn claude_user_base(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf), PathBuf> {
     if let Some(raw_override) = os_env_value_for_setup("CLAUDE_CONFIG_DIR") {
         let Some(override_path) = raw_override.to_str() else {
             return Err(PathBuf::from(raw_override));
@@ -1701,8 +1989,8 @@ fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, P
         let override_path = override_path.trim();
         if !override_path.is_empty() {
             let unresolved = PathBuf::from(override_path);
-            let config_dir = resolve_omp_agent_dir_override(&params.project_dir, override_path)
-                .map_err(|_| unresolved)?;
+            let config_dir =
+                resolve_omp_agent_dir_override(cwd, override_path).map_err(|_| unresolved)?;
             return Ok((config_dir.join(".claude.json"), config_dir));
         }
     }
@@ -1766,7 +2054,7 @@ fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource>
         true,
     );
     if let Some(home) = &provider_home {
-        match omp_claude_user_base(params, home) {
+        match claude_user_base(&params.project_dir, home) {
             Ok((claude_json, claude_dir)) => {
                 push_omp_mcp_authority_source(
                     &mut sources,
@@ -2119,15 +2407,20 @@ impl AgentPlatform {
         // `settings.json`/`settings.local.json` (those are hooks/permissions).
         // Writing the old location left every fresh `claude` instance with zero
         // Agent Mail tools. Mirror `claude mcp add`: local scope per-project +
-        // user scope top-level, both in `~/.claude.json` (home, not git-tracked,
-        // so the bearer token never lands in the project working tree).
-        let claude_json = home.join(".claude.json");
+        // user scope top-level, both in the active profile's `.claude.json`.
+        // The shared secret-write guard protects profiles inside a Git tree.
+        // CLAUDE_CONFIG_DIR relocates both user and local MCP scopes. Never
+        // configure a different profile when the requested authority is invalid.
+        let Ok((claude_json, _)) =
+            claude_user_base(&std::env::current_dir().unwrap_or_default(), home)
+        else {
+            return Vec::new();
+        };
         let project_key = pdir.to_string_lossy().into_owned();
         let mut actions = vec![ConfigAction {
             platform: self,
             file_path: claude_json.clone(),
-            description:
-                "Claude Code project-local MCP config (~/.claude.json local scope; secrets)".into(),
+            description: "Claude Code project-local MCP config (active profile; secrets)".into(),
             content: ConfigContent::ClaudeLocalScopeMcp {
                 project_path: project_key,
                 server_name: "mcp-agent-mail",
@@ -2140,8 +2433,7 @@ impl AgentPlatform {
             actions.push(ConfigAction {
                 platform: self,
                 file_path: claude_json,
-                description: "Claude Code user-level MCP config (~/.claude.json top-level mcpServers)"
-                    .into(),
+                description: "Claude Code user-level MCP config (active profile mcpServers)".into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -2294,8 +2586,8 @@ impl AgentPlatform {
     /// (NOT Gemini's `~/.gemini/settings.json`). This was verified empirically
     /// by stracing the live agy 1.0.7 binary, which opens
     /// `~/.gemini/config/mcp_config.json` at session start and spawns the
-    /// configured stdio `command`. The HTTP form uses `httpUrl` + `headers`,
-    /// identical to Gemini's MCP entry shape.
+    /// configured stdio `command`. The current CLI's HTTP form uses
+    /// `serverUrl` + `headers` (verified against agy 1.2.7).
     ///
     /// Token safety (issue #148): the user-level `mcp_config.json` carries NO
     /// bearer token; only the project-local `agy.mcp.json` embeds the
@@ -2315,7 +2607,7 @@ impl AgentPlatform {
             "agy.mcp.json",
             "mcpServers",
             json!({
-                "httpUrl": url,
+                "serverUrl": url,
                 "headers": auth_headers_value(token)
             }),
             "Antigravity (agy) project-local MCP config",
@@ -2330,7 +2622,7 @@ impl AgentPlatform {
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
-                    server_value: json!({ "httpUrl": url }),
+                    server_value: json!({ "serverUrl": url }),
                     reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
@@ -3118,7 +3410,9 @@ fn replace_windows_setup_file_retaining_displaced(
                 replaced,
                 replacement,
                 Some(retained),
-                winsafe::co::REPLACEFILE::WRITE_THROUGH,
+                // REPLACEFILE_WRITE_THROUGH is explicitly unsupported by
+                // Windows. File flush completion is handled after publication.
+                winsafe::co::REPLACEFILE::default(),
             )
         },
         |existing, new| {
@@ -3168,6 +3462,68 @@ fn replace_windows_setup_file_retaining_displaced_with(
     Err(SetupError::Other(format!(
         "could not retain the displaced Windows setup file as {suffix}"
     )))
+}
+
+#[cfg(windows)]
+fn open_windows_setup_flush_handle(
+    authority: &SetupDirectoryAuthority,
+    name: &OsStr,
+    expected: &SetupFileSnapshot,
+) -> Result<std::fs::File, SetupError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .share_mode(0);
+    let file = authority.dir.open_with(name, &options)?.into_std();
+    let observed = snapshot_open_setup_file(
+        file.try_clone()?,
+        &authority.path.join(name),
+        "Windows setup flush target",
+    )?;
+    if !setup_snapshots_match(expected, &observed) {
+        return Err(SetupError::Other(
+            "Windows setup flush target changed identity, content, permissions, or link topology"
+                .into(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Flush the exact published objects while exclusive leaf handles and the
+/// directory authority remain held. This is a file barrier, not directory
+/// entry durability. Failures preserve all artifacts and never retry a
+/// pathname rollback after another writer may have changed the namespace.
+#[cfg(windows)]
+fn finish_windows_setup_publication(
+    authority: &SetupDirectoryAuthority,
+    file_name: &OsStr,
+    published: &SetupFileSnapshot,
+    retained: Option<(&OsStr, &SetupFileSnapshot)>,
+    state: &'static str,
+    flush: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SetupError> {
+    let result = (|| {
+        let file = open_windows_setup_flush_handle(authority, file_name, published)?;
+        let retained_file = retained
+            .map(|(name, expected)| open_windows_setup_flush_handle(authority, name, expected))
+            .transpose()?;
+        if let Some(retained_file) = &retained_file {
+            flush(retained_file)?;
+        }
+        flush(&file)?;
+        revalidate_setup_directory_authority(&authority.path, authority)
+    })();
+    result.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
+        state,
+        path: authority.path.join(file_name),
+        retained: retained.map(|(name, _)| authority.path.join(name)),
+        source: Box::new(source),
+    })
 }
 
 #[cfg(windows)]
@@ -3262,6 +3618,12 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
     let (mut temp_file, temp_path) = create_persistent_windows_setup_temp(authority, file_name)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
+    std::io::Seek::rewind(&mut temp_file)?;
+    let published_snapshot = snapshot_open_setup_file(
+        temp_file.try_clone()?,
+        &temp_path,
+        "Windows setup staged file",
+    )?;
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3312,14 +3674,48 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
                 &retained_path,
                 "replaced",
             );
-            revalidate_setup_directory_authority(parent, authority)?;
-            rollback?;
+            let (rejected_name, rejected_path) =
+                rollback.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
+                    state: "rollback failed after publication",
+                    path: path.to_path_buf(),
+                    retained: Some(PathBuf::from(&retained_path)),
+                    source: Box::new(source),
+                })?;
+            if let Ok(Some(restored_snapshot)) = retained {
+                finish_windows_setup_publication(
+                    authority,
+                    OsStr::new(file_name),
+                    &restored_snapshot,
+                    Some((OsStr::new(&rejected_name), &published_snapshot)),
+                    "restored",
+                    std::fs::File::sync_all,
+                )?;
+            } else {
+                return Err(SetupError::WindowsPublicationUnconfirmed {
+                    state: "restored",
+                    path: path.to_path_buf(),
+                    retained: Some(PathBuf::from(rejected_path)),
+                    source: Box::new(invalid_setup_path(
+                        label,
+                        path,
+                        "displaced leaf at publication was not a verifiable regular file",
+                    )),
+                });
+            }
             return Err(invalid_setup_path(
                 label,
                 path,
                 "changed identity, content, permissions, or link topology at publication; the attempted replacement was retained and the displaced file restored",
             ));
         }
+        finish_windows_setup_publication(
+            authority,
+            OsStr::new(file_name),
+            &published_snapshot,
+            Some((OsStr::new(&retained_name), expected)),
+            "published",
+            std::fs::File::sync_all,
+        )?;
     } else {
         winsafe::MoveFileEx(
             &temp_path,
@@ -3327,9 +3723,17 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
             winsafe::co::MOVEFILE::WRITE_THROUGH,
         )
         .map_err(windows_setup_io_error)?;
+        finish_windows_setup_publication(
+            authority,
+            OsStr::new(file_name),
+            &published_snapshot,
+            None,
+            "published",
+            std::fs::File::sync_all,
+        )?;
     }
 
-    revalidate_setup_directory_authority(parent, authority)
+    Ok(())
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -4040,7 +4444,7 @@ fn write_config_atomic_inner(
             ConfigContent::TomlSection {
                 section_header,
                 key_values,
-            } => Ok(merge_toml_section(existing, section_header, key_values)),
+            } => merge_toml_section(existing, section_header, key_values),
         },
     )
 }
@@ -4231,6 +4635,20 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         .agents
         .clone()
         .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    if platforms.contains(&AgentPlatform::Claude)
+        && let Some(path) = invalid_claude_config_override(params)
+    {
+        return vec![SetupResult {
+            platform: AgentPlatform::Claude.display_name().to_string(),
+            actions: vec![ActionResult {
+                file_path: path.display().to_string(),
+                description: "Claude Code active-profile MCP authority preflight".to_string(),
+                outcome: ActionOutcome::Failed(
+                    "CLAUDE_CONFIG_DIR must resolve to an absolute, traversal-free UTF-8 directory; no configuration was written".to_string(),
+                ),
+            }],
+        }];
+    }
     if let Some(failure) = omp_setup_authority_preflight(params, &platforms) {
         return vec![failure];
     }
@@ -4460,6 +4878,16 @@ impl ConfigFileStatus {
     }
 }
 
+// Resolve without probing rejected paths or silently selecting the default profile.
+fn invalid_claude_config_override(params: &SetupParams) -> Option<PathBuf> {
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    claude_user_base(
+        &std::env::current_dir().unwrap_or_default(),
+        home.as_deref().unwrap_or_else(|| Path::new("~")),
+    )
+    .err()
+}
+
 /// Check config status for detected agents.
 #[must_use]
 pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
@@ -4472,6 +4900,39 @@ pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
     let mut statuses = Vec::new();
 
     for platform in &platforms {
+        if *platform == AgentPlatform::Claude
+            && let Some(path) = invalid_claude_config_override(params)
+        {
+            let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+            statuses.push(AgentConfigStatus {
+                platform: platform.display_name().to_string(),
+                slug: platform.slug().to_string(),
+                detected: false,
+                config_files: vec![ConfigFileStatus {
+                    redacted_path: redact_path_for_status(&path, home.as_deref()),
+                    path: path.display().to_string(),
+                    omp_active_user_config_drift: false,
+                    omp_mcp_alias_drift: false,
+                    omp_settings_config_drift: false,
+                    status_observations: Vec::new(),
+                    exists: false,
+                    has_server_entry: false,
+                    url_matches: false,
+                    expected_url: url.clone(),
+                    actual_url: None,
+                    entry_locations: Vec::new(),
+                    current_entry: None,
+                    expected_entry: Value::Null,
+                    drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
+                    primary_drift_reason: ConfigDriftReason::UnsupportedConfig,
+                    risk: risk_for_drift_reasons(&[ConfigDriftReason::UnsupportedConfig]),
+                    remediation:
+                        "Set CLAUDE_CONFIG_DIR to an absolute, traversal-free UTF-8 directory"
+                            .to_string(),
+                }],
+            });
+            continue;
+        }
         let mut actions = platform.config_actions(params);
         if *platform == AgentPlatform::Omp
             && actions.is_empty()
@@ -4704,6 +5165,25 @@ fn config_file_status_for_action(
     }
 
     let mut analysis = match &content {
+        Ok(Some(snapshot)) if action.platform == AgentPlatform::Antigravity => {
+            analyze_antigravity_config(
+                &snapshot.content,
+                expected_url,
+                expected_auth.as_deref(),
+                home.as_deref(),
+            )
+        }
+        Ok(Some(snapshot))
+            if matches!(action.content, ConfigContent::ClaudeLocalScopeMcp { .. }) =>
+        {
+            analyze_claude_local_config(
+                &snapshot.content,
+                &action.content,
+                expected_url,
+                expected_auth.as_deref(),
+                home.as_deref(),
+            )
+        }
         Ok(Some(snapshot)) => analyze_config_content(
             &action.file_path,
             &snapshot.content,
@@ -6089,6 +6569,61 @@ fn apply_omp_active_user_config_drift(
     }
 }
 
+fn analyze_antigravity_config(
+    content: &str,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let Ok(mut doc) = serde_json::from_str::<Value>(content) else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    // agy does not accept Gemini's httpUrl or the generic url spelling.
+    // Remove them only from this analysis view, so an ignored stale field
+    // cannot mask a missing or incorrect serverUrl. Preserve the file bytes.
+    if let Some(servers) = doc.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        for entry in servers.values_mut().filter_map(Value::as_object_mut) {
+            entry.remove("url");
+            entry.remove("httpUrl");
+        }
+    }
+    analyze_json_config_content(&doc.to_string(), expected_url, expected_auth, home)
+}
+
+fn analyze_claude_local_config(
+    content: &str,
+    action: &ConfigContent,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let ConfigContent::ClaudeLocalScopeMcp { project_path, .. } = action else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(content) else {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    };
+    if !doc.is_object() {
+        return analyze_json_config_content(content, expected_url, expected_auth, home);
+    }
+    let scope = doc
+        .get("projects")
+        .and_then(|projects| projects.get(project_path))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut analysis =
+        analyze_json_config_content(&scope.to_string(), expected_url, expected_auth, home);
+    for location in &mut analysis.entry_locations {
+        *location = format!("projects.{project_path}.{location}");
+    }
+    if let Some(entry) = analysis.current_entry.as_mut()
+        && let Some(container) = entry.get("container").and_then(Value::as_str)
+    {
+        entry["container"] = Value::String(format!("projects.{project_path}.{container}"));
+    }
+    analysis
+}
+
 fn analyze_config_content(
     path: &Path,
     content: &str,
@@ -6255,6 +6790,7 @@ fn json_entry_url(entry: &Value) -> Option<&str> {
     entry
         .get("url")
         .or_else(|| entry.get("httpUrl"))
+        .or_else(|| entry.get("serverUrl"))
         .and_then(Value::as_str)
 }
 
@@ -6403,70 +6939,145 @@ fn analyze_toml_config_content(
     }
 }
 
+/// Where the status reader files subsequent key/value lines.
+#[derive(Clone, Copy)]
+enum TomlStatusCursor {
+    /// Not inside the server entry or any of its descendants.
+    None,
+    /// Directly inside the server entry at `sections[index]`.
+    Entry(usize),
+    /// Inside `[<entry>.http_headers]`, which Codex emits in place of the
+    /// inline `http_headers = { ... }` whenever it rewrites its config.
+    Headers(usize),
+    /// Inside an unmanaged descendant such as `[<entry>.tools.x]`.
+    Descendant,
+}
+
 fn collect_toml_server_sections(content: &str) -> Vec<TomlServerSection> {
-    let mut sections = Vec::new();
-    let mut current_index: Option<usize> = None;
+    let mut sections: Vec<TomlServerSection> = Vec::new();
+    // Sections declared only through a descendant header (`[a.b.http_headers]`
+    // before `[a.b]`) are implicit; the explicit header later adopts them
+    // instead of registering a duplicate entry.
+    let mut explicit: Vec<bool> = Vec::new();
+    let mut cursor = TomlStatusCursor::None;
 
     for raw_line in content.lines() {
         if let Some(section) = parse_toml_section_header(raw_line) {
-            if matches!(
-                section,
-                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
-            ) {
-                sections.push(TomlServerSection {
-                    section: section.to_string(),
-                    entry: Map::new(),
-                    url: None,
-                    authorization: None,
-                    startup_timeout: None,
-                    legacy_stdio: false,
-                });
-                current_index = Some(sections.len() - 1);
-            } else {
-                current_index = None;
-            }
+            cursor = toml_status_header_cursor(section, &mut sections, &mut explicit);
             continue;
         }
 
-        let Some(index) = current_index else {
-            continue;
-        };
         let Some((key, value)) = parse_toml_key_value(raw_line) else {
             continue;
         };
 
-        match key.as_str() {
-            "url" | "httpUrl" => {
-                if let Some(url) = value.as_str() {
-                    sections[index].url = Some(url.to_string());
+        match cursor {
+            TomlStatusCursor::None | TomlStatusCursor::Descendant => {}
+            TomlStatusCursor::Headers(index) => {
+                if key == "Authorization" {
+                    sections[index].authorization = value.as_str().map(str::to_string);
+                }
+                let headers = sections[index]
+                    .entry
+                    .entry("http_headers".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(headers) = headers.as_object_mut() {
+                    headers.insert(key, value);
                 }
             }
-            "http_headers" => {
-                sections[index].authorization = value
-                    .as_object()
-                    .and_then(|headers| headers.get("Authorization"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+            TomlStatusCursor::Entry(index) => {
+                record_toml_server_entry_key(&mut sections[index], key, value);
             }
-            "startup_timeout_sec" => {
-                sections[index].startup_timeout = value.as_u64();
-            }
-            "command" | "args" => {
-                sections[index].legacy_stdio = true;
-            }
-            "transport"
-                if value
-                    .as_str()
-                    .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio")) =>
-            {
-                sections[index].legacy_stdio = true;
-            }
-            _ => {}
         }
-        sections[index].entry.insert(key, value);
     }
 
     sections
+}
+
+/// Resolve a `[header]` to the section its following lines belong to,
+/// registering the server entry when the header introduces it.
+fn toml_status_header_cursor(
+    section: &str,
+    sections: &mut Vec<TomlServerSection>,
+    explicit: &mut Vec<bool>,
+) -> TomlStatusCursor {
+    let (owner, child) = match toml_section_relation(section, "[mcp_servers.mcp_agent_mail]") {
+        TomlSectionRelation::Target => (Some(section.trim().trim_matches(['[', ']']).trim()), None),
+        TomlSectionRelation::Descendant(child) => {
+            let section = section.trim().trim_matches(['[', ']']).trim();
+            let owner = [TOML_CANONICAL_SERVER_TABLE, TOML_ALIAS_SERVER_TABLE]
+                .into_iter()
+                .find(|spelling| section.starts_with(spelling));
+            (owner, Some(child))
+        }
+        TomlSectionRelation::Other => (None, None),
+    };
+    let Some(owner) = owner else {
+        return TomlStatusCursor::None;
+    };
+    let declared = child.is_none();
+    let existing = sections
+        .iter()
+        .enumerate()
+        .find(|(idx, candidate)| candidate.section == owner && (!declared || !explicit[*idx]))
+        .map(|(idx, _)| idx);
+    let index = if let Some(idx) = existing {
+        if declared {
+            explicit[idx] = true;
+        }
+        idx
+    } else {
+        sections.push(TomlServerSection {
+            section: owner.to_string(),
+            entry: Map::new(),
+            url: None,
+            authorization: None,
+            startup_timeout: None,
+            legacy_stdio: false,
+        });
+        explicit.push(declared);
+        sections.len() - 1
+    };
+    match child.as_deref() {
+        None => TomlStatusCursor::Entry(index),
+        Some("http_headers") => TomlStatusCursor::Headers(index),
+        Some(_) => TomlStatusCursor::Descendant,
+    }
+}
+
+fn record_toml_server_entry_key(section: &mut TomlServerSection, key: String, value: Value) {
+    match key.as_str() {
+        "url" | "httpUrl" => {
+            if let Some(url) = value.as_str() {
+                section.url = Some(url.to_string());
+            }
+        }
+        "http_headers" => {
+            section.authorization = value
+                .as_object()
+                .and_then(|headers| headers.get("Authorization"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        "http_headers.Authorization" => {
+            section.authorization = value.as_str().map(str::to_string);
+        }
+        "startup_timeout_sec" => {
+            section.startup_timeout = value.as_u64();
+        }
+        "command" | "args" => {
+            section.legacy_stdio = true;
+        }
+        "transport"
+            if value
+                .as_str()
+                .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio")) =>
+        {
+            section.legacy_stdio = true;
+        }
+        _ => {}
+    }
+    section.entry.insert(key, value);
 }
 
 fn parse_toml_key_value(line: &str) -> Option<(String, Value)> {
@@ -6674,6 +7285,20 @@ fn redact_value_for_status_key(key: Option<&str>, value: Value, home: Option<&Pa
 }
 
 fn redact_path_for_status(path: &Path, home: Option<&Path>) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(home) = home
+            && let Ok(relative) = path.strip_prefix(home)
+        {
+            return if relative.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", relative.display().to_string().replace('\\', "/"))
+            };
+        }
+        path.display().to_string().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
     redact_home_in_status_text(&path.display().to_string(), home)
 }
 
@@ -6692,7 +7317,10 @@ fn redact_home_in_status_text(text: &str, home: Option<&Path>) -> String {
     if let Some(rest) = text.strip_prefix(&prefix) {
         return format!("~/{rest}");
     }
-    text.replace(&prefix, "~/")
+    let redacted = text.replace(&prefix, "~/");
+    #[cfg(windows)]
+    let redacted = redacted.replace(&format!("{home}\\"), "~/");
+    redacted
 }
 
 fn push_drift_reason(reasons: &mut Vec<ConfigDriftReason>, reason: ConfigDriftReason) {
@@ -7253,7 +7881,14 @@ mod tests {
         let error = resolve_token(None, tmp.path())
             .expect_err("a directory authority must not degrade to token generation");
 
+        #[cfg(not(windows))]
         assert!(error.to_string().contains("not a regular file"), "{error}");
+        // Windows rejects opening a directory before file-type inspection.
+        #[cfg(windows)]
+        assert!(
+            matches!(error, SetupError::Io(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
     }
 
     #[test]
@@ -7973,7 +8608,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let override_path = tmp.path().join("custom[agent]/mcp*.json");
+        // Brackets are Git glob metacharacters and valid filenames on Windows.
+        let override_path = tmp.path().join("custom[agent]/mcp[local].json");
         let mut params = SetupParams {
             token: "first-secret".into(),
             project_dir: tmp.path().to_path_buf(),
@@ -8228,10 +8864,12 @@ mod tests {
 
     #[test]
     fn config_actions_omp_uses_native_http_config_paths() {
-        let home = PathBuf::from("/tmp/omp-home");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("omp-home");
+        let project = temp.path().join("project");
         let params = SetupParams {
             token: "tok".into(),
-            project_dir: PathBuf::from("/tmp/p"),
+            project_dir: project.clone(),
             home_dir_override: Some(home.clone()),
             skip_user_config: false,
             ..Default::default()
@@ -8242,7 +8880,7 @@ mod tests {
             2,
             "project-local + default-profile user config"
         );
-        assert_eq!(actions[0].file_path, PathBuf::from("/tmp/p/.omp/mcp.json"));
+        assert_eq!(actions[0].file_path, project.join(".omp/mcp.json"));
         assert_eq!(actions[1].file_path, home.join(".omp/agent/mcp.json"));
 
         for action in &actions {
@@ -8457,12 +9095,13 @@ mod tests {
 
     #[test]
     fn config_actions_omp_honors_resolved_active_profile_path() {
-        let active_profile_config =
-            PathBuf::from("/tmp/omp-home/.omp/profiles/work/agent/mcp.json");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("omp-home");
+        let active_profile_config = home.join(".omp/profiles/work/agent/mcp.json");
         let params = SetupParams {
             token: "tok".into(),
-            project_dir: PathBuf::from("/tmp/p"),
-            home_dir_override: Some(PathBuf::from("/tmp/omp-home")),
+            project_dir: temp.path().join("project"),
+            home_dir_override: Some(home),
             omp_user_config_path_override: Some(active_profile_config.clone()),
             skip_user_config: false,
             ..Default::default()
@@ -8499,7 +9138,15 @@ mod tests {
             absolute
         );
 
-        let traversing = temp.path().join("home/../outside");
+        // PathBuf::join normalizes parent components in Windows verbatim paths.
+        // Construct the raw authority so the validator actually sees traversal.
+        let traversing = PathBuf::from(format!(
+            "{}{}home{}..{}outside",
+            temp.path().display(),
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        ));
         let error = require_absolute_omp_home_dir(Some(traversing))
             .expect_err("an absolute path with parent traversal must fail closed");
         assert!(error.to_string().contains("traversal-free"));
@@ -8532,7 +9179,14 @@ mod tests {
             },
             SetupParams {
                 project_dir: project.clone(),
-                omp_user_config_path_override: Some(temp.path().join("user/../escaped/mcp.json")),
+                omp_user_config_path_override: Some(PathBuf::from(format!(
+                    "{}{}user{}..{}escaped{}mcp.json",
+                    temp.path().display(),
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR
+                ))),
                 agents: Some(vec![AgentPlatform::Omp]),
                 token: "must-not-be-written".to_string(),
                 skip_hooks: true,
@@ -8577,8 +9231,11 @@ mod tests {
 
     #[test]
     fn resolve_omp_config_paths_matches_v18_profile_precedence() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home_path = temp.path().join("home");
+        let cwd_path = temp.path().join("repo");
+        let home = home_path.as_path();
+        let cwd = cwd_path.as_path();
 
         let named = resolve_omp_config_paths(
             home,
@@ -8589,10 +9246,10 @@ mod tests {
             Some("ignored-for-named-profile"),
         )
         .unwrap();
-        assert_eq!(named.config_root, PathBuf::from("/home/alice/.custom-omp"));
+        assert_eq!(named.config_root, home.join(".custom-omp"));
         assert_eq!(
             named.user_mcp_config,
-            PathBuf::from("/home/alice/.custom-omp/profiles/work/agent/mcp.json")
+            home.join(".custom-omp/profiles/work/agent/mcp.json")
         );
 
         let explicit_default = resolve_omp_config_paths(
@@ -8606,7 +9263,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             explicit_default.user_mcp_config,
-            PathBuf::from("/work/repo/relative-agent-dir/mcp.json"),
+            cwd.join("relative-agent-dir/mcp.json"),
             "an explicitly empty OMP_PROFILE selects default and must not fall through to PI_PROFILE"
         );
 
@@ -8621,14 +9278,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             legacy.user_mcp_config,
-            PathBuf::from("/home/alice/.omp/profiles/legacy/agent/mcp.json")
+            home.join(".omp/profiles/legacy/agent/mcp.json")
         );
     }
 
     #[test]
     fn resolve_omp_config_paths_rejects_traversal_and_ambiguous_prefixes() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home = temp.path();
+        let cwd = temp.path();
 
         for config_dir in [
             "../escape",
@@ -8641,11 +9299,23 @@ mod tests {
             assert!(error.to_string().contains("PI_CONFIG_DIR"));
         }
 
-        for agent_dir in ["../escape", "agent/../../escape", "C:\\escape"] {
+        for agent_dir in ["../escape", "agent/../../escape", "C:escape"] {
             let error = resolve_omp_config_paths(home, cwd, None, None, None, Some(agent_dir))
                 .expect_err("unsafe PI_CODING_AGENT_DIR must fail closed");
             assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
         }
+        // A fully qualified Windows authority is valid on Windows, but is an
+        // ambiguous foreign prefix on Unix. Drive-relative C:escape above is
+        // rejected on both platforms.
+        let windows_absolute =
+            resolve_omp_config_paths(home, cwd, None, None, None, Some("C:\\escape"));
+        #[cfg(windows)]
+        assert_eq!(
+            windows_absolute.unwrap().user_mcp_config,
+            PathBuf::from("C:\\escape\\mcp.json")
+        );
+        #[cfg(not(windows))]
+        assert!(windows_absolute.is_err());
 
         let relative_cwd = resolve_omp_config_paths(
             home,
@@ -8690,8 +9360,9 @@ mod tests {
 
     #[test]
     fn resolve_omp_config_paths_rejects_invalid_profiles_like_runtime_boot() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/repo");
+        let temp = setup_real_tempdir();
+        let home = temp.path();
+        let cwd = temp.path();
         for invalid in [".", "..", "bad profile", "Work", "CON", "LPT9.txt", "bad."] {
             let error = resolve_omp_config_paths(home, cwd, Some(invalid), None, None, None)
                 .expect_err("invalid explicit profile must fail closed");
@@ -8715,14 +9386,11 @@ mod tests {
 
         let default = resolve_omp_config_paths(home, cwd, Some("default"), None, None, None)
             .expect("the explicit default profile is valid");
-        assert_eq!(
-            default.user_mcp_config,
-            PathBuf::from("/home/alice/.omp/agent/mcp.json")
-        );
+        assert_eq!(default.user_mcp_config, home.join(".omp/agent/mcp.json"));
     }
 
     #[test]
-    fn config_actions_antigravity_uses_http_url_and_gemini_config_path() {
+    fn config_actions_antigravity_uses_server_url_and_gemini_config_path() {
         // bd-47kjh.7.2: agy reads ~/.gemini/config/mcp_config.json (verified by
         // stracing the live agy 1.0.7 binary), NOT ~/.gemini/settings.json.
         let home = PathBuf::from("/tmp/agyhome");
@@ -8736,7 +9404,7 @@ mod tests {
         let actions = AgentPlatform::Antigravity.config_actions(&params);
         assert_eq!(actions.len(), 2, "project-local + user-level");
 
-        // Project-local agy.mcp.json carries httpUrl + the bearer header.
+        // Project-local agy.mcp.json carries serverUrl + the bearer header.
         let project = &actions[0];
         assert_eq!(project.file_path, PathBuf::from("/tmp/p/agy.mcp.json"));
         match &project.content {
@@ -8747,8 +9415,8 @@ mod tests {
             } => {
                 assert_eq!(*servers_key, "mcpServers");
                 assert!(
-                    server_value.get("httpUrl").is_some(),
-                    "agy uses httpUrl (gemini-compatible schema)"
+                    server_value.get("serverUrl").is_some(),
+                    "agy 1.2.7 uses serverUrl for HTTP transport"
                 );
                 assert!(
                     server_value.get("type").is_none(),
@@ -8772,7 +9440,7 @@ mod tests {
         );
         match &user.content {
             ConfigContent::JsonMerge { server_value, .. } => {
-                assert!(server_value.get("httpUrl").is_some());
+                assert!(server_value.get("serverUrl").is_some());
                 assert!(
                     server_value.get("headers").is_none(),
                     "user-level agy config must NOT embed a bearer token (#148)"
@@ -8805,6 +9473,78 @@ mod tests {
             }
             _ => panic!("expected JsonMerge"),
         }
+    }
+
+    #[test]
+    fn antigravity_setup_repairs_ignored_http_url_and_reports_real_transport() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("project"),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Antigravity]),
+            token: "transport-fixture-token".into(),
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        for action in &actions {
+            std::fs::create_dir_all(action.file_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &action.file_path,
+                json!({"mcpServers": {"mcp-agent-mail": {
+                    "httpUrl": params.server_url()
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let before = check_status(&params);
+        for file in &before[0].config_files {
+            assert!(!file.url_matches, "agy ignores httpUrl: {file:?}");
+            assert_eq!(
+                file.primary_drift_reason,
+                ConfigDriftReason::UnsupportedConfig
+            );
+        }
+        let results = run_setup(&params);
+        assert!(
+            results[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        for action in &actions {
+            let doc: Value =
+                serde_json::from_slice(&std::fs::read(&action.file_path).unwrap()).unwrap();
+            let entry = &doc["mcpServers"]["mcp-agent-mail"];
+            assert_eq!(entry["serverUrl"], params.server_url());
+            assert!(entry.get("httpUrl").is_none());
+            assert!(entry.get("command").is_none());
+        }
+        let after = check_status(&params);
+        for file in &after[0].config_files {
+            assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+        }
+        assert!(
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains(&params.token)
+        );
+        // A stale recognized URL cannot be masked by an ignored healthy alias.
+        let user_path = &actions[1].file_path;
+        std::fs::write(
+            user_path,
+            json!({"mcpServers": {"mcp-agent-mail": {
+                "serverUrl": "http://stale.invalid/mcp/",
+                "httpUrl": params.server_url(),
+                "url": params.server_url()
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_status(&params)[0].config_files[1].primary_drift_reason,
+            ConfigDriftReason::StaleHttpPath
+        );
     }
 
     #[test]
@@ -9439,6 +10179,109 @@ mod tests {
             })
             .expect("the rejected replacement must be retained without deleting it");
         assert_eq!(std::fs::read(rejected.path()).unwrap(), attempted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flushes_both_verified_files() {
+        let tmp = setup_real_tempdir();
+        let target = tmp.path().join("config.json");
+        let retained = tmp.path().join("retained.json");
+        std::fs::write(&target, "published").unwrap();
+        std::fs::write(&retained, "original").unwrap();
+        let published = read_setup_file(&target, "target").unwrap().unwrap();
+        let original = read_setup_file(&retained, "retained").unwrap().unwrap();
+        let authority = open_setup_directory_authority(tmp.path()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        finish_windows_setup_publication(
+            &authority,
+            OsStr::new("config.json"),
+            &published,
+            Some((OsStr::new("retained.json"), &original)),
+            "published",
+            |file| {
+                file.sync_all()?;
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"published");
+        assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flush_failure_preserves_both_files_and_state() {
+        for state in ["published", "restored"] {
+            for fail_at in [1, 2] {
+                let tmp = setup_real_tempdir();
+                let target = tmp.path().join("config.json");
+                let retained = tmp.path().join("retained.json");
+                std::fs::write(&target, "Bearer private-fixture").unwrap();
+                std::fs::write(&retained, "original").unwrap();
+                let published = read_setup_file(&target, "target").unwrap().unwrap();
+                let original = read_setup_file(&retained, "retained").unwrap().unwrap();
+                let authority = open_setup_directory_authority(tmp.path()).unwrap();
+                let calls = std::cell::Cell::new(0);
+                let error = finish_windows_setup_publication(
+                    &authority,
+                    OsStr::new("config.json"),
+                    &published,
+                    Some((OsStr::new("retained.json"), &original)),
+                    state,
+                    |file| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == fail_at {
+                            Err(std::io::Error::other("injected flush failure"))
+                        } else {
+                            file.sync_all()
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    &error,
+                    SetupError::WindowsPublicationUnconfirmed {
+                        state: actual,
+                        retained: Some(path),
+                        ..
+                    } if *actual == state && *path == retained
+                ));
+                assert!(!error.to_string().contains("private-fixture"));
+                assert_eq!(std::fs::read(&target).unwrap(), b"Bearer private-fixture");
+                assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_flush_refuses_replaced_inode_without_flushing() {
+        let tmp = setup_real_tempdir();
+        let target = tmp.path().join("config.json");
+        let displaced = tmp.path().join("displaced.json");
+        std::fs::write(&target, "same bytes").unwrap();
+        let expected = read_setup_file(&target, "target").unwrap().unwrap();
+        std::fs::rename(&target, &displaced).unwrap();
+        std::fs::write(&target, "same bytes").unwrap();
+        let authority = open_setup_directory_authority(tmp.path()).unwrap();
+        let error = finish_windows_setup_publication(
+            &authority,
+            OsStr::new("config.json"),
+            &expected,
+            None,
+            "published",
+            |_| panic!("must reject substituted inode before flushing"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SetupError::WindowsPublicationUnconfirmed { .. }
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"same bytes");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"same bytes");
     }
 
     #[cfg(windows)]
@@ -10835,6 +11678,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn claude_config_actions_full_set() {
+        let _profile = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
         let params = SetupParams {
             token: "tok".into(),
             project_dir: PathBuf::from("/tmp/p"),
@@ -10872,6 +11716,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn claude_config_actions_skip_user_and_hooks() {
+        let _profile = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
         let params = SetupParams {
             token: "tok".into(),
             project_dir: PathBuf::from("/tmp/p"),
@@ -10881,6 +11726,193 @@ http_headers = { Authorization = "Bearer tok" }
         };
         let actions = AgentPlatform::Claude.config_actions(&params);
         assert_eq!(actions.len(), 1, "only project-local action");
+    }
+
+    #[test]
+    fn claude_setup_writes_and_checks_the_active_profile() {
+        for skip_user_config in [false, true] {
+            let tmp = setup_real_tempdir();
+            let home = tmp.path().join("home");
+            let profile = tmp.path().join("profile");
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
+            let params = SetupParams {
+                token: "profile-test-token".into(),
+                project_dir: project.clone(),
+                home_dir_override: Some(home.clone()),
+                agents: Some(vec![AgentPlatform::Claude]),
+                skip_user_config,
+                skip_hooks: false,
+                project_slug: "profile-test".into(),
+                agent_name: "RedFox".into(),
+                ..Default::default()
+            };
+            let results = run_setup(&params);
+            assert!(
+                results
+                    .iter()
+                    .flat_map(|r| &r.actions)
+                    .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+                "{results:?}"
+            );
+            let config_path = profile.join(".claude.json");
+            let config: Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            let project_key = project.to_string_lossy();
+            assert_eq!(
+                config["projects"][project_key.as_ref()]["mcpServers"]["mcp-agent-mail"]["url"],
+                params.server_url()
+            );
+            assert_eq!(config.get("mcpServers").is_some(), !skip_user_config);
+            assert!(!home.join(".claude.json").exists());
+            assert!(project.join(".claude/settings.json").is_file());
+            let status = check_status(&params);
+            assert!(!status[0].config_files.is_empty());
+            for file in &status[0].config_files {
+                assert_eq!(file.path, config_path.display().to_string());
+                assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+            }
+            // A healthy global entry must not hide drift in this project's scope.
+            let mut changed = config;
+            changed["projects"][project_key.as_ref()]["mcpServers"]["mcp-agent-mail"]["url"] =
+                json!("http://stale.invalid/mcp/");
+            std::fs::write(&config_path, changed.to_string()).unwrap();
+            assert_eq!(
+                check_status(&params)[0].config_files[0].primary_drift_reason,
+                ConfigDriftReason::StaleHttpPath
+            );
+        }
+    }
+
+    #[test]
+    fn claude_relative_profile_uses_launch_directory_not_target_project() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("different-target"),
+            home_dir_override: Some(tmp.path().join("home")),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "relative-profile");
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("relative-profile/.claude.json");
+        assert_eq!(actions[0].file_path, expected);
+        assert_eq!(actions[1].file_path, expected);
+        assert_ne!(
+            expected,
+            params.project_dir.join("relative-profile/.claude.json")
+        );
+    }
+
+    #[test]
+    fn claude_blank_profile_preserves_default_home() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            home_dir_override: Some(tmp.path().join("home")),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "  ");
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        assert_eq!(actions[0].file_path, tmp.path().join("home/.claude.json"));
+    }
+
+    #[test]
+    fn claude_setup_rejects_invalid_profile_without_fallback_or_false_green() {
+        let tmp = setup_real_tempdir();
+        let params = SetupParams {
+            project_dir: tmp.path().join("project"),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Claude]),
+            token: "must-not-be-written".into(),
+            ..Default::default()
+        };
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "../other-profile");
+        assert!(AgentPlatform::Claude.config_actions(&params).is_empty());
+        let results = run_setup(&params);
+        assert!(matches!(
+            results[0].actions[0].outcome,
+            ActionOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let status = check_status(&params);
+        assert_eq!(status[0].config_files.len(), 1);
+        assert_eq!(
+            status[0].config_files[0].primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert_eq!(status[0].config_files[0].status_observations.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_non_utf8_profile_is_rejected_without_writes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Claude);
+        let _profile = EnvVarGuard::set_os(
+            "CLAUDE_CONFIG_DIR",
+            OsString::from_vec(vec![b'/', b'p', 0xff]),
+        );
+        assert!(AgentPlatform::Claude.config_actions(&params).is_empty());
+        assert!(matches!(
+            run_setup(&params)[0].actions[0].outcome,
+            ActionOutcome::Failed(_)
+        ));
+        let status = check_status(&params);
+        assert_eq!(
+            status[0].config_files[0].primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(serde_json::to_string(&status).is_ok());
+    }
+
+    #[test]
+    fn claude_profile_in_project_refuses_tracked_secret_write() {
+        let tmp = setup_real_tempdir();
+        let profile = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join(".claude.json");
+        let original = "{}\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["add", "--", "profile/.claude.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
+        let params = SetupParams {
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Claude]),
+            token: "must-not-enter-index".into(),
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let result = run_setup(&params);
+        assert!(
+            result[0]
+                .actions
+                .iter()
+                .all(|action| matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(profile).unwrap().count(), 1);
     }
 
     #[test]
@@ -11422,7 +12454,9 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn omp_unsupported_provider_authorities_are_never_probed_or_fingerprinted() {
-        let tmp = setup_real_tempdir();
+        // Ordinary Windows paths preserve the raw parent component; joining
+        // a verbatim path would normalize it away before the authority check.
+        let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
         write_healthy_omp_project_config(&params);
 
@@ -11482,6 +12516,8 @@ http_headers = { Authorization = "Bearer tok" }
         };
         write_healthy_omp_project_config(&missing_home_params);
         let sentinel = project_dir.join("<unresolved-claude-user-home>");
+        // This diagnostic placeholder is a legal filename only on Unix.
+        #[cfg(unix)]
         std::fs::write(
             &sentinel,
             r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
@@ -11919,7 +12955,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(
             missing
                 .remediation
-                .contains(&missing_overlay.display().to_string())
+                .contains(&missing_overlay.display().to_string().replace('\\', "/"))
         );
 
         params.agents = Some(vec![AgentPlatform::Cline]);
@@ -11936,7 +12972,7 @@ http_headers = { Authorization = "Bearer tok" }
     #[test]
     fn check_status_omp_legacy_user_settings_fail_closed_until_main_yaml_exists() {
         for legacy_name in ["settings.json", "agent.db"] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = setup_real_tempdir();
             let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
             write_healthy_omp_project_config(&params);
             let agent_dir = params
@@ -12192,7 +13228,8 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn setup_status_remediation_shell_quotes_untrusted_arguments() {
-        let home = PathBuf::from("/home/tester");
+        let temp = setup_real_tempdir();
+        let home = temp.path().join("home");
         let params = SetupParams {
             host: "host;$(touch bad)".to_string(),
             path: "/mcp path/$HOME/'".to_string(),
@@ -12650,7 +13687,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "15".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(merged.contains("[mcp_servers.mcp_agent_mail]"));
         assert!(!merged.contains("mcp-agent-mail"));
@@ -12681,7 +13719,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "30".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         for stale_key in [
             "command",
@@ -12729,7 +13768,8 @@ http_headers = { Authorization = "Bearer tok" }
                 ),
                 ("startup_timeout_sec".to_string(), "15".to_string()),
             ],
-        );
+        )
+        .unwrap();
 
         // TOML rejects a table header when the same table was already
         // declared. One canonical header proves setup did not emit the invalid
@@ -12748,6 +13788,389 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(merged.contains("custom_setting = \"keep-first\""));
         assert!(!merged.contains("custom_setting = \"drop-duplicate\""));
         assert!(merged.contains("[other]\nenabled = true"));
+    }
+
+    /// Codex re-serializes every server entry through its own TOML writer on
+    /// `codex mcp add`/`remove`, turning `http_headers = { ... }` into a
+    /// standard sub-table. Setup must replace that sub-table instead of
+    /// leaving it behind next to a fresh inline key (GH #328).
+    const CODEX_RESERIALIZED_CONFIG: &str = "\
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.mcp_agent_mail.tools.send_message]
+approval = \"never\"
+
+[mcp_servers.context7]
+command = \"true\"
+";
+
+    fn codex_http_key_values(token: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "url".to_string(),
+                "\"http://127.0.0.1:8766/mcp/\"".to_string(),
+            ),
+            ("startup_timeout_sec".to_string(), "30".to_string()),
+            (
+                "http_headers".to_string(),
+                format!("{{ Authorization = \"Bearer {token}\" }}"),
+            ),
+        ]
+    }
+
+    fn count_toml_key(merged: &str, key: &str) -> usize {
+        merged
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line.split_once('=')
+                    .is_some_and(|(lhs, _)| lhs.trim() == key)
+                    || line.ends_with(&format!(".{key}]"))
+            })
+            .count()
+    }
+
+    #[test]
+    fn setup_replaces_codex_sub_table_http_headers_without_duplicate_keys() {
+        let merged = merge_toml_section(
+            Some(CODEX_RESERIALIZED_CONFIG),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("rotated"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged)
+            .unwrap_or_else(|error| panic!("merged config must parse: {error}\n{merged}"));
+        let entry = &parsed["mcp_servers"]["mcp_agent_mail"];
+        assert_eq!(
+            entry["http_headers"]["Authorization"].as_str(),
+            Some("Bearer rotated")
+        );
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:8766/mcp/"));
+        assert_eq!(entry["startup_timeout_sec"].as_integer(), Some(30));
+        assert_eq!(
+            count_toml_key(&merged, "http_headers"),
+            1,
+            "exactly one http_headers definition may remain\n{merged}"
+        );
+        assert!(!merged.contains("Bearer scratch"), "{merged}");
+        // Unmanaged descendants and unrelated servers survive untouched.
+        assert_eq!(
+            entry["tools"]["send_message"]["approval"].as_str(),
+            Some("never")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+
+        let sections = collect_toml_server_sections(&merged);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer rotated"));
+    }
+
+    #[test]
+    fn setup_repairs_document_with_duplicated_http_headers_definition() {
+        // The exact shape an earlier setup wrote in GH #328: a sub-table left
+        // at its old position plus a fresh inline key. Codex refuses to load
+        // this file, and toml_edit refuses to parse it, so the line-oriented
+        // fallback has to converge on a valid document.
+        let corrupted = "\
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.context7]
+command = \"true\"
+
+[mcp_servers.mcp_agent_mail]
+
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+http_headers = { Authorization = \"Bearer scratch\" }
+";
+        assert!(toml::from_str::<toml::Value>(corrupted).is_err());
+
+        let merged = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("scratch"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged)
+            .unwrap_or_else(|error| panic!("repaired config must parse: {error}\n{merged}"));
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer scratch")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+        assert_eq!(count_toml_key(&merged, "http_headers"), 1, "{merged}");
+    }
+
+    #[test]
+    fn setup_line_fallback_keeps_unmanaged_descendant_tables_and_drops_alias_headers() {
+        // Unparseable input (duplicate key in an unrelated table) forces the
+        // fallback; it must still keep `tools.*` and fold the alias spelling.
+        let corrupted = "\
+[other]
+enabled = true
+
+[mcp_servers.\"mcp-agent-mail\"]
+url = \"http://127.0.0.1:8766/old/\"
+url = \"http://127.0.0.1:8766/older/\"
+custom_setting = \"keep\"
+
+[mcp_servers.\"mcp-agent-mail\".http_headers]
+Authorization = \"Bearer stale\"
+
+[mcp_servers.\"mcp-agent-mail\".tools.send_message]
+approval = \"never\"
+";
+        assert!(toml::from_str::<toml::Value>(corrupted).is_err());
+
+        let merged = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        assert!(!merged.contains("mcp-agent-mail"), "{merged}");
+        assert!(!merged.contains("Bearer stale"), "{merged}");
+        assert!(merged.contains("custom_setting = \"keep\""), "{merged}");
+        assert!(
+            merged
+                .contains("[mcp_servers.mcp_agent_mail.tools.send_message]\napproval = \"never\""),
+            "{merged}"
+        );
+        assert_eq!(count_toml_key(&merged, "http_headers"), 1, "{merged}");
+        assert!(merged.contains("[other]\nenabled = true"), "{merged}");
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+    }
+
+    #[test]
+    fn setup_refuses_to_rewrite_config_corrupt_outside_its_section() {
+        let corrupted = "\
+[other]
+enabled = true
+enabled = false
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/old/\"
+";
+        let error = merge_toml_section(
+            Some(corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not valid TOML"), "{message}");
+        assert!(message.contains("duplicate key"), "{message}");
+    }
+
+    #[test]
+    fn setup_replaces_dotted_key_http_headers() {
+        let merged = merge_toml_section(
+            Some(
+                "[mcp_servers.mcp_agent_mail]\n\
+                 url = \"http://127.0.0.1:8766/mcp/\"\n\
+                 http_headers.Authorization = \"Bearer stale\"\n\
+                 http_headers.X-Extra = \"keep-me-not\"\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let headers = parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]
+            .as_table()
+            .unwrap();
+        assert_eq!(headers.len(), 1, "{merged}");
+        assert_eq!(headers["Authorization"].as_str(), Some("Bearer fresh"));
+    }
+
+    #[test]
+    fn setup_structural_merge_preserves_comments_and_unrelated_layout() {
+        let existing = "\
+# global settings
+model = \"gpt-5\" # keep this comment
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/old/\" # stale
+tool_timeout_sec = 45
+
+[projects.\"/tmp/x\"]
+trust_level = \"trusted\"
+";
+        let merged = merge_toml_section(
+            Some(existing),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+
+        assert!(merged.starts_with("# global settings\nmodel = \"gpt-5\" # keep this comment\n"));
+        assert!(
+            merged.contains("[projects.\"/tmp/x\"]\ntrust_level = \"trusted\""),
+            "{merged}"
+        );
+        assert!(merged.contains("tool_timeout_sec = 45"), "{merged}");
+        assert!(!merged.contains("/old/"), "{merged}");
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+    }
+
+    #[test]
+    fn setup_creates_server_table_when_only_other_servers_exist() {
+        let merged = merge_toml_section(
+            Some("[mcp_servers.context7]\ncommand = \"true\"\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["context7"]["command"].as_str(),
+            Some("true")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer fresh")
+        );
+        assert_eq!(
+            merged.matches("[mcp_servers.mcp_agent_mail]").count(),
+            1,
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn setup_appends_server_table_to_document_without_mcp_servers() {
+        let merged = merge_toml_section(
+            Some("model = \"gpt-5\"\n\n[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+        assert_eq!(
+            parsed["projects"]["/tmp/x"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["mcp_agent_mail"]["url"].as_str(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+        assert_eq!(
+            merged.matches("[mcp_servers.mcp_agent_mail]").count(),
+            1,
+            "{merged}"
+        );
+        assert!(!merged.contains("[mcp_servers]\n"), "{merged}");
+        let sections = collect_toml_server_sections(&merged);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer fresh"));
+    }
+
+    #[test]
+    fn setup_replaces_root_level_dotted_server_keys() {
+        let merged = merge_toml_section(
+            Some(
+                "mcp_servers.mcp_agent_mail.url = \"http://127.0.0.1:8766/old/\"\n\
+                 mcp_servers.mcp_agent_mail.http_headers = { Authorization = \"Bearer stale\" }\n\
+                 mcp_servers.mcp_agent_mail.tool_timeout_sec = 45\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fresh"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let entry = &parsed["mcp_servers"]["mcp_agent_mail"];
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:8766/mcp/"));
+        assert_eq!(
+            entry["http_headers"]["Authorization"].as_str(),
+            Some("Bearer fresh")
+        );
+        assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(45));
+        assert!(!merged.contains("stale"), "{merged}");
+    }
+
+    #[test]
+    fn setup_status_reads_codex_sub_table_http_headers_without_drift() {
+        let analysis = analyze_toml_config_content(
+            CODEX_RESERIALIZED_CONFIG,
+            "http://127.0.0.1:8766/mcp/",
+            Some("Bearer scratch"),
+            Some(30),
+            None,
+        );
+        assert!(analysis.has_server_entry);
+        assert!(analysis.url_matches);
+        assert!(
+            analysis.drift_reasons.is_empty(),
+            "Codex's own serialization must not read as drift: {:?}",
+            analysis.drift_reasons
+        );
+        assert_eq!(analysis.entry_locations, vec!["mcp_servers.mcp_agent_mail"]);
+        let entry = analysis.current_entry.unwrap();
+        assert_eq!(
+            entry["entry"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer <redacted>")
+        );
+    }
+
+    #[test]
+    fn setup_status_adopts_sub_table_declared_before_its_parent_header() {
+        let content = "\
+[mcp_servers.mcp_agent_mail.http_headers]
+Authorization = \"Bearer scratch\"
+
+[mcp_servers.context7]
+command = \"true\"
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+startup_timeout_sec = 30
+";
+        let sections = collect_toml_server_sections(content);
+        assert_eq!(sections.len(), 1, "{sections:?}");
+        assert_eq!(sections[0].authorization.as_deref(), Some("Bearer scratch"));
+        assert_eq!(
+            sections[0].url.as_deref(),
+            Some("http://127.0.0.1:8766/mcp/")
+        );
+        assert_eq!(sections[0].startup_timeout, Some(30));
+    }
+
+    #[test]
+    fn setup_status_still_reports_repeated_server_headers_as_duplicates() {
+        let content = "\
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/mcp/\"
+
+[mcp_servers.mcp_agent_mail]
+url = \"http://127.0.0.1:8766/other/\"
+";
+        let sections = collect_toml_server_sections(content);
+        assert_eq!(sections.len(), 2, "{sections:?}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Lexical response assembler: ranking, pagination, snippets, and explain
 //!
 //! Converts raw Tantivy search results into [`SearchResults`] with:
-//! - Score-sorted hits with deterministic tie-breaking (by ID descending)
+//! - Score-sorted hits with deterministic tie-breaking (by ID ascending)
 //! - Offset/limit pagination with correct `total_count`
 //! - Context-aware text snippets with term highlighting
 //! - Optional deterministic multi-stage explain report
@@ -52,67 +52,164 @@ fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
         .try_into()
 }
 
-/// Generate a text snippet from a document field, highlighting matched terms.
-///
-/// Returns a truncated excerpt centered around the first occurrence of any
-/// query term, with `**bold**` markers around matched portions.
+/// A character whose lowercase representation has a different UTF-8 width.
+struct LowercaseChange {
+    lowered_start: usize,
+    lowered_end: usize,
+    original_start: usize,
+    original_end: usize,
+}
+
+/// Lowercased search text with sparse corrections to original UTF-8 offsets.
+/// Lowercasing can expand (`İ`) or shrink (`K`) the byte representation. Most
+/// characters, including most non-ASCII text, need no correction entries.
+struct LowercaseText {
+    text: String,
+    changes: Vec<LowercaseChange>,
+}
+
+impl LowercaseText {
+    fn new(original: &str) -> Self {
+        let text = original.to_lowercase();
+        let mut changes = Vec::new();
+        if !original.is_ascii() {
+            let mut lowered_offset = 0;
+            for (original_offset, ch) in original.char_indices() {
+                // str::to_lowercase also handles contextual final sigma; its
+                // two forms have the same UTF-8 width as char::to_lowercase.
+                let lowered_len = ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+                let lowered_end = lowered_offset + lowered_len;
+                if lowered_len != ch.len_utf8() {
+                    changes.push(LowercaseChange {
+                        lowered_start: lowered_offset,
+                        lowered_end,
+                        original_start: original_offset,
+                        original_end: original_offset + ch.len_utf8(),
+                    });
+                }
+                lowered_offset = lowered_end;
+            }
+            debug_assert_eq!(lowered_offset, text.len());
+        }
+        Self { text, changes }
+    }
+
+    /// A partial match within a lowercase expansion highlights the whole
+    /// original character, never half of its UTF-8 representation. Between
+    /// width-changing characters, offsets have a constant displacement.
+    fn original_range(&self, start: usize, end: usize) -> (usize, usize) {
+        if self.changes.is_empty() {
+            return (start, end);
+        }
+        let first = self
+            .changes
+            .partition_point(|change| change.lowered_start <= start);
+        let last = self
+            .changes
+            .partition_point(|change| change.lowered_start < end);
+        let original_start = if first == 0 {
+            start
+        } else {
+            let change = &self.changes[first - 1];
+            if start < change.lowered_end {
+                change.original_start
+            } else {
+                change.original_end + (start - change.lowered_end)
+            }
+        };
+        let original_end = if last == 0 {
+            end
+        } else {
+            let change = &self.changes[last - 1];
+            if end <= change.lowered_end {
+                change.original_end
+            } else {
+                change.original_end + (end - change.lowered_end)
+            }
+        };
+        (original_start, original_end)
+    }
+}
+
+/// Generate a plain-text excerpt centered around the first matching term.
+/// Highlight byte ranges are returned separately by [`find_highlights`].
 #[must_use]
 pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
-    if text.is_empty() || query_terms.is_empty() {
+    generate_snippet_with_limit(text, query_terms, SNIPPET_MAX_CHARS)
+}
+
+/// The character budget excludes the optional leading/trailing ellipses.
+fn generate_snippet_with_limit(
+    text: &str,
+    query_terms: &[String],
+    max_chars: usize,
+) -> Option<String> {
+    if text.is_empty() || query_terms.is_empty() || max_chars == 0 {
         return None;
     }
-
-    let lower_text = text.to_lowercase();
-
-    // Find the first matching term position
-    let mut best_pos: Option<usize> = None;
-    let mut best_term_len = 0usize;
-
+    let lowered = LowercaseText::new(text);
+    let mut best_match = None;
     for term in query_terms {
-        let lower_term = term.to_lowercase();
-        if lower_term.is_empty() {
+        let term = term.to_lowercase();
+        if term.is_empty() {
             continue;
         }
-        if let Some(pos) = lower_text.find(&lower_term)
-            && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
-        {
-            best_pos = Some(pos);
-            best_term_len = lower_term.len();
+        if let Some(pos) = lowered.text.find(&term) {
+            let range = lowered.original_range(pos, pos + term.len());
+            if best_match.is_none_or(|(start, _)| range.0 < start) {
+                best_match = Some(range);
+            }
         }
     }
-
-    let match_pos = best_pos?;
-    let match_start = floor_char_boundary(text, match_pos);
-    let match_end = ceil_char_boundary(text, match_start.saturating_add(best_term_len));
-
-    // Calculate excerpt window
-    let start = floor_char_boundary(text, match_start.saturating_sub(SNIPPET_CONTEXT));
-    let end = ceil_char_boundary(text, match_end.saturating_add(SNIPPET_CONTEXT));
-
-    // Snap to word boundaries
-    let start = snap_to_word_start(text, start);
-    let end = snap_to_word_end(text, end);
-
-    // Build snippet
-    let mut snippet = String::with_capacity(SNIPPET_MAX_CHARS + 20);
-
+    let (match_start, match_end) = best_match?;
+    let match_chars = text[match_start..match_end].chars().count();
+    let context_before = SNIPPET_CONTEXT.min(max_chars.saturating_sub(match_chars));
+    let start = retreat_chars(text, match_start, context_before);
+    let word_start = snap_to_word_start(text, start);
+    // A very long word before the match must not push the match out of the
+    // snippet. Prefer the unsnapped boundary when the word exceeds the budget.
+    let start = if text[word_start..match_end]
+        .chars()
+        .take(max_chars.saturating_add(1))
+        .count()
+        <= max_chars
+    {
+        word_start
+    } else {
+        start
+    };
+    let end = snap_to_word_end(text, advance_chars(text, match_end, SNIPPET_CONTEXT));
+    let excerpt_end = end.min(advance_chars(text, start, max_chars));
+    let mut snippet = String::new();
     if start > 0 {
         snippet.push_str("...");
     }
-
-    let max_end = ceil_char_boundary(text, start.saturating_add(SNIPPET_MAX_CHARS));
-    let excerpt_end = end.min(max_end).max(start);
-    let excerpt = &text[start..excerpt_end];
-    snippet.push_str(excerpt);
-
-    if end < text.len() {
+    snippet.push_str(&text[start..excerpt_end]);
+    if excerpt_end < text.len() {
         snippet.push_str("...");
     }
-
     Some(snippet)
 }
 
-/// Find highlight ranges for query terms within a text
+fn retreat_chars(text: &str, pos: usize, count: usize) -> usize {
+    if count == 0 {
+        return pos;
+    }
+    text[..pos]
+        .char_indices()
+        .rev()
+        .nth(count - 1)
+        .map_or(0, |(offset, _)| offset)
+}
+
+fn advance_chars(text: &str, pos: usize, count: usize) -> usize {
+    text[pos..]
+        .char_indices()
+        .nth(count)
+        .map_or(text.len(), |(offset, _)| pos + offset)
+}
+
+/// Find UTF-8 byte ranges in the original text, not its lowercased copy.
 #[must_use]
 pub fn find_highlights(
     text: &str,
@@ -122,35 +219,24 @@ pub fn find_highlights(
     if text.is_empty() || query_terms.is_empty() {
         return Vec::new();
     }
-    let lower_text = text.to_lowercase();
+    let lowered = LowercaseText::new(text);
     let mut ranges = Vec::new();
-
     for term in query_terms {
-        let lower_term = term.to_lowercase();
-        if lower_term.is_empty() {
+        let term = term.to_lowercase();
+        if term.is_empty() {
             continue;
         }
-        let mut search_from = 0;
-
-        while let Some(pos) = lower_text[search_from..].find(&lower_term) {
-            let abs_pos = search_from + pos;
-            let start = floor_char_boundary(text, abs_pos);
-            let end = ceil_char_boundary(text, abs_pos.saturating_add(lower_term.len()));
-            if end <= start {
-                search_from = abs_pos + lower_term.len();
-                continue;
-            }
+        for (pos, matched) in lowered.text.match_indices(&term) {
+            let (start, end) = lowered.original_range(pos, pos + matched.len());
             ranges.push(HighlightRange {
                 field: field_name.to_string(),
                 start,
                 end,
             });
-            search_from = abs_pos + lower_term.len();
         }
     }
-
-    // Sort by position for consistent output
-    ranges.sort_by_key(|r| r.start);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup_by(|a, b| a.start == b.start && a.end == b.end);
     ranges
 }
 
@@ -160,10 +246,11 @@ fn snap_to_word_start(text: &str, pos: usize) -> usize {
     if safe_pos == 0 || safe_pos >= text.len() {
         return safe_pos.min(text.len());
     }
-    // Walk backwards to find whitespace
     text[..safe_pos]
-        .rfind(|c: char| c.is_whitespace())
-        .map_or(0, |p| p + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(offset, ch)| offset + ch.len_utf8())
 }
 
 /// Snap a byte position forward to the end of the nearest word
@@ -200,7 +287,7 @@ fn ceil_char_boundary(text: &str, pos: usize) -> usize {
 #[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone)]
 pub struct ResponseConfig {
-    /// Maximum snippet length
+    /// Maximum snippet length in characters, excluding ellipses.
     pub snippet_max_chars: usize,
     /// Whether to generate snippets
     pub generate_snippets: bool,
@@ -223,6 +310,171 @@ impl Default for ResponseConfig {
             explain_max_factors: 4,
         }
     }
+}
+
+/// The complete ranking key must participate in collection, not just in a
+/// sort after collection: discarded ties cannot be recovered by sorting.
+#[cfg(feature = "tantivy-engine")]
+#[derive(Debug, Clone, Copy)]
+struct LexicalRank {
+    score: f32,
+    doc_id: i64,
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl PartialEq for LexicalRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl Eq for LexicalRank {}
+
+#[cfg(feature = "tantivy-engine")]
+impl PartialOrd for LexicalRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+impl Ord for LexicalRank {
+    /// Higher score ranks first; among equal scores the LOWER document id
+    /// ranks first. That is the (score desc, id asc) order the SQL planner
+    /// (`m.id ASC`) and search_service's cursor pagination use: a page
+    /// boundary that selected the highest tied ids instead made the next
+    /// cursor page skip every remaining tie (br-t31jg).
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.doc_id.cmp(&self.doc_id))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+type RankedDocuments = Vec<(LexicalRank, tantivy::DocAddress)>;
+
+#[cfg(feature = "tantivy-engine")]
+#[derive(Clone, Copy)]
+enum LexicalPagination<'a> {
+    Offset(usize),
+    Cursor(Option<&'a crate::search_planner::SearchCursor>),
+}
+
+/// Refresh a surviving boundary against the same filtered snapshot as its page.
+/// BM25 scores can change after unrelated messages are indexed; the boundary's
+/// identity still marks where to continue. If it was removed or no longer
+/// matches the query, retain the encoded score/ID boundary.
+#[cfg(feature = "tantivy-engine")]
+fn current_cursor_boundary(
+    searcher: &tantivy::Searcher,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    cursor: &crate::search_planner::SearchCursor,
+) -> tantivy::Result<(f64, i64)> {
+    use tantivy::query::{BooleanQuery, EnableScoring, Occur, TermQuery};
+    use tantivy::schema::IndexRecordOption;
+
+    let Ok(id) = u64::try_from(cursor.id) else {
+        return Ok((cursor.score, cursor.id));
+    };
+    let identity_query = TermQuery::new(
+        tantivy::Term::from_field_u64(handles.id, id),
+        IndexRecordOption::Basic,
+    );
+    // IDs may also occur on another document kind in the unified index. Only
+    // a boundary that matches the original query and all its filters counts.
+    let boundary_query = BooleanQuery::new(vec![
+        (Occur::Must, Box::new(identity_query)),
+        (Occur::Must, query.box_clone()),
+    ]);
+    let addresses = searcher.search(&boundary_query, &TopDocs::with_limit(1).order_by_score())?;
+    let Some((_, address)) = addresses.first() else {
+        return Ok((cursor.score, cursor.id));
+    };
+    // Read the original query's score, without the extra identity term used
+    // to locate this document and without assembling an explanation tree.
+    let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+    let mut scorer = weight.scorer(searcher.segment_reader(address.segment_ord), 1.0)?;
+    let score = if tantivy::DocSet::seek(scorer.as_mut(), address.doc_id) == address.doc_id {
+        f64::from(scorer.score())
+    } else {
+        cursor.score
+    };
+    Ok((score, cursor.id))
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn collect_ranked_page(
+    searcher: &tantivy::Searcher,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    limit: usize,
+    pagination: LexicalPagination<'_>,
+) -> tantivy::Result<(usize, RankedDocuments)> {
+    let (offset, boundary) = match pagination {
+        LexicalPagination::Offset(offset) => (offset, None),
+        LexicalPagination::Cursor(cursor) => (
+            0,
+            cursor
+                .map(|cursor| current_cursor_boundary(searcher, query, handles, cursor))
+                .transpose()?,
+        ),
+    };
+    let num_docs = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
+    if limit == 0 || offset >= num_docs {
+        // Preserve the exact matching count, including for count-only queries
+        // and offsets far beyond the index, without allocating a top-K heap.
+        return searcher
+            .search(query, &Count)
+            .map(|count| (count, Vec::new()));
+    }
+
+    // Bound offset + limit by the immutable snapshot's size before Tantivy
+    // allocates its collector. In particular, usize::MAX is not a heap size.
+    let page_limit = limit.min(num_docs - offset);
+    let id_field = searcher.schema().get_field_name(handles.id).to_string();
+    let id_columns = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            segment
+                .fast_fields()
+                .u64(&id_field)
+                .map(|column| (segment.segment_id(), column))
+        })
+        .collect::<tantivy::Result<HashMap<_, _>>>()?;
+
+    let collector = TopDocs::with_limit(page_limit)
+        .and_offset(offset)
+        .tweak_score(move |segment: &tantivy::SegmentReader| {
+            // These are precisely the segments of this immutable searcher;
+            // opening a missing or invalid fast field already returned Err.
+            let ids = id_columns[&segment.segment_id()].clone();
+            move |doc: tantivy::DocId, score: tantivy::Score| {
+                // Match build_hit's representation of the stored document ID.
+                #[allow(clippy::cast_possible_wrap)]
+                let doc_id = ids.first(doc).unwrap_or(0) as i64;
+                if boundary.is_some_and(|(boundary_score, boundary_id)| {
+                    let order = f64::from(score).total_cmp(&boundary_score);
+                    order.is_gt() || (order.is_eq() && doc_id <= boundary_id)
+                }) {
+                    return None;
+                }
+                Some(LexicalRank { score, doc_id })
+            }
+        });
+    let (count, ranked) = searcher.search(query, &(Count, collector))?;
+    // None sorts below every eligible rank. A short last page may retain some
+    // excluded documents in the bounded heap; never hydrate or return them.
+    Ok((
+        count,
+        ranked
+            .into_iter()
+            .filter_map(|(rank, address)| rank.map(|rank| (rank, address)))
+            .collect(),
+    ))
 }
 
 /// Execute a Tantivy search and assemble results with pagination, snippets,
@@ -249,63 +501,91 @@ pub fn execute_search(
     explain: bool,
     config: &ResponseConfig,
 ) -> SearchResults {
+    execute_search_page(
+        index,
+        query,
+        handles,
+        query_terms,
+        limit,
+        LexicalPagination::Offset(offset),
+        explain,
+        config,
+    )
+}
+
+/// Collect a planner page in score-descending, ID-ascending order. The cursor
+/// boundary is applied during collection, before top-K truncation, so page
+/// depth does not require retaining an ever-growing prefix of the corpus.
+#[cfg(feature = "tantivy-engine")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_search_with_cursor(
+    index: &Index,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    query_terms: &[String],
+    limit: usize,
+    cursor: Option<&crate::search_planner::SearchCursor>,
+    explain: bool,
+    config: &ResponseConfig,
+) -> SearchResults {
+    execute_search_page(
+        index,
+        query,
+        handles,
+        query_terms,
+        limit,
+        LexicalPagination::Cursor(cursor),
+        explain,
+        config,
+    )
+}
+
+#[cfg(feature = "tantivy-engine")]
+#[allow(clippy::too_many_arguments)]
+fn execute_search_page(
+    index: &Index,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    query_terms: &[String],
+    limit: usize,
+    pagination: LexicalPagination<'_>,
+    explain: bool,
+    config: &ResponseConfig,
+) -> SearchResults {
     let start = Instant::now();
 
     let Ok(reader) = manual_index_reader(index) else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
-
-    // Fetch more results than needed to handle offset + count total
-    let fetch_limit = offset.saturating_add(limit).max(1);
-    let Ok((total_count, top_docs)) = searcher.search(
-        query,
-        &(Count, TopDocs::with_limit(fetch_limit).order_by_score()),
-    ) else {
+    let Ok((total_count, top_docs)) =
+        collect_ranked_page(&searcher, query, handles, limit, pagination)
+    else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 
-    // Build hits
-    let mut ranked_hits = Vec::with_capacity(top_docs.len());
     let composer_config = ExplainComposerConfig {
         verbosity: config.explain_verbosity,
         max_factors_per_stage: config.explain_max_factors,
     };
+    let mut hits = Vec::with_capacity(top_docs.len());
+    let mut explanations = Vec::new();
 
-    for (score, doc_addr) in top_docs {
+    // The collector has already ranked and paginated using the complete key.
+    // Do not load bodies, generate snippets, or explain skipped documents.
+    for (rank, doc_addr) in top_docs {
         let doc: TantivyDocument = match searcher.doc(doc_addr) {
             Ok(d) => d,
             Err(_) => continue,
         };
-
-        let hit = build_hit(&doc, handles, score, query_terms, config);
-        let explanation =
-            explain.then(|| build_explanation(&hit, score, query_terms, &composer_config));
-        ranked_hits.push((hit, explanation));
-    }
-
-    // Sort primarily by score descending, secondary by ID for determinism.
-    ranked_hits.sort_by(|(a, _), (b, _)| {
-        let score_cmp = b.score.total_cmp(&a.score);
-        if score_cmp == std::cmp::Ordering::Equal {
-            b.doc_id.cmp(&a.doc_id)
-        } else {
-            score_cmp
-        }
-    });
-
-    if offset > 0 {
-        ranked_hits.drain(0..offset.min(ranked_hits.len()));
-    }
-    if ranked_hits.len() > limit {
-        ranked_hits.truncate(limit);
-    }
-
-    let mut hits = Vec::with_capacity(ranked_hits.len());
-    let mut explanations = Vec::new();
-    for (hit, explanation) in ranked_hits {
-        if let Some(explanation) = explanation {
-            explanations.push(explanation);
+        let hit = build_hit(&doc, handles, rank.score, query_terms, config);
+        if explain {
+            explanations.push(build_explanation(
+                &hit,
+                rank.score,
+                query_terms,
+                &composer_config,
+            ));
         }
         hits.push(hit);
     }
@@ -377,7 +657,7 @@ fn build_hit(
     // Generate snippet from body (or subject if body is empty)
     let snippet = if config.generate_snippets {
         let text = if body.is_empty() { &subject } else { &body };
-        generate_snippet(text, query_terms)
+        generate_snippet_with_limit(text, query_terms, config.snippet_max_chars)
     } else {
         None
     };
@@ -724,6 +1004,158 @@ mod tests {
         assert_eq!(snap_to_word_end(text, 5), 5);
     }
 
+    #[test]
+    fn snippet_handles_multibyte_whitespace() {
+        for separator in ['\u{00a0}', '\u{2003}', '\u{2028}', '\u{3000}'] {
+            let text = format!("prefix{separator}{} NEEDLE tail", "x".repeat(50));
+            let snippet = generate_snippet(&text, &["needle".to_string()]).unwrap();
+            assert!(snippet.contains("NEEDLE"), "{separator:?}: {snippet}");
+            assert_eq!(
+                snap_to_word_start(&text, text.find("NEEDLE").unwrap() - 2),
+                "prefix".len() + separator.len_utf8()
+            );
+        }
+    }
+
+    #[test]
+    fn highlights_map_length_changing_lowercase_to_original() {
+        for prefix in ["İ", "\u{212a}", "İ\u{212a}", "\u{212a}İ\u{212a}İ"] {
+            let text = format!("{prefix} NEEDLE and NEEDLE");
+            let ranges = find_highlights(&text, "body", &["needle".to_string()]);
+            assert_eq!(ranges.len(), 2);
+            for range in ranges {
+                assert_eq!(&text[range.start..range.end], "NEEDLE");
+            }
+        }
+    }
+
+    #[test]
+    fn highlights_expand_partial_lowercase_match_to_whole_character() {
+        let text = "İ \u{212a}";
+        let ranges = find_highlights(
+            text,
+            "body",
+            &["i".to_string(), "\u{0307}".to_string(), "k".to_string()],
+        );
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&text[ranges[0].start..ranges[0].end], "İ");
+        assert_eq!(&text[ranges[1].start..ranges[1].end], "\u{212a}");
+    }
+
+    #[test]
+    fn highlights_preserve_contextual_final_sigma() {
+        let text = "ΟΣ NEEDLE";
+        let ranges = find_highlights(text, "body", &["ος".to_string()]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&text[ranges[0].start..ranges[0].end], "ΟΣ");
+    }
+
+    #[test]
+    fn highlights_deduplicate_repeated_terms() {
+        let ranges = find_highlights("Needle", "body", &["needle".into(), "NEEDLE".into()]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start, ranges[0].end), (0, 6));
+    }
+
+    #[test]
+    fn snippet_keeps_match_after_long_unbroken_word() {
+        let text = format!("{}NEEDLE{}", "x".repeat(500), "y".repeat(500));
+        let snippet = generate_snippet(&text, &["needle".into()]).unwrap();
+        assert!(snippet.contains("NEEDLE"));
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.chars().count() <= SNIPPET_MAX_CHARS + 6);
+    }
+
+    #[test]
+    fn snippet_budget_counts_characters_not_bytes() {
+        let snippet = generate_snippet_with_limit("猫犬鳥魚熊", &["鳥".into()], 3).unwrap();
+        assert_eq!(snippet, "猫犬鳥...");
+    }
+
+    #[test]
+    fn snippet_maps_anchor_after_many_lowercase_expansions() {
+        for prefix in ["İ".repeat(500), "\u{212a}".repeat(500)] {
+            let text = format!("{prefix} NEEDLE tail");
+            let snippet = generate_snippet(&text, &["needle".into()]).unwrap();
+            assert!(snippet.contains("NEEDLE"));
+        }
+    }
+
+    #[test]
+    fn snippet_marks_truncated_overlong_match() {
+        let text = "x".repeat(300);
+        let snippet = generate_snippet_with_limit(&text, std::slice::from_ref(&text), 20).unwrap();
+        assert_eq!(snippet, format!("{}...", "x".repeat(20)));
+    }
+
+    #[test]
+    fn snippet_zero_budget_and_empty_terms_have_no_excerpt() {
+        assert!(generate_snippet_with_limit("needle", &["needle".into()], 0).is_none());
+        assert!(generate_snippet("needle", &[String::new()]).is_none());
+        assert!(find_highlights("needle", "body", &[String::new()]).is_empty());
+    }
+
+    #[test]
+    fn snippet_and_highlights_cover_multilingual_matches() {
+        for text in ["İ\u{212a} 猫 犬 鳥", "ΑΒΓ ΣΟΣ needle", "🦀\u{2003}é NEEDLE"] {
+            for term in text.split_whitespace() {
+                let terms = [term.to_string()];
+                let snippet = generate_snippet(text, &terms).unwrap();
+                assert!(snippet.contains(term));
+                let ranges = find_highlights(text, "body", &terms);
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|range| &text[range.start..range.end] == term)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lowercase_offset_map_scales_with_width_changes_not_message_length() {
+        let text = "Résumé ΣΟΣ 🦀 猫 — ordinary text ".repeat(10_000);
+        assert!(LowercaseText::new(&text).changes.is_empty());
+        let mixed = format!("{text}İ\u{212a}{text}");
+        assert_eq!(LowercaseText::new(&mixed).changes.len(), 2);
+    }
+
+    #[test]
+    fn compact_lowercase_map_matches_dense_reference_at_all_character_boundaries() {
+        for text in [
+            "İ\u{212a}ẞȺȾ NEEDLE 猫",
+            "plain 🦀 É ΟΣ text",
+            "İİ\u{212a}\u{212a}\u{0307}İ\u{212a} end",
+            "\u{212a}İ\u{212a}İ\u{212a}İ",
+        ] {
+            let lowered = LowercaseText::new(text);
+            let mut dense = Vec::new();
+            let mut lower_offset = 0;
+            for (original_offset, ch) in text.char_indices() {
+                dense.push((lower_offset, original_offset));
+                lower_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            }
+            dense.push((lowered.text.len(), text.len()));
+            let positions: Vec<_> = lowered
+                .text
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(lowered.text.len()))
+                .collect();
+            for (start_index, &start) in positions.iter().enumerate() {
+                for &end in &positions[start_index + 1..] {
+                    let first = dense.partition_point(|&(offset, _)| offset <= start) - 1;
+                    let last = dense.partition_point(|&(offset, _)| offset < end);
+                    let actual = lowered.original_range(start, end);
+                    assert_eq!(actual, (dense[first].1, dense[last].1));
+                    assert!(text.is_char_boundary(actual.0));
+                    assert!(text.is_char_boundary(actual.1));
+                }
+            }
+        }
+    }
+
     // ── Constants ──
 
     #[test]
@@ -826,7 +1258,7 @@ mod tests {
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 100, 2, false, &config);
             assert_eq!(results.hits.len(), 1);
-            assert_eq!(results.hits[0].doc_id, 1);
+            assert_eq!(results.hits[0].doc_id, 3);
         }
 
         #[test]
@@ -836,7 +1268,7 @@ mod tests {
             let results = execute_search(&index, &AllQuery, &handles, &[], 2, 1, false, &config);
             let ids: Vec<i64> = results.hits.iter().map(|hit| hit.doc_id).collect();
             assert_eq!(results.total_count, 3);
-            assert_eq!(ids, vec![2, 1]);
+            assert_eq!(ids, vec![2, 3]);
         }
 
         #[test]
@@ -987,6 +1419,23 @@ mod tests {
         }
 
         #[test]
+        fn build_hit_respects_snippet_character_budget() {
+            let (_, handles) = setup_index();
+            let document = doc!(
+                handles.id => 10u64,
+                handles.doc_kind => "message",
+                handles.body => "needle abcdefgh"
+            );
+            let config = ResponseConfig {
+                snippet_max_chars: 6,
+                ..ResponseConfig::default()
+            };
+            let hit = build_hit(&document, &handles, 1.0, &["needle".into()], &config);
+            assert_eq!(hit.snippet.as_deref(), Some("needle..."));
+            assert_eq!(hit.highlight_ranges.len(), 1);
+        }
+
+        #[test]
         fn execute_search_empty_results() {
             let (index, handles) = setup_index();
             let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
@@ -1009,19 +1458,384 @@ mod tests {
         #[test]
         fn deterministic_tiebreaking() {
             let (index, handles) = setup_index();
-            // AllQuery gives same score to all docs — tie-breaking by ID desc
+            // AllQuery gives same score to all docs — tie-breaking by ID asc,
+            // the order the SQL planner and cursor pagination use.
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 100, 0, false, &config);
-            // After tie-breaking: IDs should be in descending order
+            // After tie-breaking: IDs should be in ascending order
             for window in results.hits.windows(2) {
                 if (window[0].score - window[1].score).abs() < f64::EPSILON {
                     assert!(
-                        window[0].doc_id >= window[1].doc_id,
-                        "Expected {} >= {} for tie-breaking",
+                        window[0].doc_id <= window[1].doc_id,
+                        "Expected {} <= {} for tie-breaking",
                         window[0].doc_id,
                         window[1].doc_id
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn single_result_pages_do_not_repeat_or_omit_tied_documents() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            let mut ids = Vec::new();
+            for offset in 0..3 {
+                let results =
+                    execute_search(&index, &AllQuery, &handles, &[], 1, offset, true, &config);
+                assert_eq!(results.total_count, 3);
+                assert_eq!(results.hits.len(), 1);
+                assert_eq!(results.explain.as_ref().unwrap().hits.len(), 1);
+                ids.push(results.hits[0].doc_id);
+            }
+            assert_eq!(ids, vec![1, 2, 3]);
+        }
+
+        #[test]
+        fn tied_pages_are_stable_across_segments_and_insertion_order() {
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            let ids = [12u64, 4, 8, 1, 15, 11, 3, 14, 9, 2, 7, 13, 6, 10, 5];
+            for batch in ids.chunks(5) {
+                for &id in batch {
+                    writer
+                        .add_document(doc!(
+                            handles.id => id,
+                            handles.doc_kind => "message",
+                            handles.body => "same matching text"
+                        ))
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            let reader = manual_index_reader(&index).unwrap();
+            assert_eq!(reader.searcher().segment_readers().len(), 3);
+
+            let config = ResponseConfig::default();
+            let mut paged_ids = Vec::new();
+            for offset in (0..15).step_by(2) {
+                let results =
+                    execute_search(&index, &AllQuery, &handles, &[], 2, offset, false, &config);
+                assert_eq!(results.total_count, 15);
+                paged_ids.extend(results.hits.iter().map(|hit| hit.doc_id));
+            }
+            assert_eq!(paged_ids, (1i64..=15).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn cursor_pages_exhaust_tied_corpus_beyond_candidate_prefix() {
+            use crate::search_planner::SearchCursor;
+
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            // Reverse insertion order and independent segments must not affect
+            // the score/ID boundary, even after passing the old 64-hit prefix.
+            for segment in (0..3_u64).rev() {
+                for id in (segment * 32 + 1..=segment * 32 + 32).rev() {
+                    writer
+                        .add_document(doc!(
+                            handles.id => id,
+                            handles.doc_kind => "message",
+                            handles.body => "same matching text"
+                        ))
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            assert_eq!(
+                manual_index_reader(&index)
+                    .unwrap()
+                    .searcher()
+                    .segment_readers()
+                    .len(),
+                3
+            );
+
+            let config = ResponseConfig::default();
+            for limit in [1, 3, 7] {
+                let mut cursor = None;
+                let mut ids = Vec::new();
+                for _ in 0..=96 {
+                    let page = execute_search_with_cursor(
+                        &index,
+                        &AllQuery,
+                        &handles,
+                        &[],
+                        limit,
+                        cursor.as_ref(),
+                        true,
+                        &config,
+                    );
+                    assert_eq!(page.total_count, 96);
+                    assert_eq!(page.explain.as_ref().unwrap().hits.len(), page.hits.len());
+                    assert!(page.hits.len() <= limit);
+                    ids.extend(page.hits.iter().map(|hit| hit.doc_id));
+                    let Some(last) = page.hits.last() else { break };
+                    cursor = Some(SearchCursor {
+                        score: last.score,
+                        id: last.doc_id,
+                    });
+                }
+                assert_eq!(ids, (1..=96).collect::<Vec<_>>(), "page size {limit}");
+            }
+        }
+
+        #[test]
+        fn cursor_page_continues_after_deleted_boundary() {
+            use crate::search_planner::SearchCursor;
+
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            let first = execute_search_with_cursor(
+                &index,
+                &AllQuery,
+                &handles,
+                &[],
+                2,
+                None,
+                false,
+                &config,
+            );
+            assert_eq!(
+                first.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            let last = first.hits.last().unwrap();
+            let cursor = SearchCursor {
+                score: last.score,
+                id: last.doc_id,
+            };
+            let mut writer = index.writer::<TantivyDocument>(15_000_000).unwrap();
+            writer.delete_term(tantivy::Term::from_field_u64(handles.id, 2));
+            writer.commit().unwrap();
+
+            let next = execute_search_with_cursor(
+                &index,
+                &AllQuery,
+                &handles,
+                &[],
+                2,
+                Some(&cursor),
+                false,
+                &config,
+            );
+            assert_eq!(
+                next.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+
+        #[test]
+        fn cursor_page_refreshes_boundary_score_after_corpus_growth() {
+            use crate::search_planner::SearchCursor;
+
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            for id in 1..=3_u64 {
+                writer
+                    .add_document(doc!(handles.id => id, handles.body => "needle shared"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            let query = QueryParser::for_index(&index, vec![handles.body])
+                .parse_query("needle")
+                .unwrap();
+            let config = ResponseConfig::default();
+            let first =
+                execute_search_with_cursor(&index, &*query, &handles, &[], 2, None, false, &config);
+            let last = first.hits.last().unwrap();
+            assert_eq!(last.doc_id, 2);
+            let cursor = SearchCursor {
+                score: last.score,
+                id: last.doc_id,
+            };
+            for id in 4..=20_u64 {
+                writer
+                    .add_document(doc!(handles.id => id, handles.body => "unrelated corpus growth"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+
+            let next = execute_search_with_cursor(
+                &index,
+                &*query,
+                &handles,
+                &[],
+                2,
+                Some(&cursor),
+                false,
+                &config,
+            );
+            assert_eq!(
+                next.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert_ne!(
+                next.hits[0].score.to_bits(),
+                cursor.score.to_bits(),
+                "fixture must change BM25 scores"
+            );
+        }
+
+        #[test]
+        fn relevance_precedes_id_and_original_scores_are_preserved() {
+            use tantivy::query::{BooleanQuery, Occur, TermQuery};
+            use tantivy::schema::IndexRecordOption;
+
+            let (index, handles) = setup_index();
+            let query = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(AllQuery)),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        tantivy::Term::from_field_u64(handles.id, 1),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ]);
+            let reader = manual_index_reader(&index).unwrap();
+            let searcher = reader.searcher();
+            let baseline = searcher
+                .search(&query, &TopDocs::with_limit(3).order_by_score())
+                .unwrap();
+            let expected_scores: HashMap<_, _> = baseline
+                .into_iter()
+                .map(|(score, address)| {
+                    let doc: TantivyDocument = searcher.doc(address).unwrap();
+                    let id = doc.get_first(handles.id).unwrap().as_u64().unwrap();
+                    (id, f64::from(score).to_bits())
+                })
+                .collect();
+            let config = ResponseConfig::default();
+            let mut ids = Vec::new();
+            for offset in 0..3 {
+                let result =
+                    execute_search(&index, &query, &handles, &[], 1, offset, true, &config);
+                let hit = &result.hits[0];
+                let id = u64::try_from(hit.doc_id).unwrap();
+                assert_eq!(hit.score.to_bits(), expected_scores[&id]);
+                ids.push(hit.doc_id);
+            }
+            assert_eq!(ids, vec![1, 2, 3]);
+
+            let mut cursor = None;
+            let mut cursor_ids = Vec::new();
+            for _ in 0..4 {
+                let page = execute_search_with_cursor(
+                    &index,
+                    &query,
+                    &handles,
+                    &[],
+                    1,
+                    cursor.as_ref(),
+                    false,
+                    &config,
+                );
+                let Some(hit) = page.hits.first() else { break };
+                let id = u64::try_from(hit.doc_id).unwrap();
+                assert_eq!(hit.score.to_bits(), expected_scores[&id]);
+                cursor_ids.push(hit.doc_id);
+                cursor = Some(crate::search_planner::SearchCursor {
+                    score: hit.score,
+                    id: hit.doc_id,
+                });
+            }
+            assert_eq!(cursor_ids, vec![1, 2, 3]);
+        }
+
+        #[test]
+        fn zero_limit_and_out_of_range_offsets_keep_exact_counts() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            for (limit, offset) in [(0, 0), (0, usize::MAX), (10, 3), (1, usize::MAX)] {
+                let result = execute_search(
+                    &index,
+                    &AllQuery,
+                    &handles,
+                    &[],
+                    limit,
+                    offset,
+                    true,
+                    &config,
+                );
+                assert_eq!(result.total_count, 3);
+                assert!(result.hits.is_empty());
+                assert!(result.explain.unwrap().hits.is_empty());
+            }
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
+            let query = parser.parse_query("migration").unwrap();
+            let result = execute_search(
+                &index,
+                &*query,
+                &handles,
+                &[],
+                0,
+                usize::MAX,
+                false,
+                &config,
+            );
+            assert_eq!(result.total_count, 1);
+        }
+
+        #[test]
+        fn oversized_limits_are_bounded_by_snapshot_size() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            for (offset, expected) in [(0, vec![1, 2, 3]), (1, vec![2, 3]), (2, vec![3])] {
+                let result = execute_search(
+                    &index,
+                    &AllQuery,
+                    &handles,
+                    &[],
+                    usize::MAX,
+                    offset,
+                    false,
+                    &config,
+                );
+                assert_eq!(result.total_count, 3);
+                let ids: Vec<_> = result.hits.iter().map(|hit| hit.doc_id).collect();
+                assert_eq!(ids, expected);
+            }
+        }
+
+        #[test]
+        fn lexical_rank_uses_a_total_score_order_and_id_tiebreak() {
+            let higher_score = LexicalRank {
+                score: 2.0,
+                doc_id: 1,
+            };
+            let higher_id = LexicalRank {
+                score: 1.0,
+                doc_id: 100,
+            };
+            let lower_id = LexicalRank {
+                score: 1.0,
+                doc_id: 2,
+            };
+            assert!(higher_score > lower_id);
+            assert!(
+                lower_id > higher_id,
+                "among equal scores the lower id ranks first"
+            );
+            for score in [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN] {
+                let rank = LexicalRank { score, doc_id: 1 };
+                let equivalent = LexicalRank {
+                    score,
+                    doc_id: rank.doc_id,
+                };
+                assert_eq!(rank, equivalent);
+                assert_eq!(
+                    rank.partial_cmp(&equivalent),
+                    Some(std::cmp::Ordering::Equal)
+                );
             }
         }
     }

@@ -42,7 +42,7 @@ use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedStat
 use crate::tui_events::MailEvent;
 use crate::tui_layout::{DockLayout, DockPosition};
 use crate::tui_persist::{
-    ScreenFilterPresetStore, console_persist_path_from_env_or_default,
+    ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
@@ -1163,7 +1163,7 @@ pub struct MessageBrowserScreen {
 impl MessageBrowserScreen {
     fn build(filter_presets_path_override: Option<PathBuf>) -> Self {
         let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
-            let console_path = console_persist_path_from_env_or_default();
+            let console_path = configured_console_persist_path();
             screen_filter_presets_path(&console_path)
         });
         let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
@@ -4055,7 +4055,7 @@ fn run_message_search_via_service(
     let pool_cfg = DbPoolConfig::from_env();
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
-    let cx = Cx::for_request();
+    let cx = crate::runtime_request_cx(asupersync::Budget::INFINITE);
     match block_on(mcp_agent_mail_db::search_service::execute_search_simple(
         &cx, &pool, query,
     )) {

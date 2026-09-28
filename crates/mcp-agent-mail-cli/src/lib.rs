@@ -1856,22 +1856,22 @@ pub enum FileReservationsCommand {
         /// Extension in seconds, clamped to 60..=31536000 (default: 1800).
         #[arg(long, default_value_t = 1800)]
         extend_seconds: i64,
-        /// Restrict renewal to specific paths.
-        #[arg(long)]
+        /// Restrict renewal to specific paths (`--paths a b` or repeated `--paths a --paths b`).
+        #[arg(long, num_args = 1..)]
         paths: Vec<String>,
-        /// Restrict renewal to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict renewal to specific reservation IDs (`--ids 1 2`, `--ids 1,2`, or repeated).
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Release file reservations.
     Release {
         project: String,
         agent: String,
-        /// Restrict release to specific paths.
-        #[arg(long)]
+        /// Restrict release to specific paths (`--paths a b` or repeated `--paths a --paths b`).
+        #[arg(long, num_args = 1..)]
         paths: Vec<String>,
-        /// Restrict release to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict release to specific reservation IDs (`--ids 1 2`, `--ids 1,2`, or repeated).
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Check for conflicts on proposed paths without creating reservations.
@@ -2013,7 +2013,7 @@ pub enum VerifyLane {
     E2eStdio,
     /// `rch exec -- cargo bench -p mcp-agent-mail-cli -- --help`
     BenchQuick,
-    /// `rch exec -- cargo test -p mcp-agent-mail-cli --test reliability_coverage_ci`
+    /// `rch exec -- cargo test -p mcp-agent-mail-cli --test it reliability_coverage_ci::`
     ReliabilityCoverage,
 }
 
@@ -4358,10 +4358,28 @@ fn is_project_not_found_error(err: &CliError) -> bool {
 /// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
 ///
 /// I3 (br-bvq1x.9.3): thin delegator; the detection logic lives in
-/// `mcp_agent_mail_server`. Registered UNFILTERED so it still observes
-/// connection-lifecycle warnings even when the TUI suppresses fmt logs (the
-/// exact freeze scenario where `drop_close` matters most).
+/// `mcp_agent_mail_server`. Register it through [`drop_close_counter_layer`].
 struct DropCloseCounterLayer;
+
+/// The `drop_close` counter, filtered to the one target it counts.
+///
+/// Its filter is independent of the fmt filter, so it still observes
+/// connection-lifecycle warnings when the TUI suppresses fmt logs (the exact
+/// freeze scenario where `drop_close` matters most). It must not be unfiltered:
+/// a layer without a filter is interested in every callsite, which makes
+/// `tracing::enabled!` true everywhere. FrankenSQLite then turns off its fused
+/// prepared-DML fast lane and opens a DEBUG span per statement on every
+/// connection (br-49zjq).
+pub fn drop_close_counter_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    use tracing_subscriber::Layer as _;
+
+    DropCloseCounterLayer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+        metadata.target() == mcp_agent_mail_server::FSQLITE_RUNTIME_TRACE_TARGET
+    }))
+}
 
 impl<S> tracing_subscriber::Layer<S> for DropCloseCounterLayer
 where
@@ -4376,47 +4394,133 @@ where
     }
 }
 
-fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
+/// Per-callsite rate limit for repeated storage-engine warnings (br-kp1in.26).
+///
+/// FrankenSQLite logs some configuration facts at WARN on every connection open
+/// (e.g. `WAL-FEC requires a caller-owned native runtime`: ~8,000 identical
+/// lines per 20 minutes of ordinary load, burying real warnings). This filter
+/// lets each `fsqlite*` WARN call site through at most once per window; other
+/// targets and levels are untouched, and ERROR is never limited. It applies to
+/// the fmt layer only, so counting layers still observe every event.
+#[derive(Debug, Default)]
+pub struct DependencyWarnRateLimit {
+    last_emitted: std::sync::Mutex<
+        std::collections::HashMap<tracing::callsite::Identifier, std::time::Instant>,
+    >,
+}
+
+impl DependencyWarnRateLimit {
+    /// Minimum spacing between two emissions of the same call site.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn is_limited_callsite(meta: &tracing::Metadata<'_>) -> bool {
+        meta.is_event()
+            && *meta.level() == tracing::Level::WARN
+            && meta.target().starts_with("fsqlite")
+    }
+
+    fn admit_at(&self, meta: &tracing::Metadata<'_>, now: std::time::Instant) -> bool {
+        if !Self::is_limited_callsite(meta) {
+            return true;
+        }
+        let mut last = self
+            .last_emitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.get(&meta.callsite()) {
+            Some(previous) if now.saturating_duration_since(*previous) < Self::WINDOW => false,
+            _ => {
+                last.insert(meta.callsite(), now);
+                true
+            }
+        }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for DependencyWarnRateLimit {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.admit_at(meta, std::time::Instant::now())
+    }
+
+    fn callsite_enabled(
+        &self,
+        meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if Self::is_limited_callsite(meta) {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::always()
+        }
+    }
+}
+
+fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool, log_level: &str) {
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
-        let filter = build_release_log_filter(suppress_runtime_logs_for_tui);
-
-        // The env filter is scoped to the fmt layer ONLY so the drop_close
-        // counter keeps observing fsqlite warnings even when the filter is
-        // "off" (TUI active). Preserves the prior fmt behaviour exactly.
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .with_ansi(crate::output::is_tty())
-            .compact()
-            .with_filter(filter);
-
+        let filter = build_release_log_filter(suppress_runtime_logs_for_tui, log_level);
         // Ignore double-init errors when tests or host processes already set a subscriber.
-        let _ = tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(DropCloseCounterLayer)
-            .try_init();
+        let _ = release_log_subscriber(filter).try_init();
     });
 }
 
-fn build_release_log_filter(suppress_runtime_logs_for_tui: bool) -> tracing_subscriber::EnvFilter {
+fn release_log_subscriber(
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // The env filter is scoped to the fmt layer ONLY so the drop_close
+    // counter keeps observing fsqlite warnings even when the filter is
+    // "off" (TUI active).
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_ansi(crate::output::is_tty())
+        .compact()
+        .with_filter(tracing_subscriber::filter::FilterExt::and(
+            filter,
+            DependencyWarnRateLimit::default(),
+        ));
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(drop_close_counter_layer())
+}
+
+/// `log_level` is the canonical `LOG_LEVEL` from `Config` (br-kp1in.20).
+/// `RUST_LOG` replaces it only when `AM_ALLOW_DEBUG_STARTUP_LOGS` is set.
+fn build_release_log_filter(
+    suppress_runtime_logs_for_tui: bool,
+    log_level: &str,
+) -> tracing_subscriber::EnvFilter {
+    let from_rust_log = !suppress_runtime_logs_for_tui
+        && env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS")
+        && std::env::var_os("RUST_LOG").is_some();
     let mut filter = if suppress_runtime_logs_for_tui {
         // Never emit tracing lines while the interactive TUI owns stdout/stderr.
         // This prevents log spam from corrupting alternate-screen rendering.
         tracing_subscriber::EnvFilter::new("off")
-    } else if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_release_log_filter()))
+    } else if from_rust_log {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(default_release_log_filter(log_level))
+        })
     } else {
-        tracing_subscriber::EnvFilter::new(default_release_log_filter())
+        tracing_subscriber::EnvFilter::new(default_release_log_filter(log_level))
     };
 
-    if suppress_runtime_logs_for_tui || allow_noisy_dependency_logs() {
+    // The warn-level clamps would loosen a stricter LOG_LEVEL for dependencies.
+    if suppress_runtime_logs_for_tui
+        || allow_noisy_dependency_logs()
+        || (!from_rust_log
+            && mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level))
+    {
         return filter;
     }
 
@@ -4429,27 +4533,32 @@ fn build_release_log_filter(suppress_runtime_logs_for_tui: bool) -> tracing_subs
     filter
 }
 
-fn default_release_log_filter() -> &'static str {
-    concat!(
-        "warn,",
-        "mcp_agent_mail_cli=info,",
-        "mcp_agent_mail_server=info,",
-        "mcp_agent_mail_core=info,",
-        "mcp_agent_mail_db=info,",
-        "mcp_agent_mail_storage=info,",
-        "mcp_agent_mail_tools=info,",
-        "fsqlite_core::connection=warn,",
-        "fsqlite_mvcc::observability=warn,",
-        "fsqlite_mvcc::gc=warn,",
-        "fsqlite_mvcc::rebase=warn,",
-        "mvcc=warn,",
-        "checkpoint=warn,",
-        "fsqlite.storage_wiring=warn,",
-        "fsqlite_wal::checkpoint_executor=warn,",
-        "fsqlite_vdbe::jit=warn,",
-        "fsqlite_vdbe::engine=warn,",
-        "jit_compile=error,",
-        "execute_statement_dispatch=error",
+/// Agent Mail's own crates log at `log_level`; dependencies stay at `warn`
+/// (with the known-noisy engine targets pinned) unless `log_level` is stricter.
+fn default_release_log_filter(log_level: &str) -> String {
+    if mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level) {
+        return log_level.to_string();
+    }
+    format!(
+        "warn,\
+         mcp_agent_mail_cli={log_level},\
+         mcp_agent_mail_server={log_level},\
+         mcp_agent_mail_core={log_level},\
+         mcp_agent_mail_db={log_level},\
+         mcp_agent_mail_storage={log_level},\
+         mcp_agent_mail_tools={log_level},\
+         fsqlite_core::connection=warn,\
+         fsqlite_mvcc::observability=warn,\
+         fsqlite_mvcc::gc=warn,\
+         fsqlite_mvcc::rebase=warn,\
+         mvcc=warn,\
+         checkpoint=warn,\
+         fsqlite.storage_wiring=warn,\
+         fsqlite_wal::checkpoint_executor=warn,\
+         fsqlite_vdbe::jit=warn,\
+         fsqlite_vdbe::engine=warn,\
+         jit_compile=error,\
+         execute_statement_dispatch=error"
     )
 }
 
@@ -5222,25 +5331,76 @@ fn prompt_live_service_choice(owner_label: &str, host: &str, port: u16) -> LiveS
     }
 }
 
+/// Refresh the snapshot, then keep its attachment guidance visible below it.
+fn render_read_only_tui_attachment_frame<W: std::io::Write>(
+    output: &mut W,
+    host: &str,
+    port: u16,
+    owner: Option<ManagedServiceKind>,
+    write_snapshot: impl FnOnce(&mut W) -> CliResult<()>,
+) -> CliResult<()> {
+    write!(output, "\x1b[2J\x1b[H")?;
+    output.flush()?;
+    write_snapshot(output)?;
+    writeln!(output)?;
+    writeln!(output, "READ-ONLY ATTACHMENT — watching the running server")?;
+    let owner_label = owner.map_or(
+        "An existing Agent Mail server",
+        managed_service_display_name,
+    );
+    writeln!(
+        output,
+        "{owner_label} owns {host}:{port}; this view cannot control its TUI."
+    )?;
+    writeln!(
+        output,
+        "Ctrl-C detaches. For the full interactive TUI: am --takeover"
+    )?;
+    if let Some(kind) = owner {
+        writeln!(
+            output,
+            "Takeover stops the managed service through its supervisor and restores it when you exit."
+        )?;
+        if matches!(kind, ManagedServiceKind::Systemd) {
+            writeln!(
+                output,
+                "To leave the user service stopped instead: systemctl --user stop {SYSTEMD_UNIT_NAME} && am"
+            )?;
+        }
+    } else {
+        writeln!(
+            output,
+            "If another supervisor manages this server, stop it there first to prevent automatic restarts."
+        )?;
+    }
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
 /// Follow a running service's read-only TUI snapshot. This uses the existing
 /// `tui-dump` transport, whose primary path is `/mail/ws-state`; it never
 /// starts a server, acquires a mutation lock, or invokes service control.
-fn run_read_only_tui_attachment() -> CliResult<()> {
-    use std::io::Write as _;
-
-    eprintln!(
-        "[info] Read-only TUI attachment active; press Ctrl-C to detach (full TUI: `am --takeover`)."
-    );
+fn run_read_only_tui_attachment(config: &Config) -> CliResult<()> {
+    let owner = active_conflicting_managed_service(&config.http_host, config.http_port)
+        .map(|(kind, _)| kind);
+    let mut output = std::io::stdout();
     loop {
-        print!("\x1b[2J\x1b[H");
-        std::io::stdout().flush().map_err(CliError::Io)?;
-        robot::handle_robot(robot::RobotArgs {
-            format: Some(robot::OutputFormat::Toon),
-            json: false,
-            project: None,
-            agent: None,
-            command: robot::RobotSubcommand::TuiDump,
-        })?;
+        render_read_only_tui_attachment_frame(
+            &mut output,
+            &config.http_host,
+            config.http_port,
+            owner,
+            |_| {
+                robot::handle_robot(robot::RobotArgs {
+                    format: Some(robot::OutputFormat::Toon),
+                    json: false,
+                    project: None,
+                    agent: None,
+                    command: robot::RobotSubcommand::TuiDump,
+                })
+            },
+        )?;
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -7217,6 +7377,73 @@ mod restart_coordination_tests {
     }
 
     #[test]
+    fn read_only_attachment_refresh_preserves_owner_and_reclaim_guidance() {
+        for owner in [
+            None,
+            Some(ManagedServiceKind::Systemd),
+            Some(ManagedServiceKind::Launchd),
+        ] {
+            let mut output = Vec::new();
+            for _ in 0..2 {
+                render_read_only_tui_attachment_frame(
+                    &mut output,
+                    "127.0.0.1",
+                    8765,
+                    owner,
+                    |output| {
+                        // More rows than a typical terminal: guidance must
+                        // follow the snapshot rather than scroll out above it.
+                        output.extend_from_slice("snapshot row\n".repeat(100).as_bytes());
+                        Ok(())
+                    },
+                )
+                .expect("render attachment frame");
+            }
+            let output = String::from_utf8(output).expect("UTF-8 banner");
+            let clear = "\x1b[2J\x1b[H";
+            assert_eq!(output.matches(clear).count(), 2);
+            let visible = output.rsplit(clear).next().expect("last refresh");
+            assert!(
+                visible.rfind("snapshot row").expect("snapshot body")
+                    < visible.find("READ-ONLY ATTACHMENT").expect("banner")
+            );
+            assert!(visible.contains("READ-ONLY ATTACHMENT"));
+            assert!(visible.contains("owns 127.0.0.1:8765"));
+            assert!(visible.contains("am --takeover"));
+            assert!(visible.contains("Ctrl-C detaches"));
+            if let Some(kind) = owner {
+                assert!(visible.contains(managed_service_display_name(kind)));
+                assert!(visible.contains("restores it when you exit"));
+            } else {
+                assert!(visible.contains("stop it there first"));
+            }
+            assert_eq!(
+                visible.contains("systemctl --user stop agent-mail.service && am"),
+                matches!(owner, Some(ManagedServiceKind::Systemd))
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_attachment_banner_propagates_output_failure() {
+        let mut output: &mut [u8] = &mut [];
+        let mut snapshot_read = false;
+        let error =
+            render_read_only_tui_attachment_frame(&mut output, "localhost", 8765, None, |_| {
+                snapshot_read = true;
+                Ok(())
+            })
+            .expect_err("a full output buffer must fail");
+        assert!(
+            matches!(error, CliError::Io(error) if error.kind() == std::io::ErrorKind::WriteZero)
+        );
+        assert!(
+            !snapshot_read,
+            "a failed clear must prevent the snapshot read"
+        );
+    }
+
+    #[test]
     fn coordinate_acquires_when_lock_is_free() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_with_unused_port(dir.path());
@@ -7375,14 +7602,14 @@ fn handle_serve_http(
         config.tui_enabled = false;
     }
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
-    apply_release_logging_defaults(suppress_runtime_logs_for_tui);
+    apply_release_logging_defaults(suppress_runtime_logs_for_tui, &config.log_level);
 
     // A healthy service remains the mailbox owner unless the operator says
     // otherwise. On a terminal the coexistence choice is explicit (br-mljnz):
     // attach read-only, take over through the managed-service stop/restore
     // path, or quit. Automation keeps the silent read-only attach.
     let takeover = match live_service_tui_decision(&config, config.tui_enabled, takeover) {
-        LiveServiceTuiDecision::AttachReadOnly => return run_read_only_tui_attachment(),
+        LiveServiceTuiDecision::AttachReadOnly => return run_read_only_tui_attachment(&config),
         LiveServiceTuiDecision::Quit => {
             eprintln!("[info] Leaving the running server untouched.");
             return Ok(());
@@ -8398,11 +8625,28 @@ pub fn prepare_runtime_server_startup_with_takeover(
     takeover: bool,
 ) -> CliResult<()> {
     config.validate_user_env_authority()?;
+    raise_server_fd_soft_limit();
     run_runtime_server_startup_prep_with(
         config,
         |cfg| auto_clear_db_blockers_with_takeover(cfg, takeover),
         run_startup_database_self_heal,
     )
+}
+
+/// br-kp1in.17: servers raise their soft `RLIMIT_NOFILE` toward the hard limit
+/// so the systemd-default 1,024 cannot exhaust under ordinary load. Defense in
+/// depth only; descriptor leaks are fixed at their source (br-8r6dl).
+fn raise_server_fd_soft_limit() {
+    use mcp_agent_mail_core::metrics::{SERVER_FD_SOFT_LIMIT_TARGET, raise_fd_soft_limit};
+    match raise_fd_soft_limit(SERVER_FD_SOFT_LIMIT_TARGET) {
+        Some((before, after)) if after > before => {
+            tracing::info!(before, after, "raised soft RLIMIT_NOFILE for the server");
+        }
+        Some(_) => {}
+        None => tracing::warn!(
+            "could not raise soft RLIMIT_NOFILE; the server keeps the inherited limit"
+        ),
+    }
 }
 fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
@@ -9227,8 +9471,8 @@ pub fn run_stdio_server(config: &Config) -> std::io::Result<()> {
 }
 
 fn handle_serve_stdio() -> CliResult<()> {
-    apply_release_logging_defaults(false);
     let config = Config::from_env();
+    apply_release_logging_defaults(false, &config.log_level);
     prepare_runtime_server_startup(&config)?;
     let result = run_stdio_server(&config);
     let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
@@ -9596,9 +9840,9 @@ fn mark_all_read_direct(
     let rt = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
     rt.block_on(async {
         let ctx = context::AsyncCliContext::open()?;
-        let cx = asupersync::Cx::for_request();
         mark_all_read_direct_with_pool(
             &cx,
             &ctx.pool,
@@ -15949,8 +16193,13 @@ fn resolve_canonical_snapshot_source_path(
     storage_root_is_explicit: bool,
     context: &str,
 ) -> CliResult<CanonicalSnapshotSource> {
-    let archive = collect_doctor_archive_inventory(storage_root);
-    let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
+    // br-kp1in.18: every CLI canonical read (robot search, ...) passes here.
+    // The full inventory opens and parses every archive message file, so
+    // judge first from the filename-only probe; parse only when the probe
+    // cannot prove the live DB covers the archive (10k messages: 10,012
+    // file opens per `am robot search` before this).
+    let probe = collect_doctor_archive_cheap_probe(storage_root);
+    let archive_has_state = probe.counts != DoctorInventoryCounts::default();
     let candidate_display = source_candidate.display().to_string();
     let candidate_path = PathBuf::from(source_candidate);
     let archive_authoritative_for_path = doctor_archive_is_authoritative_for_sqlite_path(
@@ -15988,16 +16237,19 @@ fn resolve_canonical_snapshot_source_path(
 
             match db_inventory {
                 Ok(db_inventory) => {
-                    if archive_has_state
+                    let archive = (archive_has_state
+                        && !doctor_db_covers_archive_cheap_probe(&probe, &db_inventory))
+                    .then(|| collect_doctor_archive_inventory(storage_root));
+                    if let Some(archive) = archive.as_ref()
+                        && archive.counts() != DoctorInventoryCounts::default()
                         && doctor_archive_is_authoritative_for_db(
-                            &archive,
+                            archive,
                             &db_inventory,
                             &opened_path,
                             storage_root,
                             storage_root_is_explicit,
                         )
-                        && let Some(detail) =
-                            doctor_archive_db_drift_detail(&archive, &db_inventory)
+                        && let Some(detail) = doctor_archive_db_drift_detail(archive, &db_inventory)
                     {
                         tracing::warn!(
                             operation = context,
@@ -16941,7 +17193,9 @@ fn render_setup_actions_table(results: &[mcp_agent_mail_core::setup::SetupResult
         return;
     }
 
-    let _ = mcp_agent_mail_server::theme::init_console_theme();
+    let _ = mcp_agent_mail_server::theme::init_console_theme_from_config(
+        mcp_agent_mail_core::Config::get().console_theme,
+    );
     let reset = mcp_agent_mail_server::theme::RESET;
     let dim = mcp_agent_mail_server::theme::DIM;
     let border = mcp_agent_mail_server::theme::secondary_bold();
@@ -19120,7 +19374,7 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
                 .map_err(|error| {
                     CliError::Other(format!("failed to build ATC simulate runtime: {error}"))
                 })?;
-            let cx = asupersync::Cx::for_request();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let stream = outcome_to_result(runtime.block_on(async {
                 mcp_agent_mail_db::atc_queries::replay(&cx, read_db.pool(), range).await
             }))?;
@@ -19262,10 +19516,31 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         // another Agent Mail process already owns the mailbox" whenever a
         // server was up — the normal state — making first-class verbs
         // unusable. Local fallback still applies when no daemon is present.
-        if try_proxy_file_reservations_mutation(&action)? {
+        let payload = run_file_reservations_mutation(&action)?;
+        // GH#329: `--paths a.rs,b.rs` is first matched literally, because a
+        // comma can be part of a real file name. When that literal restriction
+        // matched nothing, retry once with the value split on top-level commas
+        // (glob braces/classes such as `src/{a,b}.rs` stay whole) so the
+        // natural comma-list form releases/renews what the caller meant
+        // instead of leaving every hold in place.
+        if file_reservations_mutation_matched_nothing(&action, &payload)
+            && let Some(split_action) = file_reservations_action_with_split_paths(&action)
+        {
+            if let FileReservationsCommand::Renew { paths, .. }
+            | FileReservationsCommand::Release { paths, .. } = &split_action
+            {
+                output::warn(&format!(
+                    "No reservation matched the literal --paths value(s); retrying with the \
+                     comma-separated parts: {}",
+                    paths.join(" ")
+                ));
+            }
+            let payload = run_file_reservations_mutation(&split_action)?;
+            emit_proxied_file_reservations_output(&split_action, &payload);
             return Ok(());
         }
-        return handle_file_reservations_mutation_locally(&action);
+        emit_proxied_file_reservations_output(&action, &payload);
+        return Ok(());
     }
 
     let config = Config::from_env();
@@ -19282,10 +19557,128 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
     result
 }
 
+/// Run one mutating reservation verb through a live daemon when one owns the
+/// mailbox, else through the local tool path, and return the tool payload.
+fn run_file_reservations_mutation(
+    action: &FileReservationsCommand,
+) -> CliResult<serde_json::Value> {
+    if let Some(payload) = try_proxy_file_reservations_mutation(action)? {
+        return Ok(payload);
+    }
+    handle_file_reservations_mutation_locally(action)
+}
+
+/// True when a path-restricted release/renew (not queued) acted on nothing.
+fn file_reservations_mutation_matched_nothing(
+    action: &FileReservationsCommand,
+    payload: &serde_json::Value,
+) -> bool {
+    match action {
+        FileReservationsCommand::Release { paths, .. } if !paths.is_empty() => {
+            let queued = payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
+                || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued");
+            !queued
+                && payload
+                    .get("released")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    == 0
+        }
+        FileReservationsCommand::Renew { paths, .. } if !paths.is_empty() => payload
+            .get("file_reservations")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        _ => false,
+    }
+}
+
+/// Split one `--paths` value on commas outside glob syntax: `{...}`
+/// alternations and `[...]` classes keep their commas. Segments are trimmed
+/// and empty segments dropped.
+fn split_reservation_path_on_top_level_commas(value: &str) -> Vec<String> {
+    let mut brace_depth = 0usize;
+    let mut in_class = false;
+    let mut start = 0usize;
+    let mut segments = Vec::new();
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => brace_depth += 1,
+            '}' if !in_class => brace_depth = brace_depth.saturating_sub(1),
+            ',' if !in_class && brace_depth == 0 => {
+                segments.push(&value[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&value[start..]);
+    segments
+        .into_iter()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same release/renew with every `--paths` value split on top-level
+/// commas, or `None` when splitting changes nothing (no retry is useful) or
+/// would leave no pattern at all (that must never widen into "every hold").
+fn file_reservations_action_with_split_paths(
+    action: &FileReservationsCommand,
+) -> Option<FileReservationsCommand> {
+    let split = |paths: &[String]| -> Option<Vec<String>> {
+        let mut changed = false;
+        let mut out = Vec::with_capacity(paths.len());
+        for value in paths {
+            let parts = split_reservation_path_on_top_level_commas(value);
+            // Only a top-level comma justifies a retry; whitespace alone is
+            // part of the literal value.
+            if parts.len() > 1 || (value.contains(',') && parts.first() != Some(value)) {
+                changed = true;
+            }
+            out.extend(parts);
+        }
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|path| seen.insert(path.clone()));
+        (changed && !out.is_empty() && out != paths).then_some(out)
+    };
+    match action {
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => Some(FileReservationsCommand::Release {
+            project: project.clone(),
+            agent: agent.clone(),
+            paths: split(paths)?,
+            ids: ids.clone(),
+        }),
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            extend_seconds,
+            paths,
+            ids,
+        } => Some(FileReservationsCommand::Renew {
+            project: project.clone(),
+            agent: agent.clone(),
+            extend_seconds: *extend_seconds,
+            paths: split(paths)?,
+            ids: ids.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Use the same reservation transaction and archive path as MCP when no daemon
 /// owns the mailbox. Keep the exclusive CLI ownership guard through the entire
 /// operation; opening a second direct-SQL mutation path loses archive updates.
-fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -> CliResult<()> {
+fn handle_file_reservations_mutation_locally(
+    action: &FileReservationsCommand,
+) -> CliResult<serde_json::Value> {
     let config = Config::from_env();
     let _mailbox_mutation_locks =
         acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
@@ -19359,8 +19752,7 @@ fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -
         };
         parse_tool_json_payload(tool, &result.map_err(mcp_error_to_cli_error)?)
     })?;
-    emit_proxied_file_reservations_output(action, &payload);
-    Ok(())
+    Ok(payload)
 }
 
 /// Make the provenance of a direct CLI reservation read explicit. A readable
@@ -19388,13 +19780,15 @@ fn emit_cli_reservation_read_attestation(attestation: &robot::ReservationReadAtt
 /// [`send_mail_envelope_via_server_or_local`] and the mutating `contacts`
 /// verbs proxy via [`try_proxy_contacts_mutation`] (#171, GH#185).
 ///
-/// Returns `Ok(true)` when the daemon handled the call (output already
-/// emitted), `Ok(false)` when no daemon owns the mailbox and the caller should
+/// Returns `Ok(Some(payload))` when the daemon handled the call (the caller
+/// renders it), `Ok(None)` when no daemon owns the mailbox and the caller should
 /// fall back to the local tool path. Returns `Err` when the daemon rejected
 /// the call in a way that disallows local fallback, or when a daemon owns the
 /// mailbox but its HTTP endpoint is unreachable (refusing a local mutation the
 /// owner would block anyway).
-fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> CliResult<bool> {
+fn try_proxy_file_reservations_mutation(
+    action: &FileReservationsCommand,
+) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
     let server_url = local_server_url(&server_config);
@@ -19402,7 +19796,7 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
 
     let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let storage_root = server_config.storage_root.clone();
@@ -19419,12 +19813,7 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
         .await
     })?;
 
-    let Some(payload) = payload else {
-        return Ok(false);
-    };
-
-    emit_proxied_file_reservations_output(action, &payload);
-    Ok(true)
+    Ok(payload)
 }
 
 /// Translate a mutating reservation command into its MCP tool request.
@@ -19532,13 +19921,41 @@ fn emit_proxied_file_reservations_output(
                 ));
             }
         }
-        FileReservationsCommand::Renew { .. } => {
+        FileReservationsCommand::Renew {
+            project,
+            paths,
+            ids,
+            ..
+        } => {
             let rows = payload
                 .get("file_reservations")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             output::success(&format!("Renewed {} reservation(s).", rows.len()));
+            if rows.is_empty() && !paths.is_empty() {
+                warn_path_restriction_matched_nothing("renewed", project, paths);
+            }
+            // br-kp1in.24 / GH#329: name the requested ids that renewed nothing.
+            if paths.is_empty() && !ids.is_empty() {
+                let renewed: std::collections::BTreeSet<i64> = rows
+                    .iter()
+                    .filter_map(|row| row.get("id").and_then(serde_json::Value::as_i64))
+                    .collect();
+                let missed: Vec<String> = ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|id| !renewed.contains(id))
+                    .map(ToString::to_string)
+                    .collect();
+                if !missed.is_empty() {
+                    output::warn(&format!(
+                        "Reservation id(s) {} renewed nothing: not found, released, or not held by this agent.",
+                        missed.join(", ")
+                    ));
+                }
+            }
             let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
             for r in &rows {
                 let id = r.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
@@ -19558,7 +19975,12 @@ fn emit_proxied_file_reservations_output(
             }
             table.render();
         }
-        FileReservationsCommand::Release { project, agent, .. } => {
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => {
             if payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
                 || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued")
             {
@@ -19573,12 +19995,81 @@ fn emit_proxied_file_reservations_output(
                 .get("released")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            output::success(&format!(
-                "Released {released} reservation(s) for {agent} in {project}."
-            ));
+            let released_ids = payload
+                .get("released_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_i64)
+                        .collect::<std::collections::BTreeSet<i64>>()
+                });
+            match released_ids
+                .as_ref()
+                .filter(|released_ids| !released_ids.is_empty())
+            {
+                Some(released_ids) => output::success(&format!(
+                    "Released {released} reservation(s) for {agent} in {project}: id(s) {}.",
+                    released_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                None => output::success(&format!(
+                    "Released {released} reservation(s) for {agent} in {project}."
+                )),
+            }
+            if released == 0 && !paths.is_empty() {
+                warn_path_restriction_matched_nothing("released", project, paths);
+            }
+            // br-kp1in.24 / GH#329: an explicit id that released nothing must
+            // not pass silently; the caller would believe the lease is gone.
+            let requested_ids = ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<i64>>();
+            if paths.is_empty() && !requested_ids.is_empty() {
+                if let Some(released_ids) = released_ids.as_ref() {
+                    let missed = requested_ids
+                        .difference(released_ids)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    if !missed.is_empty() {
+                        output::warn(&format!(
+                            "Reservation id(s) {} released nothing: not found, already released, \
+                             or not held by {agent}.",
+                            missed.join(", ")
+                        ));
+                    }
+                } else {
+                    // A server without `released_ids` reports only a count.
+                    let requested = i64::try_from(requested_ids.len()).unwrap_or(i64::MAX);
+                    if released < requested {
+                        output::warn(&format!(
+                            "{} of {requested} requested reservation id(s) released nothing: not \
+                             found, already released, or not held by {agent}.",
+                            requested - released
+                        ));
+                    }
+                }
+            }
         }
         _ => {}
     }
+}
+
+/// GH#329: a path-restricted release/renew that acted on nothing must not look
+/// like success. The exit status stays 0 (a repeated release is an idempotent
+/// no-op), but stderr names the patterns so a caller that mistyped one, and
+/// still holds the lease, can tell.
+fn warn_path_restriction_matched_nothing(verb: &str, project: &str, paths: &[String]) {
+    output::warn(&format!(
+        "Nothing was {verb}: no active reservation held by this agent matched --paths {}. \
+         If these were already released this is expected; otherwise check the patterns \
+         with `am file_reservations list {project}`.",
+        paths.join(" ")
+    ));
 }
 
 fn active_reservation_predicate_sql(table_ref: &str) -> String {
@@ -20941,6 +21432,7 @@ fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Co
         .current_dir(project_dir)
         .env("RUST_LOG", "error")
         .env("BEADS_DIR", beads_dir_utf8)
+        .env_remove("BEADS_DB")
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")
         .args([
@@ -20981,6 +21473,8 @@ fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, S
 
 fn br_issue_summary_items(value: &serde_json::Value) -> Vec<serde_json::Value> {
     value
+        .get("issues")
+        .unwrap_or(value)
         .as_array()
         .map(|issues| {
             issues
@@ -21385,10 +21879,10 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
     conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
-    let cx = asupersync::Cx::for_request();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     let outcome = rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await });
 
@@ -29103,6 +29597,7 @@ struct DoctorServerFixDiagnostics {
     http_check: DoctorFixCheck,
     rpc_check: DoctorFixCheck,
     process_check: DoctorFixCheck,
+    descriptor_check: DoctorFixCheck,
     restart_recommended: bool,
 }
 
@@ -29123,6 +29618,7 @@ const DOCTOR_PRIMARY_CHECK_PRIORITY: &[&str] = &[
     "archive_db_parity",
     "foreign_key_integrity",
     "server_port",
+    "server_descriptors",
     "server_process_cpu",
     "server_http_health",
     "server_jsonrpc_health",
@@ -29137,6 +29633,7 @@ const DOCTOR_DATABASE_INCIDENT_CHECKS: &[&str] = &[
 ];
 const DOCTOR_SERVER_INCIDENT_CHECKS: &[&str] = &[
     "server_port",
+    "server_descriptors",
     "server_process_cpu",
     "server_http_health",
     "server_jsonrpc_health",
@@ -29836,6 +30333,122 @@ fn collect_doctor_server_runtime_diagnostics(config: &Config) -> DoctorServerRun
     }
 }
 
+/// br-kp1in.17: soft `RLIMIT_NOFILE` below which a long-lived server is
+/// expected to run out of descriptors under ordinary multi-agent load (the
+/// systemd default of 1,024 hit EMFILE in under 60 s on 2026-09-23).
+const DOCTOR_SERVER_NOFILE_SOFT_FLOOR: u64 = 8_192;
+
+/// One listener's descriptor usage, read from `/proc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorDescriptorSample {
+    pid: u32,
+    /// Soft `RLIMIT_NOFILE`; `None` when unlimited.
+    soft_limit: Option<u64>,
+    open: usize,
+}
+
+/// Soft "Max open files" limit from `/proc/<pid>/limits` text:
+/// `Some(None)` = unlimited, `None` = no parseable row.
+fn parse_proc_limits_nofile_soft(limits: &str) -> Option<Option<u64>> {
+    let row = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))?;
+    match row.split_whitespace().next()? {
+        "unlimited" => Some(None),
+        soft => soft.parse().ok().map(Some),
+    }
+}
+
+fn sample_listener_descriptors(pid: u32) -> Result<DoctorDescriptorSample, String> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))
+        .map_err(|error| format!("pid {pid}: cannot read its limits: {error}"))?;
+    let soft_limit = parse_proc_limits_nofile_soft(&limits)
+        .ok_or_else(|| format!("pid {pid}: no parseable 'Max open files' limit"))?;
+    let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|error| format!("pid {pid}: cannot list its descriptors: {error}"))?
+        .count();
+    Ok(DoctorDescriptorSample {
+        pid,
+        soft_limit,
+        open,
+    })
+}
+
+/// Grade descriptor headroom across the listener samples; the worst wins.
+fn doctor_descriptor_check(samples: &[Result<DoctorDescriptorSample, String>]) -> DoctorFixCheck {
+    const RANK: [&str; 3] = ["ok", "warn", "fail"];
+    let mut worst = 0;
+    let mut details = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let (rank, detail) = match sample {
+            Err(error) => (1, format!("could not sample descriptors ({error})")),
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit: None,
+                open,
+            }) => (0, format!("pid {pid}: {open} open, no soft limit")),
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit: Some(soft),
+                open,
+            }) => {
+                let open = u64::try_from(*open).unwrap_or(u64::MAX);
+                let percent = open.saturating_mul(100) / (*soft).max(1);
+                let usage = format!("pid {pid}: {open} of {soft} descriptors open ({percent}%)");
+                if percent >= 90 {
+                    (
+                        2,
+                        format!(
+                            "{usage}; exhaustion is imminent (RESOURCE_BUSY/EMFILE next): restart the server through its supervisor and upgrade to a build with the descriptor-leak fix"
+                        ),
+                    )
+                } else if percent >= 70 {
+                    (
+                        1,
+                        format!("{usage}; headroom is low, plan a supervised restart"),
+                    )
+                } else if *soft < DOCTOR_SERVER_NOFILE_SOFT_FLOOR {
+                    (
+                        1,
+                        format!(
+                            "{usage}; soft limit is below {DOCTOR_SERVER_NOFILE_SOFT_FLOOR}: set LimitNOFILE=65536 (`am service install` renders it) or run a build that raises it at startup"
+                        ),
+                    )
+                } else {
+                    (0, usage)
+                }
+            }
+        };
+        worst = worst.max(rank);
+        details.push(detail);
+    }
+    DoctorFixCheck {
+        status: RANK[worst],
+        detail: details.join("; "),
+    }
+}
+
+fn doctor_server_descriptor_check(listener_pids: &[u32]) -> DoctorFixCheck {
+    if !cfg!(target_os = "linux") {
+        return DoctorFixCheck {
+            status: "ok",
+            detail: "Descriptor headroom check skipped: it reads /proc, which this platform lacks"
+                .to_string(),
+        };
+    }
+    if listener_pids.is_empty() {
+        return DoctorFixCheck {
+            status: "warn",
+            detail: "No listener PID available to sample descriptor headroom".to_string(),
+        };
+    }
+    let samples: Vec<_> = listener_pids
+        .iter()
+        .map(|pid| sample_listener_descriptors(*pid))
+        .collect();
+    doctor_descriptor_check(&samples)
+}
+
 fn doctor_server_diagnostics(config: &Config) -> DoctorServerFixDiagnostics {
     let runtime = collect_doctor_server_runtime_diagnostics(config);
     let restart_recommended = runtime.restart_recommended();
@@ -29935,6 +30548,7 @@ fn doctor_server_diagnostics(config: &Config) -> DoctorServerFixDiagnostics {
             detail: runtime.jsonrpc_health.detail().to_string(),
         },
         process_check,
+        descriptor_check: doctor_server_descriptor_check(&runtime.listener_pids),
         restart_recommended,
     }
 }
@@ -29995,6 +30609,57 @@ fn probe_local_http_health(
             "/health probe failed for {}:{}: {}",
             config.http_host, config.http_port, error
         )),
+    }
+}
+
+/// The live server's `descriptors` health contributor when it is not green
+/// (br-kp1in.17): a rising descriptor floor or thin headroom raises the
+/// server's `health_level` only to yellow, which alone does not warn here.
+/// Servers that predate the contributor report nothing.
+fn server_descriptor_warning(health: &serde_json::Value) -> Option<String> {
+    let row = health
+        .get("health_level_contributors")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some("descriptors"))?;
+    let level = row.get("level").and_then(serde_json::Value::as_str)?;
+    if level.eq_ignore_ascii_case("green") {
+        return None;
+    }
+    let detail = row
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Some(format!("server descriptors {level}: {detail}"))
+}
+
+/// `(status, detail)` for robot health's `sqlite_write_mode` probe: the
+/// autocommit write mode the live server's engine runs (br-kp1in.16). The
+/// runtime pins MVCC concurrent on every write connection, so any other
+/// observed mode is degraded.
+fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str, String) {
+    let Some(mode) = health
+        .and_then(|health| health.get("sqlite_autocommit_write_mode"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return (
+            "skip",
+            "live server health reported no write mode".to_string(),
+        );
+    };
+    match mode {
+        "mvcc_concurrent" => (
+            "ok",
+            "autocommit writes pinned to MVCC concurrent".to_string(),
+        ),
+        "" | "not_observed" => (
+            "skip",
+            "server has not opened a write connection yet".to_string(),
+        ),
+        other => (
+            "degraded",
+            format!("autocommit write mode is {other}; the runtime pins mvcc_concurrent"),
+        ),
     }
 }
 
@@ -30077,9 +30742,14 @@ fn probe_local_jsonrpc_health(
                                     && !health_level.eq_ignore_ascii_case("critical")
                                     && !health_level.eq_ignore_ascii_case("red")
                                 {
-                                    DoctorProbeResult::ok(format!(
-                                        "JSON-RPC health_check succeeded via {url}"
-                                    ))
+                                    match server_descriptor_warning(&parsed) {
+                                        Some(warning) => {
+                                            DoctorProbeResult::warn(format!("{warning} via {url}"))
+                                        }
+                                        None => DoctorProbeResult::ok(format!(
+                                            "JSON-RPC health_check succeeded via {url}"
+                                        )),
+                                    }
                                 } else if status.eq_ignore_ascii_case("ok") {
                                     DoctorProbeResult::warn(detail)
                                 } else {
@@ -30575,6 +31245,42 @@ impl DoctorArchiveCheapProbe {
         };
         self.ambiguous |= other.ambiguous;
     }
+}
+
+/// True when a populated DB is provably at least as complete as the archive on
+/// every drift-classifier signal, judged from the cheap probe alone: counts
+/// (the probe counts message FILES, an upper bound on the deduplicated logical
+/// count), the highest canonical message id, and per-project identities. Then
+/// `doctor_archive_db_drift_detail` cannot report a lag and the full,
+/// per-message-parsing inventory is unnecessary. An ambiguous probe proves
+/// nothing.
+fn doctor_db_covers_archive_cheap_probe(
+    probe: &DoctorArchiveCheapProbe,
+    db: &DoctorDbInventory,
+) -> bool {
+    db.counts.messages > 0
+        && !probe.ambiguous
+        && db.counts.projects >= probe.counts.projects
+        && db.counts.agents >= probe.counts.agents
+        && db.counts.messages >= probe.counts.messages
+        && db.max_message_id >= probe.latest_message_id.unwrap_or(0)
+        && probe.project_identities.iter().all(|archive_identity| {
+            doctor_archive_identity_matches_db(archive_identity, &db.project_identities)
+        })
+}
+
+/// The full archive inventory for a drift decision against `db`, or `None`
+/// when there is no archive or the filename-only probe already proves the DB
+/// covers it (then no drift can be reported and parsing every message file
+/// would be wasted work).
+fn doctor_archive_inventory_for_drift(
+    storage_root: &Path,
+    probe: Option<&DoctorArchiveCheapProbe>,
+    db: &DoctorDbInventory,
+) -> Option<DoctorArchiveInventory> {
+    let probe = probe?;
+    (!doctor_db_covers_archive_cheap_probe(probe, db))
+        .then(|| collect_doctor_archive_inventory(storage_root))
 }
 
 /// Collect the cheap archive probe across every project directory.
@@ -31892,7 +32598,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     storage_root_is_explicit: bool,
     archive_root: &Path,
     archive_available: bool,
-    archive_inventory: Option<DoctorArchiveInventory>,
+    archive_probe: Option<&DoctorArchiveCheapProbe>,
     archive_reconstruct_available: bool,
 ) -> CliResult<DoctorDatabaseFixStrategy> {
     let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
@@ -31946,7 +32652,6 @@ fn doctor_database_fix_strategy_read_only_probes(
     }
 
     if archive_available {
-        let archive = archive_inventory.clone().unwrap_or_default();
         let db = match collect_doctor_db_inventory_canonical(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
@@ -31957,14 +32662,16 @@ fn doctor_database_fix_strategy_read_only_probes(
                 ));
             }
         };
-        if doctor_archive_is_authoritative_for_db(
-            &archive,
-            &db,
-            Path::new(&opened.opened_path),
-            storage_root,
-            storage_root_is_explicit,
-        ) && let Some(strategy) =
-            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, archive_root)
+        if let Some(archive) = doctor_archive_inventory_for_drift(storage_root, archive_probe, &db)
+            && doctor_archive_is_authoritative_for_db(
+                &archive,
+                &db,
+                Path::new(&opened.opened_path),
+                storage_root,
+                storage_root_is_explicit,
+            )
+            && let Some(strategy) =
+                doctor_reconstruct_strategy_for_archive_drift(&archive, &db, archive_root)
         {
             return Ok(strategy);
         }
@@ -32123,11 +32830,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     let archive_root = storage_root.join("projects");
     let archive_available = path_is_real_directory(&archive_root);
-    let archive_inventory =
-        archive_available.then(|| collect_doctor_archive_inventory(storage_root));
-    let archive_has_state = archive_inventory
+    // br-kp1in.18: `am doctor health` (run at every agent session start)
+    // judges from the filename-only probe; the per-message parse happens only
+    // for a drift decision the probe cannot settle.
+    let archive_probe = archive_available.then(|| collect_doctor_archive_cheap_probe(storage_root));
+    let archive_has_state = archive_probe
         .as_ref()
-        .is_some_and(|inventory| inventory.counts() != DoctorInventoryCounts::default());
+        .is_some_and(|probe| probe.counts != DoctorInventoryCounts::default());
     let resolved_path = resolve_sqlite_runtime_path(&configured_path);
     let resolved = Path::new(&resolved_path);
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
@@ -32242,7 +32951,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             storage_root_is_explicit,
             &archive_root,
             archive_available,
-            archive_inventory,
+            archive_probe.as_ref(),
             archive_reconstruct_available,
         );
     }
@@ -32294,7 +33003,6 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     if archive_available {
-        let archive = archive_inventory.clone().unwrap_or_default();
         let db = match collect_doctor_db_inventory(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
@@ -32305,14 +33013,17 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                 ));
             }
         };
-        if doctor_archive_is_authoritative_for_db(
-            &archive,
-            &db,
-            resolved,
-            storage_root,
-            storage_root_is_explicit,
-        ) && let Some(strategy) =
-            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, &archive_root)
+        if let Some(archive) =
+            doctor_archive_inventory_for_drift(storage_root, archive_probe.as_ref(), &db)
+            && doctor_archive_is_authoritative_for_db(
+                &archive,
+                &db,
+                resolved,
+                storage_root,
+                storage_root_is_explicit,
+            )
+            && let Some(strategy) =
+                doctor_reconstruct_strategy_for_archive_drift(&archive, &db, &archive_root)
         {
             return Ok(strategy);
         }
@@ -34826,6 +35537,12 @@ fn handle_doctor_check_with_target(
             "check": "server_process_cpu",
             "status": server_diagnostics.process_check.status,
             "detail": server_diagnostics.process_check.detail,
+        }));
+
+        checks.push(serde_json::json!({
+            "check": "server_descriptors",
+            "status": server_diagnostics.descriptor_check.status,
+            "detail": server_diagnostics.descriptor_check.detail,
         }));
         server_diagnostics
     };
@@ -37922,7 +38639,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     Some(&server_config.storage_root),
                     "mail inbox",
                 )?;
-                let cx = asupersync::Cx::for_request();
+                let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
                 let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
                 let pid = proj.id.unwrap_or(0);
                 let agent = resolve_agent_async(&cx, read_pool.pool(), pid, &agent_name).await?;
@@ -38034,7 +38751,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -38107,7 +38824,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -38280,7 +38997,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     "mail search",
                 )
             })?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -38998,7 +39715,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             reject_local_registration_if_proof_gate_enabled("agents create")?;
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
@@ -39083,7 +39800,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agents = match mcp_agent_mail_db::queries::list_active_agents_bounded(
@@ -39169,7 +39886,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let row = match mcp_agent_mail_db::queries::get_agent(
@@ -39235,7 +39952,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             if !std::path::Path::new(&project_key).is_absolute()
                 && let Ok(ctx) = context::AsyncCliContext::open()
             {
-                let cx = asupersync::Cx::for_request();
+                let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
                 if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
                     && proj.human_key != project_key
                 {
@@ -39354,7 +40071,7 @@ async fn handle_agents_reap(
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
     let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let payload = agents_reap_payload(&cx, &ctx.pool, stale_days, project_key, dry_run).await?;
     render_agents_reap_payload(&payload, fmt, dry_run, stale_days);
     Ok(())
@@ -42685,6 +43402,7 @@ StartLimitIntervalSec=300
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=300
+LimitNOFILE=65536
 ExecStart={exec_args}
 WorkingDirectory={working_dir}
 Restart=on-failure
@@ -42835,6 +43553,11 @@ fn build_launchd_plist_content(
     </dict>
     <key>ThrottleInterval</key>
     <integer>30</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>10240</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{log_dir}/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -44751,6 +45474,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             !unit.contains("HTTP_BEARER_TOKEN"),
             "unit must omit HTTP_BEARER_TOKEN when auth is disabled or no token is configured"
         );
+        // br-kp1in.17: the systemd user default (1,024) exhausted within a minute
+        // of mixed load on v0.3.36; the unit must request a real limit.
+        assert!(
+            unit.contains("\nLimitNOFILE=65536\n"),
+            "unit must raise the descriptor limit: {unit}"
+        );
     }
 
     #[test]
@@ -44857,6 +45586,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         assert!(
             plist.contains("<key>WorkingDirectory</key>"),
             "plist must contain WorkingDirectory key"
+        );
+        assert!(
+            plist.contains(
+                "<key>SoftResourceLimits</key>\n    <dict>\n        <key>NumberOfFiles</key>\n        <integer>10240</integer>"
+            ),
+            "plist must raise the descriptor limit (br-kp1in.17): {plist}"
         );
         assert!(
             plist.contains("<string>/Users/dev/projects/myapp</string>"),
@@ -45045,7 +45780,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
 
     #[test]
     fn default_release_log_filter_includes_fsqlite_noise_suppressors() {
-        let filter = default_release_log_filter();
+        let filter = default_release_log_filter("info");
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
@@ -45058,6 +45793,198 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         let directives = noisy_dependency_log_clamp_directives();
         assert!(directives.contains(&"jit_compile=error"));
         assert!(directives.contains(&"execute_statement_dispatch=error"));
+    }
+
+    /// (target, level, callsite metadata) of one admitted event.
+    type AdmittedEvent = (String, tracing::Level, &'static tracing::Metadata<'static>);
+
+    /// Captures every event its filter admits.
+    #[derive(Clone, Default)]
+    struct AdmittedEvents(std::sync::Arc<std::sync::Mutex<Vec<AdmittedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmittedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((meta.target().to_string(), *meta.level(), meta));
+        }
+    }
+
+    /// br-49zjq: FrankenSQLite keeps its fused prepared-DML lane only while
+    /// `tracing::enabled!` is false for its per-statement targets. The release
+    /// subscriber must keep them off, including with the TUI's "off" filter,
+    /// while the `drop_close` counter still sees `fsqlite::runtime` warnings.
+    #[test]
+    fn release_subscriber_leaves_statement_tracing_off_and_counts_drop_close() {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn statement_tracing_enabled() -> bool {
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG)
+                || tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO)
+                || tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
+        }
+
+        // Control: the pre-fix composition (counter layer without a filter)
+        // enables every callsite, so the assertions below can fail.
+        let unfiltered = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new("off")))
+            .with(DropCloseCounterLayer);
+        tracing::subscriber::with_default(unfiltered, || assert!(statement_tracing_enabled()));
+
+        for directives in [
+            "off".to_string(),
+            default_release_log_filter("info"),
+            default_release_log_filter("debug"),
+        ] {
+            let subscriber = release_log_subscriber(EnvFilter::new(&directives));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(!statement_tracing_enabled(), "filter {directives:?}");
+            });
+        }
+
+        assert_eq!(
+            mcp_agent_mail_server::FSQLITE_RUNTIME_TRACE_TARGET,
+            "fsqlite::runtime"
+        );
+        let counter = &mcp_agent_mail_core::global_metrics().db.drop_close_total;
+        let before = counter.load();
+        let subscriber = release_log_subscriber(EnvFilter::new("off"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "fsqlite::runtime", event = "drop_close", "dropped");
+        });
+        // `>`: a globally installed subscriber in a sibling test may count too.
+        assert!(counter.load() > before);
+    }
+
+    /// br-kp1in.26: a WARN emitted on every connection open must not flood the
+    /// log, while engine errors and Agent Mail's own warnings stay complete.
+    #[test]
+    fn dependency_warn_rate_limit_emits_each_engine_warn_callsite_once() {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let seen = AdmittedEvents::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(seen.clone().with_filter(DependencyWarnRateLimit::default()));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..100 {
+                tracing::warn!(
+                    target: "fsqlite_core::connection",
+                    "WAL-FEC requires a caller-owned native runtime"
+                );
+            }
+            for _ in 0..3 {
+                tracing::warn!(target: "fsqlite_core::connection", "another engine warning");
+            }
+            for _ in 0..5 {
+                tracing::warn!(target: "mcp_agent_mail_db", "agent mail's own warning");
+            }
+            for _ in 0..4 {
+                tracing::error!(target: "fsqlite_core::connection", "engine error");
+            }
+        });
+
+        let seen = seen.0.lock().unwrap();
+        let count = |target: &str, level: tracing::Level| {
+            seen.iter()
+                .filter(|(t, l, _)| t == target && *l == level)
+                .count()
+        };
+        assert_eq!(
+            count("fsqlite_core::connection", tracing::Level::WARN),
+            2,
+            "exactly one line per distinct engine WARN call site"
+        );
+        assert_eq!(count("mcp_agent_mail_db", tracing::Level::WARN), 5);
+        assert_eq!(count("fsqlite_core::connection", tracing::Level::ERROR), 4);
+    }
+
+    /// br-kp1in.20: `LOG_LEVEL` (canonicalized by `Config`) sets Agent Mail's
+    /// own threshold; dependencies stay at `warn` unless it is stricter.
+    #[test]
+    fn log_level_sets_agent_mail_threshold_and_stricter_levels_silence_dependencies() {
+        use tracing::Level;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn admitted(log_level: &str) -> Vec<(String, Level)> {
+            let seen = AdmittedEvents::default();
+            let subscriber = tracing_subscriber::registry().with(
+                seen.clone()
+                    .with_filter(build_release_log_filter(false, log_level)),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "mcp_agent_mail_server", "own debug");
+                tracing::info!(target: "mcp_agent_mail_server", "own info");
+                tracing::warn!(target: "mcp_agent_mail_server", "own warn");
+                tracing::error!(target: "mcp_agent_mail_server", "own error");
+                tracing::debug!(target: "some_dependency", "dependency debug");
+                tracing::warn!(target: "some_dependency", "dependency warn");
+                tracing::warn!(target: "fsqlite_core::connection", "engine warn");
+            });
+            let seen = seen.0.lock().unwrap();
+            seen.iter()
+                .map(|(target, level, _)| (target.clone(), *level))
+                .collect()
+        }
+        let own = |level| ("mcp_agent_mail_server".to_string(), level);
+        let dependency_warns = [
+            ("some_dependency".to_string(), Level::WARN),
+            ("fsqlite_core::connection".to_string(), Level::WARN),
+        ];
+
+        let mut expected = vec![own(Level::INFO), own(Level::WARN), own(Level::ERROR)];
+        expected.extend(dependency_warns.clone());
+        assert_eq!(
+            admitted("info"),
+            expected,
+            "the default keeps today's filter"
+        );
+
+        let mut expected = vec![own(Level::DEBUG), own(Level::INFO), own(Level::WARN)];
+        expected.push(own(Level::ERROR));
+        expected.extend(dependency_warns);
+        assert_eq!(
+            admitted("debug"),
+            expected,
+            "debug opens Agent Mail's own logs, never dependency debug output"
+        );
+
+        assert_eq!(admitted("error"), vec![own(Level::ERROR)]);
+        assert_eq!(admitted("off"), Vec::new());
+    }
+
+    #[test]
+    fn dependency_warn_rate_limit_readmits_a_callsite_after_the_window() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let seen = AdmittedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "fsqlite_wal", "periodic engine warning");
+            tracing::warn!(target: "mcp_agent_mail_storage", "own warning");
+        });
+        let seen = seen.0.lock().unwrap();
+        let engine = seen[0].2;
+        let own = seen[1].2;
+
+        let limit = DependencyWarnRateLimit::default();
+        let t0 = std::time::Instant::now();
+        let window = DependencyWarnRateLimit::WINDOW;
+        assert!(limit.admit_at(engine, t0));
+        assert!(!limit.admit_at(engine, t0 + window - std::time::Duration::from_secs(1)));
+        assert!(limit.admit_at(engine, t0 + window));
+        // Never limited, even back to back.
+        assert!(limit.admit_at(own, t0));
+        assert!(limit.admit_at(own, t0));
     }
 
     #[test]
@@ -57324,6 +58251,131 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn parse_proc_limits_nofile_soft_reads_the_soft_column() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max cpu time              unlimited            unlimited            seconds   \n\
+                      Max open files            1024                 1048576              files     \n";
+        assert_eq!(parse_proc_limits_nofile_soft(limits), Some(Some(1024)));
+        assert_eq!(
+            parse_proc_limits_nofile_soft("Max open files  unlimited  unlimited  files\n"),
+            Some(None)
+        );
+        assert_eq!(
+            parse_proc_limits_nofile_soft("Max processes  10  10  processes\n"),
+            None
+        );
+    }
+
+    /// br-kp1in.17: `am doctor` relays the server's descriptor-leak verdict.
+    #[test]
+    fn server_descriptor_warning_relays_a_non_green_descriptors_contributor() {
+        let health = |level: &str| {
+            serde_json::json!({
+                "status": "ok",
+                "health_level": "yellow",
+                "health_level_contributors": [
+                    {"name": "pressure", "level": "yellow", "detail": "pool 85%"},
+                    {"name": "descriptors", "level": level,
+                     "detail": "1900 open of soft limit 65536 (2%); floor rose in every window"},
+                ],
+            })
+        };
+        let warning =
+            server_descriptor_warning(&health("yellow")).expect("yellow descriptors warn");
+        assert!(
+            warning.starts_with("server descriptors yellow: 1900 open"),
+            "{warning}"
+        );
+        assert_eq!(server_descriptor_warning(&health("green")), None);
+        // Another yellow contributor alone does not make this probe warn.
+        assert_eq!(
+            server_descriptor_warning(&serde_json::json!({
+                "health_level_contributors": [{"name": "pressure", "level": "yellow", "detail": ""}],
+            })),
+            None
+        );
+        // A server that predates the contributor.
+        assert_eq!(
+            server_descriptor_warning(&serde_json::json!({"status": "ok"})),
+            None
+        );
+    }
+
+    #[test]
+    fn server_write_mode_probe_flags_any_mode_but_the_pinned_one() {
+        // br-kp1in.16.
+        let health = |mode: &str| serde_json::json!({"sqlite_autocommit_write_mode": mode});
+        assert_eq!(
+            server_write_mode_probe(Some(&health("mvcc_concurrent"))).0,
+            "ok"
+        );
+        let (status, detail) = server_write_mode_probe(Some(&health("serialized")));
+        assert_eq!(status, "degraded");
+        assert!(detail.contains("serialized"), "{detail}");
+        assert_eq!(
+            server_write_mode_probe(Some(&health("not_observed"))).0,
+            "skip"
+        );
+        // A server that predates the field, and no reachable server.
+        assert_eq!(
+            server_write_mode_probe(Some(&serde_json::json!({"status": "ok"}))).0,
+            "skip"
+        );
+        assert_eq!(server_write_mode_probe(None).0, "skip");
+    }
+
+    #[test]
+    fn doctor_descriptor_check_grades_headroom_and_low_limits() {
+        // br-kp1in.17.
+        let s = |pid, soft_limit, open| {
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit,
+                open,
+            })
+        };
+        // The live host on 2026-09-23 (13,886 of 32,768) has headroom now.
+        assert_eq!(
+            doctor_descriptor_check(&[s(1, Some(32_768), 13_886)]).status,
+            "ok"
+        );
+        let fail = doctor_descriptor_check(&[s(2, Some(1_024), 950)]);
+        assert_eq!(fail.status, "fail");
+        assert!(
+            fail.detail.contains("950 of 1024") && fail.detail.contains("imminent"),
+            "{}",
+            fail.detail
+        );
+        assert_eq!(
+            doctor_descriptor_check(&[s(3, Some(32_768), 25_000)]).status,
+            "warn"
+        );
+        // A low soft limit warns even while nearly idle.
+        let low = doctor_descriptor_check(&[s(4, Some(1_024), 40)]);
+        assert_eq!(low.status, "warn");
+        assert!(low.detail.contains("below 8192"), "{}", low.detail);
+        assert_eq!(doctor_descriptor_check(&[s(5, None, 10)]).status, "ok");
+        assert_eq!(
+            doctor_descriptor_check(&[Err("pid 6: gone".to_string())]).status,
+            "warn"
+        );
+        // The worst listener decides.
+        assert_eq!(
+            doctor_descriptor_check(&[s(7, Some(65_536), 10), s(8, Some(1_024), 1_000)]).status,
+            "fail"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_listener_descriptors_reads_a_live_process_and_refuses_a_missing_one() {
+        let sample = sample_listener_descriptors(std::process::id()).expect("sample own /proc");
+        assert!(sample.open > 0, "{sample:?}");
+        assert!(sample.soft_limit.is_none_or(|soft| soft > 0), "{sample:?}");
+        assert!(sample_listener_descriptors(u32::MAX).is_err());
+    }
+
+    #[test]
     fn doctor_server_fix_summary_includes_jsonrpc_probe_detail() {
         let diagnostics = DoctorServerFixDiagnostics {
             port_status: mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer,
@@ -57342,6 +58394,10 @@ startup_timeout_sec = 42
             process_check: DoctorFixCheck {
                 status: "warn",
                 detail: "cpu high".to_string(),
+            },
+            descriptor_check: DoctorFixCheck {
+                status: "ok",
+                detail: "descriptors ok".to_string(),
             },
             restart_recommended: true,
         };
@@ -59042,6 +60098,88 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn startup_database_self_heal_handles_empty_project_delta_without_reconstruct() {
+        for include_message in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().canonicalize().expect("native absolute root");
+            let message_dir = seed_archive_mailbox_project(&root);
+            // Project identities must be persistent: doctor intentionally
+            // excludes temporary project roots from authoritative recovery.
+            // Only metadata uses this path; fixture files stay in the tempdir.
+            let project_key = std::env::current_dir()
+                .unwrap()
+                .join("startup-delta-source-project");
+            std::fs::write(
+                root.join("projects/ahead-project/project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "slug": "ahead-project",
+                    "human_key": project_key,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let db_path = root.join("live.sqlite3");
+            let seeded = mcp_agent_mail_db::reconstruct_from_archive(&db_path, &root)
+                .expect("seed matching project and agent state");
+            assert_eq!(seeded.parse_errors, 0);
+            let db_url = format!("sqlite:///{}", db_path.display());
+            assert!(matches!(
+                startup_database_self_heal_action(&db_url, &root).unwrap(),
+                StartupDatabaseSelfHealAction::None(_)
+            ));
+            let empty_project = root.join("projects/empty-project");
+            std::fs::create_dir_all(&empty_project).unwrap();
+            std::fs::write(
+                empty_project.join("project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "slug": "empty-project",
+                    "human_key": project_key.with_file_name("startup-delta-empty-project"),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if include_message {
+                write_archive_mailbox_message(
+                    &message_dir,
+                    "2026-03-22T12-00-00Z__archive-ahead__1.md",
+                    1,
+                    "Alice",
+                    "Archive ahead",
+                    "normal",
+                    "2026-03-22T12:00:00Z",
+                    "missing message alongside an empty project",
+                );
+            }
+            for _ in 0..2 {
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    &root,
+                    || panic!("healthy archive delta must not repair"),
+                    |_| panic!("small archive delta must not reconstruct"),
+                )
+                .expect("startup applies the delta and then converges");
+            }
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT id FROM projects WHERE slug = 'empty-project'", &[])
+                    .unwrap()
+                    .len(),
+                // Metadata-only drift is deliberately hygiene debt at startup
+                // (GH217). A message delta must also import the empty project
+                // in the same transaction (GH284), without full reconstruction.
+                usize::from(include_message)
+            );
+            assert_eq!(
+                conn.query_sync("SELECT id FROM messages WHERE id = 1", &[])
+                    .unwrap()
+                    .len(),
+                usize::from(include_message)
+            );
+        }
+    }
+
+    #[test]
     fn startup_database_self_heal_dispatches_reconstruct_for_missing_db_with_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_archive_mailbox_project(dir.path());
@@ -60035,6 +61173,93 @@ startup_timeout_sec = 42
                 continue; // SQLite reader bookkeeping may move a read mark (br-00gl8)
             }
             assert_eq!(&family_after[name], bytes, "{name} must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn doctor_read_only_strategy_matches_checkpointed_committed_wal() {
+        let writer_dir = tempfile::tempdir().expect("writer directory");
+        let hot_dir = tempfile::tempdir().expect("hot family directory");
+        let settled_dir = tempfile::tempdir().expect("checkpointed family directory");
+        let stale_dir = tempfile::tempdir().expect("main-only control directory");
+        let writer_path = writer_dir.path().join("storage.sqlite3");
+        let hot_path = hot_dir.path().join("storage.sqlite3");
+        let settled_path = settled_dir.path().join("storage.sqlite3");
+        let stale_path = stale_dir.path().join("storage.sqlite3");
+        seed_project_only_db(&writer_path, "wal-strategy", "/wal-strategy");
+        {
+            let writer =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(writer_path.display().to_string())
+                    .expect("open private canonical writer");
+            writer
+                .execute_raw(
+                    "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; \
+                     ALTER TABLE agents RENAME TO agents_before_wal; \
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .expect("checkpoint a deliberately incomplete schema");
+            writer
+                .execute_raw(
+                    "ALTER TABLE agents_before_wal RENAME TO agents; \
+                     INSERT INTO projects (id, slug, human_key, created_at) \
+                     VALUES (2, 'wal-only', '/wal-only', 0);",
+                )
+                .expect("commit the schema repair and a row only in WAL");
+            for suffix in ["", "-wal"] {
+                std::fs::copy(
+                    sqlite_sidecar_path(&writer_path, suffix),
+                    sqlite_sidecar_path(&hot_path, suffix),
+                )
+                .expect("retain the committed family without checkpointing");
+            }
+        }
+        std::fs::copy(&writer_path, &settled_path).expect("copy the checkpointed equivalent");
+        std::fs::copy(&hot_path, &stale_path).expect("copy main-only negative control");
+        let stale = mcp_agent_mail_db::CanonicalDbConn::open_file(stale_path.display().to_string())
+            .expect("open independent main-only control");
+        assert!(
+            doctor_required_tables_canonical(&stale)
+                .expect("inspect stale schema")
+                .iter()
+                .any(|name| name == "agents"),
+            "ignoring WAL must lose a table required by the strategy"
+        );
+        let stale_rows = stale
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .expect("read main-only row control");
+        assert_eq!(stale_rows[0].get_named::<i64>("count").expect("count"), 1);
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&hot_path, "-wal"))
+                .expect("committed WAL exists")
+                .len()
+                > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+        );
+
+        for path in [&hot_path, &settled_path] {
+            let root = path.parent().expect("fixture directory");
+            let before = sqlite_family_bytes_for_cli_open_test(path);
+            let names_before = directory_entry_names_for_cli_open_test(root);
+            let url = format!("sqlite:///{}", path.display());
+            let opened = open_db_for_doctor_check_read_only_with_context(&url)
+                .expect("open diagnostic family");
+            let rows = opened
+                .conn
+                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .expect("read committed rows");
+            assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 2);
+            drop(opened);
+            for strategy in [
+                doctor_database_fix_strategy_read_only(&url, root),
+                doctor_database_fix_strategy_for_fix(true, &url, root),
+            ] {
+                let strategy = strategy.expect("read-only strategy");
+                assert!(
+                    matches!(strategy, DoctorDatabaseFixStrategy::None(_)),
+                    "committed WAL and its checkpointed equivalent must both be healthy: {strategy:?}"
+                );
+            }
+            assert_eq!(sqlite_family_bytes_for_cli_open_test(path), before);
+            assert_eq!(directory_entry_names_for_cli_open_test(root), names_before);
         }
     }
 
@@ -62253,6 +63478,74 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn db_covers_archive_cheap_probe_only_when_every_signal_agrees() {
+        // br-kp1in.18: the canonical-read resolver and the robot lag gate skip
+        // the per-message archive parse only on this predicate.
+        let identity = DoctorProjectIdentity {
+            slug: Some("demo".to_string()),
+            human_key: Some("/tmp/demo".to_string()),
+        };
+        let probe = DoctorArchiveCheapProbe {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 2,
+                messages: 10,
+            },
+            latest_message_id: Some(10),
+            project_identities: std::collections::BTreeSet::from([identity.clone()]),
+            ambiguous: false,
+        };
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 2,
+                messages: 12,
+            },
+            max_message_id: 12,
+            project_identities: std::collections::BTreeSet::from([identity]),
+        };
+        assert!(doctor_db_covers_archive_cheap_probe(&probe, &db));
+
+        let ambiguous = DoctorArchiveCheapProbe {
+            ambiguous: true,
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(&ambiguous, &db));
+        let newer_archive_id = DoctorArchiveCheapProbe {
+            latest_message_id: Some(13),
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &newer_archive_id,
+            &db
+        ));
+        let more_archive_files = DoctorArchiveCheapProbe {
+            counts: DoctorInventoryCounts {
+                messages: 13,
+                ..probe.counts.clone()
+            },
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &more_archive_files,
+            &db
+        ));
+        let foreign_project = DoctorArchiveCheapProbe {
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("other".to_string()),
+                human_key: Some("/tmp/other".to_string()),
+            }]),
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(&foreign_project, &db));
+        let empty_db = DoctorDbInventory::default();
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &DoctorArchiveCheapProbe::default(),
+            &empty_db
+        ));
+    }
+
+    #[test]
     fn collect_doctor_archive_cheap_probe_flags_unparsable_canonical_filename_as_ambiguous() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("projects").join("demo-project");
@@ -64018,6 +65311,10 @@ startup_timeout_sec = 42
                 status: "warn",
                 detail: "No listener PID sample available for 127.0.0.1:8765".to_string(),
             },
+            descriptor_check: DoctorFixCheck {
+                status: "warn",
+                detail: "No listener PID available to sample descriptor headroom".to_string(),
+            },
             restart_recommended: false,
         };
 
@@ -64798,6 +66095,88 @@ startup_timeout_sec = 42
                 assert_eq!(ids, vec![10, 20]);
             }
             other => panic!("expected Release, got {other:?}"),
+        }
+    }
+
+    /// GH#329: `--paths a b` / `--ids 1 2` used to fail argv parsing, so a caller
+    /// that believed it released several holds released nothing.
+    #[test]
+    fn clap_parses_file_reservations_release_multi_value_forms() {
+        let parse = |args: &[&str]| -> (Vec<String>, Vec<i64>) {
+            let mut argv = vec!["am", "file_reservations", "release", "proj", "BlueLake"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv)
+                .unwrap_or_else(|err| panic!("{args:?} must parse: {err}"))
+                .command
+                .expect("expected command")
+            {
+                Commands::FileReservations {
+                    action: FileReservationsCommand::Release { paths, ids, .. },
+                } => (paths, ids),
+                other => panic!("expected Release, got {other:?}"),
+            }
+        };
+
+        assert_eq!(parse(&["--paths", "a", "b"]).0, vec!["a", "b"]);
+        assert_eq!(parse(&["--paths", "a", "--paths", "b"]).0, vec!["a", "b"]);
+        assert_eq!(parse(&["--ids", "1", "2"]).1, vec![1, 2]);
+        assert_eq!(parse(&["--ids", "1,2", "3"]).1, vec![1, 2, 3]);
+        assert_eq!(parse(&["--ids", "1", "--ids", "2"]).1, vec![1, 2]);
+        let (paths, ids) = parse(&["--paths", "x/**", "y.rs", "--ids", "7", "8"]);
+        assert_eq!(paths, vec!["x/**", "y.rs"]);
+        assert_eq!(ids, vec![7, 8]);
+        // Brace-alternation globs contain commas; paths must never be split on them.
+        assert_eq!(parse(&["--paths", "src/{a,b}/**"]).0, vec!["src/{a,b}/**"]);
+
+        // Negative: a non-numeric id is still a usage error, never a silent no-op.
+        assert!(
+            Cli::try_parse_from([
+                "am",
+                "file_reservations",
+                "release",
+                "proj",
+                "BlueLake",
+                "--ids",
+                "1",
+                "two"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_renew_multi_value_forms() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "renew",
+            "proj",
+            "BlueLake",
+            "--paths",
+            "a",
+            "b",
+            "--ids",
+            "4,5",
+            "6",
+            "--extend-seconds",
+            "900",
+        ])
+        .expect("multi-value renew must parse");
+        match cli.command.expect("expected command") {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Renew {
+                        extend_seconds,
+                        paths,
+                        ids,
+                        ..
+                    },
+            } => {
+                assert_eq!(paths, vec!["a", "b"]);
+                assert_eq!(ids, vec![4, 5, 6]);
+                assert_eq!(extend_seconds, 900);
+            }
+            other => panic!("expected Renew, got {other:?}"),
         }
     }
 
@@ -67511,6 +68890,33 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn br_issue_summary_items_handles_list_envelope_and_ready_array() {
+        let rows = serde_json::json!([{
+            "id": "selected-123",
+            "title": "selected issue",
+            "status": "open",
+            "priority": 2,
+            "issue_type": "bug",
+            "labels": ["release"]
+        }]);
+        let expected = vec![serde_json::json!({
+            "id": "selected-123",
+            "title": "selected issue",
+            "status": "open",
+            "priority": "P2",
+            "type": "bug",
+            "labels": ["release"]
+        })];
+        assert_eq!(br_issue_summary_items(&rows), expected);
+        assert_eq!(
+            br_issue_summary_items(&serde_json::json!({"issues": rows, "total": 1})),
+            expected
+        );
+        assert!(br_issue_summary_items(&serde_json::json!([])).is_empty());
+        assert!(br_issue_summary_items(&serde_json::json!({"issues": [], "total": 0})).is_empty());
+    }
+
+    #[test]
     fn br_json_command_pins_the_validated_beads_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let beads_dir = dir.path().join("_beads");
@@ -67527,7 +68933,54 @@ startup_timeout_sec = 42
             Some(beads_dir.as_os_str())
         );
         assert_eq!(env.get(OsStr::new("BD_DB")), Some(&None));
+        assert_eq!(env.get(OsStr::new("BEADS_DB")), Some(&None));
         assert_eq!(env.get(OsStr::new("BD_DATABASE")), Some(&None));
+    }
+
+    #[test]
+    fn br_json_command_ignores_inherited_foreign_database() {
+        const CHILD_ROOT: &str = "AM_TEST_BR_AUTHORITY_ROOT";
+        const WITNESS: &str = "validated Beads workspace retained";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let foreign_db = root.join("foreign/.beads/beads.db");
+            assert_eq!(std::env::var_os("BEADS_DB"), Some(foreign_db.into()));
+            let result = run_br_json(&root.join("selected/.beads"), &["list".to_string()])
+                .expect("query selected real database");
+            let issues = br_issue_summary_items(&result);
+            assert_eq!(issues.len(), 1, "unexpected database contents: {result}");
+            assert_eq!(issues[0]["title"], "selected-workspace-issue");
+            println!("{WITNESS}");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("isolated Beads workspaces");
+        for (name, title) in [
+            ("selected", "selected-workspace-issue"),
+            ("foreign", "foreign-workspace-issue"),
+        ] {
+            let beads_dir = root.path().join(name).join(".beads");
+            std::fs::create_dir_all(&beads_dir).expect("create private workspace");
+            run_beads_fixture_command(&beads_dir, &["init", "--prefix", name]);
+            run_beads_fixture_command(&beads_dir, &["create", title, "--type", "bug"]);
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::br_json_command_ignores_inherited_foreign_database",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .env("BEADS_DB", root.path().join("foreign/.beads/beads.db"))
+            .output()
+            .expect("run isolated authority probe");
+        assert!(
+            output.status.success(),
+            "authority probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(WITNESS));
     }
 
     #[cfg(unix)]
@@ -68941,6 +70394,322 @@ startup_timeout_sec = 42
             released.is_some(),
             "released_ts must be set after overlap release"
         );
+    }
+
+    #[test]
+    fn integration_file_reservations_release_reports_ids_that_released_nothing() {
+        // br-kp1in.24 / GH#329: `--ids 1 999999` used to print only
+        // "Released 1 reservation(s)", hiding that 999999 released nothing.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let release = |ids: Vec<i64>| {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.sqlite3");
+            drop(seed_acks_and_reservations_db(&db_path));
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Release {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    paths: vec![],
+                    ids,
+                },
+            );
+            let output = capture.drain_to_string();
+            assert!(result.is_ok(), "release failed: {result:?}");
+            output
+        };
+
+        // A duplicate of a released id is not an extra miss. The output names
+        // the id that was released and the one that released nothing.
+        let output = release(vec![1, 999_999, 1]);
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(output.contains(": id(s) 1."), "{output}");
+        assert!(
+            output.contains("Reservation id(s) 999999 released nothing"),
+            "{output}"
+        );
+
+        let output = release(vec![1]);
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(output.contains(": id(s) 1."), "{output}");
+        assert!(!output.contains("released nothing"), "{output}");
+
+        // Only an unknown id: nothing released, so no id list, and the miss is named.
+        let output = release(vec![999_999]);
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        assert!(!output.contains("id(s) 1"), "{output}");
+        assert!(
+            output.contains("Reservation id(s) 999999 released nothing"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_renew_names_ids_that_renewed_nothing() {
+        // br-kp1in.24 / GH#329, renew side.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let renew = |ids: Vec<i64>| {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.sqlite3");
+            drop(seed_acks_and_reservations_db(&db_path));
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Renew {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    extend_seconds: 600,
+                    paths: vec![],
+                    ids,
+                },
+            );
+            let output = capture.drain_to_string();
+            assert!(result.is_ok(), "renew failed: {result:?}");
+            output
+        };
+
+        let output = renew(vec![1, 424_242]);
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(
+            output.contains("Reservation id(s) 424242 renewed nothing"),
+            "{output}"
+        );
+
+        let output = renew(vec![1]);
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(!output.contains("renewed nothing"), "{output}");
+    }
+
+    #[test]
+    fn split_reservation_path_on_top_level_commas_keeps_glob_syntax_whole() {
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/a.rs,src/b.rs"),
+            ["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas(" src/a.rs , ,src/b.rs,"),
+            ["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/{a,b}.rs,lib/{x,{y,z}}/*.rs"),
+            ["src/{a,b}.rs", "lib/{x,{y,z}}/*.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/[a,b].rs,c.rs"),
+            ["src/[a,b].rs", "c.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/{a,b}.rs"),
+            ["src/{a,b}.rs"]
+        );
+    }
+
+    #[test]
+    fn file_reservations_split_paths_retry_only_when_it_changes_the_restriction() {
+        let release = |paths: &[&str]| FileReservationsCommand::Release {
+            project: "p".to_string(),
+            agent: "BlueLake".to_string(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            ids: vec![],
+        };
+        // No top-level comma: nothing to retry.
+        assert!(file_reservations_action_with_split_paths(&release(&["src/{a,b}.rs"])).is_none());
+        assert!(file_reservations_action_with_split_paths(&release(&[])).is_none());
+        // Whitespace alone is literal data, not a list.
+        assert!(file_reservations_action_with_split_paths(&release(&[" spaced.rs "])).is_none());
+        // Only separators: splitting must never widen into an unrestricted release.
+        assert!(file_reservations_action_with_split_paths(&release(&[",", " , "])).is_none());
+        match file_reservations_action_with_split_paths(&release(&["a.rs,b.rs", "b.rs"])) {
+            Some(FileReservationsCommand::Release { paths, .. }) => {
+                assert_eq!(paths, ["a.rs", "b.rs"]);
+            }
+            other => panic!("expected split release, got {other:?}"),
+        }
+        let renew = FileReservationsCommand::Renew {
+            project: "p".to_string(),
+            agent: "BlueLake".to_string(),
+            extend_seconds: 600,
+            paths: vec!["a.rs,b.rs".to_string()],
+            ids: vec![7],
+        };
+        match file_reservations_action_with_split_paths(&renew) {
+            Some(FileReservationsCommand::Renew {
+                paths,
+                ids,
+                extend_seconds,
+                ..
+            }) => {
+                assert_eq!(paths, ["a.rs", "b.rs"]);
+                assert_eq!(ids, [7]);
+                assert_eq!(extend_seconds, 600);
+            }
+            other => panic!("expected split renew, got {other:?}"),
+        }
+    }
+
+    fn fixture_blue_lake_active_reservations(db_path: &Path) -> i64 {
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.query_sync(
+            "SELECT COUNT(*) AS n FROM file_reservations \
+             WHERE project_id = 1 AND agent_id = 1 AND released_ts IS NULL",
+            &[],
+        )
+        .unwrap()
+        .first()
+        .and_then(|row| row.get_named("n").ok())
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn integration_file_reservations_comma_list_paths_release_and_renew_what_was_meant() {
+        // GH#329: `--paths "a,b"` was matched as ONE literal pattern, printed
+        // "Released 0", and left every hold in place.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Renew: the literal value matches nothing, the split parts renew id 1.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        drop(seed_acks_and_reservations_db(&db_path));
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 600,
+                paths: vec!["docs/not-held.md, src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        assert!(result.is_ok(), "comma-list renew failed: {result:?}");
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(
+            output.contains("retrying with the comma-separated parts"),
+            "{output}"
+        );
+
+        // Release: same shape, and the hold is really gone afterwards.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/not-held.md,src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "comma-list release failed: {result:?}");
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(!output.contains("Nothing was released"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 0);
+    }
+
+    #[test]
+    fn integration_file_reservations_literal_comma_path_is_matched_first() {
+        // A comma can be part of a real file name; the literal value wins and
+        // no split retry happens when it matches.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("docs/a,b.md".to_string())],
+        )
+        .unwrap();
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/a,b.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "literal comma release failed: {result:?}");
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(!output.contains("retrying"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 0);
+    }
+
+    #[test]
+    fn integration_file_reservations_path_restriction_matching_nothing_warns_and_exits_ok() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        drop(seed_acks_and_reservations_db(&db_path));
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let release = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/not-held.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let renew = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 600,
+                paths: vec!["docs/not-held.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        // Idempotent no-op contract: success exit, "Released 0" kept ...
+        assert!(release.is_ok() && renew.is_ok(), "{release:?} {renew:?}");
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        // ... but the restriction that matched nothing is named.
+        assert!(
+            output.contains("Nothing was released")
+                && output.contains("Nothing was renewed")
+                && output.contains("--paths docs/not-held.md"),
+            "{output}"
+        );
+        assert!(!output.contains("retrying"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 1);
+
+        // An unrestricted release that finds nothing stays quiet.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        for _ in 0..2 {
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Release {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    paths: vec![],
+                    ids: vec![],
+                },
+            );
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let output = capture.drain_to_string();
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        assert!(!output.contains("Nothing was released"), "{output}");
     }
 
     #[test]
@@ -72968,6 +74737,7 @@ startup_timeout_sec = 42
                 "server_http_health",
                 "server_jsonrpc_health",
                 "server_process_cpu",
+                "server_descriptors",
             ] {
                 assert!(
                     checks.iter().any(|c| c["check"].as_str() == Some(check)),
@@ -77489,7 +79259,8 @@ impl VerifyLane {
                 "-p",
                 "mcp-agent-mail-cli",
                 "--test",
-                "reliability_coverage_ci",
+                "it",
+                "reliability_coverage_ci::",
             ],
         }
         .into_iter()
@@ -86144,10 +87915,9 @@ async fn post_jsonrpc_request(
             .map(|(name, value)| (name.to_string(), value)),
     );
 
-    // Production request-scoped Cx, not the test-only `Cx::for_testing()`
-    // constructor — matching every other production call site in this crate
-    // (and the asupersync guidance that `for_testing` is harness material).
-    let cx = asupersync::Cx::for_request();
+    // Production request-scoped Cx minted from the running runtime (asupersync
+    // 0.5 makes both `Cx::for_testing()` and `Cx::for_request()` test-only).
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let request =
         Box::pin(products_http_client().request(&cx, Method::Post, server_url, headers, body));
     let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
@@ -87164,7 +88934,10 @@ async fn call_send_message_tool_locally(
     topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
-    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let ctx = McpContext::new(
+        mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+        1,
+    );
     let payload = mcp_agent_mail_tools::messaging::send_message(
         &ctx,
         project_key.to_string(),
@@ -87197,7 +88970,10 @@ async fn call_reply_message_tool_locally(
     body: &str,
     to_names: Option<&[String]>,
 ) -> CliResult<serde_json::Value> {
-    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let ctx = McpContext::new(
+        mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+        1,
+    );
     let payload = mcp_agent_mail_tools::messaging::reply_message(
         &ctx,
         project_key.to_string(),
@@ -87594,7 +89370,7 @@ async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let server_url = local_server_url(&config);
     let bearer = config.http_bearer_token.as_deref();
 
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let canonical_read_pool;
     let live_pool;
     let pool = match classify_products_pool_mode(&action) {
@@ -88971,7 +90747,7 @@ async fn apply_agent_start_fix(report: &AgentStartReport) -> CliResult<AgentStar
 
     reject_local_registration_if_proof_gate_enabled("agent-start --fix")?;
     let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let project = resolve_project_async(&cx, &ctx.pool, &report.project.key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = outcome_to_result(
@@ -89097,10 +90873,11 @@ fn non_empty_arg(value: Option<String>) -> Option<String> {
     value.filter(|raw| !raw.trim().is_empty())
 }
 
+/// Process environment only (a project `.env` must not name the agent: every
+/// agent in that directory would get the same identity), read through the
+/// config layer so explicit overrides, including an empty one, win (br-3w116).
 fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|raw| !raw.trim().is_empty())
+    mcp_agent_mail_core::config::process_env_value(name).filter(|raw| !raw.trim().is_empty())
 }
 
 fn scoped_agent_command(
@@ -91004,10 +92781,10 @@ fn handle_tooling_db_init(db: PathBuf, storage_root: PathBuf, json_mode: bool) -
     })
     .map_err(|err| CliError::Other(format!("cannot create DB pool: {err}")))?;
 
-    let cx = asupersync::Cx::for_request();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|err| CliError::Other(format!("failed to build runtime: {err}")))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     match runtime.block_on(async { pool.acquire(&cx).await }) {
         asupersync::Outcome::Ok(conn) => drop(conn),
@@ -92837,8 +94614,13 @@ fn seed_malformed_btree_db(db_path: &Path) {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
             .expect("open canonical db for malformed fixture");
         // Bulk-load enough sizable rows to force a multi-page table B-tree, so
-        // corrupting pages 2+ reliably reaches populated data pages.
+        // corrupting pages 2+ reliably reaches populated data pages. One
+        // transaction: 1,500 autocommit inserts each synced the rollback
+        // journal, ~55 s per fixture alone and past the 240 s kill under gate
+        // load (br-t31jg item 6).
         let filler = "x".repeat(600);
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .expect("begin malformed fixture bulk load");
         for i in 1..=1500i64 {
             conn.query_sync(
                 "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
@@ -92851,6 +94633,8 @@ fn seed_malformed_btree_db(db_path: &Path) {
             )
             .expect("insert filler row for malformed fixture");
         }
+        conn.execute_raw("COMMIT")
+            .expect("commit malformed fixture bulk load");
         conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint malformed fixture db");
     }

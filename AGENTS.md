@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -79,13 +101,13 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp-rust` (`0.7.1`, immutable Git backport `c14d26b4`; imported as `fastmcp`) | MCP protocol implementation; full family pinned for legacy stdio version negotiation while retaining Asupersync 0.4.9 |
-| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`, Git revision `2633b38a26bde68db23172b12aa402ed698cc309`, tag `am-sql-compat-20260916`) is the runtime `DbConn`; the pin includes the Windows namespace identity fix |
-| `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
-| `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
-| `frankensearch` (`0.4`, path dep `../frankensearch-rel-0332`, a gated clone at dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Never point this at a live checkout: the live tree already moved to asupersync 0.4.10, which fastmcp cannot follow yet |
-| `beads_rust` (`=0.5.4`) | Issue tracking integration |
+| `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `db458bfba780e79d099d9f8986da5a1f7b360901` for SQL binding, schema-prefix, NOCASE, INSERT SELECT UPSERT, and Linux descriptor-retention repairs. Embedded Beads still uses a separate patched 0.3.18 engine |
+| `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
+| `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
+| `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
+| `beads_rust` (`=0.6.0`, default features disabled) | Issue tracking integration; separate patched FrankenSQLite 0.3.18 engine |
 | `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |
@@ -158,6 +180,12 @@ We do not care about backwards compatibility—we're in early development with n
 ```bash
 # Check for compiler errors and warnings (workspace-wide)
 cargo check --workspace --all-targets
+
+# Check the PRODUCTION feature graph (no dev-dependencies). `--all-targets`
+# unifies dev-only features (e.g. asupersync `test-internals`) into the
+# library build and can hide code that does not compile for release/install
+# builds (br-kp1in.31: main was unshippable for 6 days with every gate green).
+cargo check --workspace --lib --bins
 
 # Check for clippy lints (pedantic + nursery are enabled)
 cargo clippy --workspace --all-targets -- -D warnings
@@ -642,7 +670,7 @@ All configuration via environment variables. Key variables:
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` (legacy URL form, accepted and normalized; resolves to `./storage.sqlite3` relative to the working directory) | SQLite connection URL |
+| `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` (the legacy `sqlite+aiosqlite:///./storage.sqlite3` default is re-derived inside `STORAGE_ROOT`; explicit relative paths resolve against the working directory) | SQLite connection URL |
 | `STORAGE_ROOT` | XDG-aware (legacy fallback to `~/.mcp_agent_mail_git_mailbox_repo`) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer an isolated `STORAGE_ROOT` for test/repro runs. |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
