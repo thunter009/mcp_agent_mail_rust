@@ -1533,7 +1533,9 @@ impl MailScreen for ThreadExplorerScreen {
                 state.clear_keyboard_move_snapshot();
                 return Cmd::None;
             }
-            if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
+            // Ctrl+X cuts (marks) and Ctrl+V pastes (moves). Not Ctrl+M:
+            // terminals send it as the same byte as Enter.
+            if key.code == KeyCode::Char('x') && key.modifiers.contains(Modifiers::CTRL) {
                 self.mark_selected_message_for_keyboard_move(state);
                 return Cmd::None;
             }
@@ -1631,8 +1633,8 @@ impl MailScreen for ThreadExplorerScreen {
                         KeyCode::Char('v') => {
                             self.view_lens = self.view_lens.next();
                         }
-                        // Clear filter
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear filter (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.filter_text.clear();
                             self.list_dirty = true;
                         }
@@ -2189,8 +2191,8 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Drag message to thread row",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to selected thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into selected thread",
             },
             HelpEntry {
                 key: "Left/Right",
@@ -2225,7 +2227,7 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Filter threads",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear filter",
             },
             HelpEntry {
@@ -2438,6 +2440,7 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
     let sender_name_map = agent_names_by_id(conn, &agent_ids);
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
     let participant_names_map = participant_names_by_thread(conn, &thread_ids, &sender_name_map);
+    let unread_map = unread_counts_by_thread(conn, &thread_ids);
 
     rows.into_iter()
         .map(|row| {
@@ -2495,10 +2498,39 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 velocity_msg_per_hr: velocity,
                 participant_names,
                 first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
-                unread_count: 0,
+                unread_count: unread_map.get(&row.thread_id).copied().unwrap_or(0),
             }
         })
         .collect()
+}
+
+/// Messages in each thread that at least one recipient has not read yet.
+fn unread_counts_by_thread(conn: &DbConn, thread_ids: &[String]) -> HashMap<String, usize> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; thread_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT m.thread_id AS thread_id, COUNT(DISTINCT m.id) AS unread \
+         FROM messages m \
+         JOIN message_recipients r ON r.message_id = m.id \
+         WHERE m.thread_id IN ({placeholders}) AND r.read_ts IS NULL \
+         GROUP BY m.thread_id"
+    );
+    let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let thread_id = row.get_named::<String>("thread_id").ok()?;
+                    let unread = row.get_named::<i64>("unread").ok()?;
+                    Some((thread_id, usize::try_from(unread).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn latest_thread_meta_by_thread(
@@ -4791,14 +4823,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_marks_selected_detail_message_for_keyboard_move() {
+    fn capital_x_clears_the_filter_from_the_list_but_types_while_editing() {
+        let mut screen = ThreadExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let key = |c| Event::Key(ftui::KeyEvent::new(KeyCode::Char(c)));
+        // While the filter is being edited, X is text.
+        for c in ['/', 'a', 'X'] {
+            let _ = screen.update(&key(c), &state);
+        }
+        assert_eq!(screen.filter_text, "aX");
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(!screen.filter_editing);
+        // From the list X clears it (Ctrl+C never reaches a screen).
+        screen.list_dirty = false;
+        let _ = screen.update(&key('X'), &state);
+        assert_eq!(screen.filter_text, "");
+        assert!(screen.list_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_detail_message_for_keyboard_move() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
         screen.detail_messages.push(make_message(77));
         screen.focus = Focus::DetailPanel;
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()
@@ -5871,6 +5922,37 @@ mod tests {
         }
 
         conn
+    }
+
+    #[test]
+    fn unread_counts_count_messages_some_recipient_has_not_read() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL)")
+            .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+               message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts INTEGER\
+             )",
+        )
+        .expect("create recipients");
+        // t1: message 1 unread by two of three recipients, message 2 read by
+        // all; t2: everything read; t3 is not asked for.
+        conn.execute_raw(
+            "INSERT INTO messages (id, thread_id) VALUES (1, 't1'), (2, 't1'), (3, 't2'), (4, 't3');
+             INSERT INTO message_recipients (message_id, agent_id, read_ts) VALUES
+                (1, 2, NULL), (1, 3, 100), (1, 4, NULL), (2, 2, 100), (3, 2, 100), (4, 2, NULL);",
+        )
+        .expect("seed rows");
+
+        let counts = unread_counts_by_thread(&conn, &["t1".to_string(), "t2".to_string()]);
+        assert_eq!(
+            counts.get("t1"),
+            Some(&1),
+            "two unread copies of one message count once"
+        );
+        assert_eq!(counts.get("t2"), None);
+        assert_eq!(counts.get("t3"), None, "only the requested threads");
+        assert!(unread_counts_by_thread(&conn, &[]).is_empty());
     }
 
     #[test]

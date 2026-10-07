@@ -140,12 +140,12 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 
 ### 3.3 High-Signal Screen Keys
 
-- Messages: `g` toggles Local/Global inbox mode; `c` opens compose; `Ctrl+M` marks read; `Ctrl+V` drops to thread.
+- Messages / Threads: `Ctrl+X` cuts the selected message and `Ctrl+V` pastes it into the selected thread (Esc cancels); `X` clears the search/filter. Messages: `g` toggles Local/Global inbox mode; `c` opens compose.
 - Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch.
 - Timeline: `V` cycles Events/Commits/Combined/Log; lowercase `v` toggles visual selection mode.
 - Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
-- Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
-- Reservations: `n` opens create-reservation form.
+- Contacts: `n` cycles Table/Graph/Matrix (sender × recipient heatmap of recent message flow); `g` toggles Mermaid panel.
+- Reservations: `n` opens create-reservation form. "View reservations" on an agent narrows the table to that agent; `X` shows every agent again.
 - ATC: `d` opens decision detail; `r` opens the retention report.
 
 ## 4. Screens Reference
