@@ -27,7 +27,12 @@ use std::time::UNIX_EPOCH;
 mod namespace;
 
 #[cfg(unix)]
-pub use namespace::{CompletedReclaimMove, ReclaimDirectory};
+pub use namespace::{
+    CompletedReclaimDelete, CompletedReclaimMove, ReclaimDirectory, ReclaimedFileBytes,
+};
+
+#[cfg(unix)]
+pub(crate) use namespace::{delete_inventoried_file, preflight_inventoried_file_readers};
 
 #[cfg(all(test, unix))]
 use namespace::{
@@ -43,7 +48,8 @@ pub enum DebrisCategory {
     /// a full copy of the DB + sidecars, so they are large).
     ForensicBundle,
     /// A quarantined corrupt DB / sidecar sibling of the live database, e.g.
-    /// `storage.sqlite3.corrupt-<ts>` or `storage.sqlite3-wal.reconstruct-failed-<ts>`.
+    /// `storage.sqlite3.corrupt-<ts>`, `storage.sqlite3.corrupt<N>`, or
+    /// `storage.sqlite3-wal.reconstruct-failed-<ts>`.
     CorruptQuarantine,
     /// A direct `storage.sqlite3.archive-reconcile-<ts>` incident snapshot.
     /// These are also known to server-side `backup_rotation`, but reclaim
@@ -243,7 +249,7 @@ pub fn select_recovery_debris_to_reclaim(
 /// Enumerate all recovery debris under `storage_root` / next to `db_path`.
 ///
 /// Combines forensic bundles (`doctor/forensics/.../`) with quarantine siblings
-/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`), archive-reconcile incident
+/// (`<db>.corrupt-*`, `<db>.corrupt<N>`, `<db>.reconstruct-failed-*`), archive-reconcile incident
 /// snapshots (`<db>.archive-reconcile-*`), startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
 /// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`), and
 /// `.stale`-marked artifacts (`<db>*.stale`, `<db>*.stale-*`, `<db>*.stale.*`).
@@ -312,6 +318,15 @@ pub fn enumerate_forensic_bundles(storage_root: &Path) -> Vec<DebrisArtifact> {
     out
 }
 
+/// Recognize the complete legacy `corrupt<N>` suffix (br-kp1in.36).
+/// Callers must first establish the exact database/companion namespace. Do
+/// not accept a bare `corrupt`, appended metadata, or Unicode digit lookalikes.
+fn is_numbered_corrupt_suffix(suffix: &[u8]) -> bool {
+    suffix
+        .strip_prefix(b"corrupt")
+        .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.iter().all(u8::is_ascii_digit))
+}
+
 /// Classify only an artifact suffix of this exact configured database family.
 ///
 /// Recovery words in the database basename carry no ownership information:
@@ -350,7 +365,10 @@ fn classify_recovery_debris_file(
         if has_payload(b"archive-reconcile-") {
             return Some(DebrisCategory::ArchiveReconcileBackup);
         }
-        if has_payload(b"corrupt-") || has_payload(b"reconstruct-failed-") {
+        if has_payload(b"corrupt-")
+            || has_payload(b"reconstruct-failed-")
+            || is_numbered_corrupt_suffix(suffix)
+        {
             return Some(DebrisCategory::CorruptQuarantine);
         }
         if has_payload(b"startup-precheckpoint-") || has_payload(b"startup-quarantine-") {
@@ -466,7 +484,7 @@ pub fn is_stale_artifact_name(name: &str) -> bool {
 /// evict unrelated pre-migration backups, and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BackupKind {
-    /// `storage.sqlite3.corrupt-*` (plus -wal/-shm siblings)
+    /// `storage.sqlite3.corrupt-*` / `.corrupt<N>` (plus -wal/-shm siblings)
     Corrupt,
     /// `storage.sqlite3.reconstruct-failed-*` and `storage.sqlite3.reconstructing-*`
     Reconstruct,
@@ -550,7 +568,7 @@ pub fn classify_backup_file(
     if after_stem.starts_with("reconstruct-") || after_stem.starts_with("reconstructing-") {
         return Some(BackupKind::Reconstruct);
     }
-    if after_stem.starts_with("corrupt-") {
+    if after_stem.starts_with("corrupt-") || is_numbered_corrupt_suffix(suffix) {
         return Some(BackupKind::Corrupt);
     }
     if after_stem.starts_with("salvage-") {
@@ -624,36 +642,186 @@ pub fn inspect_storage_backups(database_path: &Path) -> std::io::Result<BackupIn
     Ok(inventory)
 }
 
+const PROACTIVE_STAGING_PREFIX: &[u8] = b".mcp-agent-mail-proactive-backup-";
+const MAX_STAGING_INVENTORY_ENTRIES: usize = 16_384;
+
+/// Read-only footprint of proactive-backup stages beside the database.
+///
+/// Stage names do not identify a mailbox. This intentionally covers the whole
+/// database parent, just like automatic backup admission. It includes active
+/// and failed stages; neither a name nor this inventory authorizes reclamation.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProactiveBackupStagingInventory {
+    pub directories: usize,
+    /// Logical regular-file lengths, not allocated blocks. Sparse files count
+    /// fully, matching the admission budget; no `SQLite` file is opened.
+    pub bytes: u64,
+}
+
+/// Inspect all staging-shaped directories beside the configured database.
+///
+/// Unlike admission's count-only early refusal, health needs the whole bounded
+/// footprint even when there are already more than three stages. Read failures,
+/// symlinks, special files, byte overflow, and an exhausted entry budget return
+/// unavailable evidence, never a successful empty or truncated inventory.
+/// Missing parents remain empty during first-run bootstrap. This is a live
+/// metadata observation, not a transactional snapshot or a hostile-user sandbox.
+pub fn inspect_proactive_backup_staging(
+    database_path: &Path,
+) -> std::io::Result<ProactiveBackupStagingInventory> {
+    inspect_proactive_backup_staging_with_limit(database_path, MAX_STAGING_INVENTORY_ENTRIES)
+}
+
+fn staging_inventory_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn inspect_proactive_backup_staging_with_limit(
+    database_path: &Path,
+    max_entries: usize,
+) -> std::io::Result<ProactiveBackupStagingInventory> {
+    if database_path.file_name().is_none() {
+        return Ok(ProactiveBackupStagingInventory::default());
+    }
+    // Freeze relative paths once; do not change the process working directory.
+    let primary = if database_path.is_absolute() {
+        database_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(database_path)
+    };
+    let parent = primary
+        .parent()
+        .ok_or_else(|| staging_inventory_error("staging inventory database has no parent"))?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(staging_inventory_error(
+                "staging inventory database parent is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProactiveBackupStagingInventory::default());
+        }
+        Err(error) => return Err(error),
+    }
+    let mut remaining = max_entries;
+    let mut visit = || -> std::io::Result<()> {
+        remaining = remaining.checked_sub(1).ok_or_else(|| {
+            staging_inventory_error("proactive backup staging inventory entry limit exceeded")
+        })?;
+        Ok(())
+    };
+    let mut inventory = ProactiveBackupStagingInventory::default();
+    let mut pending = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        visit()?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(PROACTIVE_STAGING_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            return Err(staging_inventory_error(format!(
+                "staging-shaped entry {} is not a real directory",
+                path.display()
+            )));
+        }
+        inventory.directories += 1; // Bounded by the entry budget.
+        pending.push(path);
+    }
+    while let Some(directory) = pending.pop() {
+        // Recheck before descent, as the admission inventory does. Never
+        // intentionally follow a substituted symlink into an unrelated tree.
+        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
+            return Err(staging_inventory_error(
+                "proactive backup staging directory changed type during inventory",
+            ));
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            visit()?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            } else if metadata.file_type().is_file() {
+                inventory.bytes = inventory.bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    staging_inventory_error("proactive backup staging byte count overflow")
+                })?;
+            } else {
+                return Err(staging_inventory_error(format!(
+                    "proactive backup staging entry {} is a symlink or special file; footprint unavailable",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(inventory)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
-// Combined retention resident footprint (GH#210).
+// Combined retention resident footprint (GH#210, br-kp1in.36).
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Read-only retention footprint for one mailbox.
+/// Read-only retention footprint for one mailbox and its shared staging parent.
 ///
 /// Combines recovery debris + direct backups (de-duplicated —
 /// archive-reconcile files are visible to both inventories) + move-only
-/// reclaim staging. This is the ONE implementation behind both
+/// reclaim staging + proactive-backup stages beside the configured database.
+/// This is the ONE implementation behind both
 /// `am doctor health`'s `retention_resident` line and the MCP `health_check`
-/// `retention` block.
+/// `retention` block. Proactive stages are observation-only, not reclaimable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionResidentStats {
     pub recovery_debris_artifacts: usize,
     pub direct_backup_only_artifacts: usize,
     pub reclaimable_staging_bytes: u64,
-    /// Total resident bytes: recovery debris + de-duplicated direct backups
-    /// + reclaim staging.
+    /// Total resident logical bytes, including parent-wide proactive stages.
     pub resident_bytes: u64,
     pub live_database_bytes: Option<u64>,
     /// Resident bytes per category label: the [`DebrisCategory::as_str`]
-    /// labels, plus `"direct_backup"` (rotation-eligible files not already
-    /// counted as recovery debris) and `"reclaimable_staging"`. Only nonzero
-    /// categories are present.
+    /// labels, plus `"direct_backup"`, `"reclaimable_staging"`, and the
+    /// parent-wide `"proactive_backup_staging"`. Only nonzero categories are
+    /// present. The latter may include another mailbox's stages when several
+    /// databases share one parent, since the stage names are not mailbox-bound.
     pub resident_bytes_by_category: BTreeMap<&'static str, u64>,
     /// Bytes the retention policy would consolidate right now (`0` when the
     /// caller passed no policy). Compared against the operator alert
     /// threshold, this is the "reclaimable attention" signal the integrity
-    /// guard's observe-and-alert sweep warns on.
+    /// guard's observe-and-alert sweep warns on. Proactive stages never enter
+    /// this value: observation is not authority to move an active export.
     pub reclaimable_bytes: u64,
+}
+
+impl RetentionResidentStats {
+    /// Existing policy-selected debris alarm. Zero explicitly disables it.
+    #[must_use]
+    pub const fn reclaimable_attention(&self, alert_bytes: u64) -> bool {
+        alert_bytes > 0 && self.reclaimable_bytes >= alert_bytes
+    }
+
+    /// Excess resident evidence needs attention even when none is movable
+    /// (br-kp1in.36). Require both the configured absolute floor and 20 times
+    /// the live database size, so ordinary backups of a large DB stay quiet.
+    ///
+    /// Missing/zero live size cannot establish a ratio. In that case use the
+    /// absolute floor conservatively; consumers still report the missing size.
+    /// Zero disables the alarm. Widen before multiplying: saturation at
+    /// `u64::MAX` would incorrectly alert for an unrepresentable 20x threshold.
+    /// This is an observation, never permission to delete or move evidence.
+    #[must_use]
+    pub fn resident_attention(&self, alert_bytes: u64) -> bool {
+        alert_bytes > 0
+            && self.resident_bytes >= alert_bytes
+            && self
+                .live_database_bytes
+                .filter(|bytes| *bytes > 0)
+                .is_none_or(|live| u128::from(self.resident_bytes) >= u128::from(live) * 20)
+    }
 }
 
 /// Compute the [`RetentionResidentStats`] for `storage_root` / `database_path`.
@@ -705,6 +873,10 @@ pub fn retention_resident_stats(
     if staging_bytes > 0 {
         resident_bytes_by_category.insert("reclaimable_staging", staging_bytes);
     }
+    let proactive_staging = inspect_proactive_backup_staging(database_path)?;
+    if proactive_staging.bytes > 0 {
+        resident_bytes_by_category.insert("proactive_backup_staging", proactive_staging.bytes);
+    }
 
     let reclaimable_bytes = reclaim_policy.map_or(0, |(policy, now_us)| {
         select_recovery_debris_to_reclaim(recovery_debris.clone(), policy, now_us).reclaimable_bytes
@@ -716,7 +888,8 @@ pub fn retention_resident_stats(
         reclaimable_staging_bytes: staging_bytes,
         resident_bytes: recovery_bytes
             .saturating_add(direct_backup_only_bytes)
-            .saturating_add(staging_bytes),
+            .saturating_add(staging_bytes)
+            .saturating_add(proactive_staging.bytes),
         live_database_bytes: std::fs::metadata(database_path)
             .ok()
             .map(|metadata| metadata.len()),
@@ -834,6 +1007,112 @@ mod tests {
     const HOUR_US: i64 = 3_600 * 1_000_000;
     const DAY_US: i64 = 24 * HOUR_US;
 
+    #[test]
+    fn resident_attention_requires_both_floor_and_exact_ratio() {
+        let mut stats = RetentionResidentStats {
+            live_database_bytes: Some(100),
+            ..Default::default()
+        };
+        for (resident, alert, expected) in [
+            (200, 100, false),
+            (1_999, 100, false),
+            (2_000, 100, true),
+            (2_500, 3_000, false),
+            (3_000, 3_000, true),
+            (2_500, 100, true),
+        ] {
+            stats.resident_bytes = resident;
+            assert_eq!(
+                stats.resident_attention(alert),
+                expected,
+                "{resident}/{alert}"
+            );
+            assert!(!stats.reclaimable_attention(alert));
+        }
+    }
+
+    #[test]
+    fn retention_alert_zero_disables_both_byte_alarms() {
+        let stats = RetentionResidentStats {
+            resident_bytes: u64::MAX,
+            reclaimable_bytes: u64::MAX,
+            live_database_bytes: Some(1),
+            ..Default::default()
+        };
+        assert!(!stats.resident_attention(0));
+        assert!(!stats.reclaimable_attention(0));
+    }
+
+    #[test]
+    fn resident_ratio_multiplication_does_not_saturate_into_a_false_alarm() {
+        let mut stats = RetentionResidentStats {
+            resident_bytes: u64::MAX,
+            live_database_bytes: Some(u64::MAX / 20 + 1),
+            ..Default::default()
+        };
+        assert!(!stats.resident_attention(1));
+        stats.live_database_bytes = Some(u64::MAX / 20);
+        assert!(stats.resident_attention(1));
+    }
+
+    #[test]
+    fn missing_live_size_uses_the_absolute_floor_without_inventing_a_ratio() {
+        for live_database_bytes in [None, Some(0)] {
+            let mut stats = RetentionResidentStats {
+                resident_bytes: 499,
+                live_database_bytes,
+                ..Default::default()
+            };
+            assert!(!stats.resident_attention(500));
+            stats.resident_bytes = 500;
+            assert!(stats.resident_attention(500));
+            assert_eq!(stats.live_database_bytes, live_database_bytes);
+        }
+    }
+
+    #[test]
+    fn reclaimable_alarm_does_not_require_a_large_resident_ratio() {
+        let stats = RetentionResidentStats {
+            resident_bytes: 2_000,
+            reclaimable_bytes: 500,
+            live_database_bytes: Some(1_000),
+            ..Default::default()
+        };
+        assert!(stats.reclaimable_attention(500));
+        assert!(!stats.reclaimable_attention(501));
+        assert!(!stats.resident_attention(500));
+    }
+
+    #[test]
+    fn resident_alarm_survives_move_only_stage_reclamation() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-retention-health");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(4_096)
+            .unwrap();
+        let before = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(before.resident_bytes, 4_096);
+        assert_eq!(before.reclaimable_bytes, 0);
+        assert!(before.resident_attention(512));
+        assert!(!before.reclaimable_attention(512));
+
+        // An explicit operator move removes the stage from admission, but
+        // does not free its bytes or justify an all-clear resident verdict.
+        let destination = root.join("doctor/reclaimable/health-test");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        let after = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 4_096);
+        assert!(after.resident_attention(512));
+        assert!(!after.reclaimable_attention(512));
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
     fn art(name: &str, bytes: u64, modified_us: i64, category: DebrisCategory) -> DebrisArtifact {
         DebrisArtifact {
             path: PathBuf::from(name),
@@ -841,6 +1120,194 @@ mod tests {
             modified_us,
             category,
         }
+    }
+
+    #[test]
+    fn numbered_quarantines_require_exact_ascii_ordinals_and_database_families() {
+        use std::ffi::OsStr;
+        for database in ["mail.db", "mail.corrupt1"] {
+            for companion in [
+                "",
+                "-wal",
+                "-shm",
+                "-journal",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                ".lock",
+            ] {
+                for ordinal in ["0", "1", "70", "18446744073709551615"] {
+                    let name = format!("{database}{companion}.corrupt{ordinal}");
+                    assert_eq!(
+                        classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                        Some(DebrisCategory::CorruptQuarantine),
+                        "{name}"
+                    );
+                    if matches!(companion, "" | "-wal" | "-shm") {
+                        assert_eq!(
+                            classify_backup_file(OsStr::new(database), OsStr::new(&name)),
+                            Some(BackupKind::Corrupt),
+                            "{name}"
+                        );
+                    }
+                }
+            }
+            for suffix in ["", "-wal", "-shm", ".lock", ".bak", ".bak.meta.json"] {
+                let name = format!("{database}{suffix}");
+                assert_eq!(
+                    classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                    None,
+                    "live family: {name}"
+                );
+            }
+        }
+        for name in [
+            "mail.db.corrupt",
+            "mail.db.corrupt1.meta.json",
+            "mail.db.corrupt1notes",
+            "mail.db.corrupt1.bak",
+            "mail.db.corrupt+1",
+            "mail.db.corrupt１",
+            "mail.db.corrupt١",
+            "mail.db.CORRUPT1",
+            "mail.db2.corrupt1",
+            "mail.db.notes.corrupt1",
+            "mail.db-wal2.corrupt1",
+            "mail.db.bak.corrupt1",
+        ] {
+            assert_eq!(
+                classify_recovery_debris_file(OsStr::new("mail.db"), OsStr::new(name)),
+                None,
+                "unowned or incomplete: {name}"
+            );
+            assert_eq!(
+                classify_backup_file(OsStr::new("mail.db"), OsStr::new(name)),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_quarantine_inventory_is_external_database_scoped_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let database_dir = root.path().join("database");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&database_dir).unwrap();
+        let primary = database_dir.join("mail.db");
+        std::fs::write(&primary, [0_u8; 7]).unwrap();
+        for (name, bytes) in [
+            ("mail.db.corrupt1", 11),
+            ("mail.db-wal.corrupt2", 13),
+            ("mail.db-shm.corrupt70", 17),
+            ("mail.db.bak", 19),
+            ("other.db.corrupt1", 23),
+            ("mail.db.corrupt1.meta.json", 29),
+        ] {
+            std::fs::write(database_dir.join(name), vec![0_u8; bytes]).unwrap();
+        }
+        std::fs::write(archive.join("mail.db.corrupt1"), [0_u8; 31]).unwrap();
+        std::fs::create_dir(database_dir.join("mail.db.corrupt3")).unwrap();
+        std::fs::write(database_dir.join("mail.db.corrupt3/unrelated"), [0_u8; 37]).unwrap();
+        let stats = retention_resident_stats(
+            &archive,
+            &primary,
+            Some((
+                RetentionPolicy {
+                    keep_min: 0,
+                    max_age_secs: 0,
+                    max_total_bytes_per_category: None,
+                },
+                i64::MAX,
+            )),
+        )
+        .unwrap();
+        assert_eq!(stats.recovery_debris_artifacts, 3);
+        assert_eq!(stats.direct_backup_only_artifacts, 1);
+        assert_eq!(stats.resident_bytes, 60);
+        assert_eq!(stats.reclaimable_bytes, 41);
+        assert_eq!(stats.live_database_bytes, Some(7));
+        assert_eq!(
+            stats.resident_bytes_by_category.get("corrupt_quarantine"),
+            Some(&41)
+        );
+        assert_eq!(
+            stats.resident_bytes_by_category.get("direct_backup"),
+            Some(&19)
+        );
+        let inventory = inspect_storage_backups(&primary).unwrap();
+        assert_eq!(inventory.artifact_count, 4);
+        assert_eq!(inventory.resident_bytes, 60);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn numbered_quarantine_reclaim_preserves_live_state_and_retains_all_evidence() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.corrupt1");
+        let protected = [
+            primary.clone(),
+            root.join("mail.corrupt1-wal"),
+            root.join("mail.corrupt1-shm"),
+            root.join("mail.corrupt1.bak"),
+            root.join("mail.corrupt1.bak.meta.json"),
+            root.join("mail.corrupt12.corrupt1"),
+        ];
+        for path in &protected {
+            std::fs::write(path, b"protected").unwrap();
+        }
+        let artifact = root.join("mail.corrupt1.corrupt70");
+        std::fs::write(&artifact, b"incident evidence").unwrap();
+        let linked = root.join("mail.corrupt1.corrupt71");
+        std::os::unix::fs::symlink(&primary, &linked).unwrap();
+        let debris = enumerate_recovery_debris(&root, &primary);
+        assert_eq!(debris.len(), 1, "{debris:?}");
+        let plan = select_recovery_debris_to_reclaim(
+            debris,
+            RetentionPolicy {
+                keep_min: 0,
+                max_age_secs: 0,
+                max_total_bytes_per_category: Some(0),
+            },
+            i64::MAX,
+        );
+        let destination = root.join("doctor/reclaimable/numbered-run");
+        let outcome = consolidate_debris(&plan, &destination).unwrap();
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.moved_bytes, 17);
+        assert_eq!(outcome.failures, [] as [(PathBuf, String); 0]);
+        assert!(!artifact.exists());
+        assert_eq!(
+            std::fs::read(destination.join("mail.corrupt1.corrupt70")).unwrap(),
+            b"incident evidence"
+        );
+        assert_eq!(reclaimable_staging_bytes(&root), 17);
+        for path in protected {
+            assert_eq!(std::fs::read(path).unwrap(), b"protected");
+        }
+        assert_eq!(std::fs::read_link(linked).unwrap(), primary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn numbered_quarantine_classification_keeps_non_unicode_identity_byte_exact() {
+        use std::os::unix::ffi::OsStringExt;
+        let database = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
+        let mut numbered = database.clone();
+        numbered.push("-wal.corrupt7");
+        assert_eq!(
+            classify_recovery_debris_file(&database, &numbered),
+            Some(DebrisCategory::CorruptQuarantine)
+        );
+        assert_eq!(
+            classify_backup_file(&database, &numbered),
+            Some(BackupKind::Corrupt)
+        );
+        let alias = std::ffi::OsStr::new("mail-�.db-wal.corrupt7");
+        assert_eq!(classify_recovery_debris_file(&database, alias), None);
+        assert_eq!(classify_backup_file(&database, alias), None);
     }
 
     #[test]
@@ -1939,5 +2406,227 @@ mod tests {
             b"owned"
         );
         assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
+    }
+
+    fn proactive_stage_fixture(parent: &Path, ordinal: usize) -> PathBuf {
+        let stage = parent.join(format!(".mcp-agent-mail-proactive-backup-{ordinal:06}"));
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("snapshot.sqlite3"), [0_u8; 7]).unwrap();
+        std::fs::write(stage.join("live-export.sqlite3"), [0_u8; 11]).unwrap();
+        std::fs::create_dir(stage.join("nested")).unwrap();
+        std::fs::write(stage.join("nested/sidecar"), [0_u8; 13]).unwrap();
+        stage
+    }
+
+    #[test]
+    fn proactive_staging_health_counts_all_external_stages_without_granting_reclaim() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let archive = root.join("archive");
+        let parent = root.join("database");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let primary = parent.join("mail.db");
+        std::fs::write(&primary, [0_u8; 7]).unwrap();
+        std::fs::write(parent.join("mail.db.bak"), [0_u8; 17]).unwrap();
+        std::fs::write(parent.join("mail.db.corrupt1"), [0_u8; 23]).unwrap();
+        let reclaim = archive.join("doctor/reclaimable/earlier");
+        std::fs::create_dir_all(&reclaim).unwrap();
+        std::fs::write(reclaim.join("evidence"), [0_u8; 29]).unwrap();
+        let stages: Vec<_> = (0..6)
+            .map(|id| proactive_stage_fixture(&parent, id))
+            .collect();
+        // This similarly named archive-root tree is not in the DB parent's
+        // admission namespace and must not be mistaken for another stage.
+        proactive_stage_fixture(&archive, 99);
+        let policy = RetentionPolicy {
+            keep_min: 0,
+            max_age_secs: 0,
+            max_total_bytes_per_category: Some(0),
+        };
+        assert_eq!(
+            inspect_proactive_backup_staging(&primary).unwrap(),
+            ProactiveBackupStagingInventory {
+                directories: 6,
+                bytes: 186,
+            }
+        );
+        let before =
+            retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
+        assert_eq!(before.resident_bytes, 255);
+        assert_eq!(before.reclaimable_bytes, 23);
+        assert_eq!(before.recovery_debris_artifacts, 1);
+        assert_eq!(before.direct_backup_only_artifacts, 1);
+        assert_eq!(before.reclaimable_staging_bytes, 29);
+        assert_eq!(
+            before
+                .resident_bytes_by_category
+                .get("proactive_backup_staging"),
+            Some(&186)
+        );
+        let plan = select_recovery_debris_to_reclaim(
+            enumerate_recovery_debris(&archive, &primary),
+            policy,
+            i64::MAX,
+        );
+        assert_eq!(plan.prune.len(), 1);
+        assert_eq!(plan.prune[0].path, parent.join("mail.db.corrupt1"));
+        // Simulate an explicit operator relocation. The footprint must not
+        // disappear or double-count merely because evidence changed category.
+        std::fs::rename(&stages[0], reclaim.join("relocated-stage")).unwrap();
+        let after = retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 60);
+        assert_eq!(after.reclaimable_bytes, 23);
+        assert_eq!(
+            after
+                .resident_bytes_by_category
+                .get("proactive_backup_staging"),
+            Some(&155)
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 7]);
+        assert_eq!(
+            std::fs::read(parent.join("mail.db.bak")).unwrap(),
+            [0_u8; 17]
+        );
+        for stage in &stages[1..] {
+            assert_eq!(
+                std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+                [0_u8; 7]
+            );
+        }
+    }
+
+    #[test]
+    fn proactive_staging_inventory_is_parent_wide_and_reads_no_database_content() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let first = root.join("first.db");
+        let second = root.join("second.db");
+        std::fs::write(&first, b"not opened with SQLite").unwrap();
+        std::fs::write(&second, b"different mailbox").unwrap();
+        proactive_stage_fixture(&root, 1);
+        assert_eq!(
+            inspect_proactive_backup_staging(&first).unwrap(),
+            inspect_proactive_backup_staging(&second).unwrap()
+        );
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("large"), [0_u8; 101]).unwrap();
+        std::fs::write(root.join("proactive-backup-not-a-stage"), [0_u8; 103]).unwrap();
+        assert_eq!(inspect_proactive_backup_staging(&first).unwrap().bytes, 31);
+        assert_eq!(std::fs::read(&first).unwrap(), b"not opened with SQLite");
+        assert_eq!(std::fs::read(&second).unwrap(), b"different mailbox");
+    }
+
+    #[test]
+    fn proactive_staging_inventory_bounds_parent_and_nested_work() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        proactive_stage_fixture(&root, 1);
+        // Two parent entries and four descendants: no early success at the
+        // directory count, and unrelated parent entries consume the budget too.
+        assert_eq!(
+            inspect_proactive_backup_staging_with_limit(&primary, 6)
+                .unwrap()
+                .bytes,
+            31
+        );
+        for limit in [0, 1, 2, 5] {
+            let error = inspect_proactive_backup_staging_with_limit(&primary, limit)
+                .expect_err("incomplete scans must not claim a complete footprint");
+            assert!(error.to_string().contains("entry limit exceeded"));
+        }
+        std::fs::write(root.join("unrelated"), b"not a backup").unwrap();
+        assert!(inspect_proactive_backup_staging_with_limit(&primary, 6).is_err());
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+    }
+
+    #[test]
+    fn proactive_staging_empty_and_unavailable_are_distinct() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let missing = root.join("not-created/mail.db");
+        assert_eq!(
+            inspect_proactive_backup_staging(&missing).unwrap(),
+            ProactiveBackupStagingInventory::default()
+        );
+        assert!(!root.join("not-created").exists());
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        let stats = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(stats.resident_bytes, 0);
+        assert!(
+            !stats
+                .resident_bytes_by_category
+                .contains_key("proactive_backup_staging")
+        );
+        let malformed = root.join(".mcp-agent-mail-proactive-backup-not-a-directory");
+        std::fs::write(&malformed, b"preserved evidence").unwrap();
+        assert!(inspect_proactive_backup_staging(&primary).is_err());
+        assert!(retention_resident_stats(&root, &primary, None).is_err());
+        assert_eq!(std::fs::read(malformed).unwrap(), b"preserved evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_staging_inventory_refuses_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside evidence").unwrap();
+        for nested in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let primary = root.join("mail.db");
+            std::fs::write(&primary, b"live").unwrap();
+            if nested {
+                let stage = proactive_stage_fixture(&root, 1);
+                symlink(&outside, stage.join("linked")).unwrap();
+            } else {
+                symlink(&outside, root.join(".mcp-agent-mail-proactive-backup-link")).unwrap();
+            }
+            assert!(inspect_proactive_backup_staging(&primary).is_err());
+            assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+        }
+        // Keep the Unix socket name below sun_path's limit even when macOS
+        // supplies a long per-user TMPDIR. No process-global chdir/env changes.
+        let root = tempfile::tempdir_in("/tmp")
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        let stage = proactive_stage_fixture(&root, 1);
+        let _socket = UnixListener::bind(stage.join("socket")).unwrap();
+        assert!(inspect_proactive_backup_staging(&primary).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"outside evidence"
+        );
+        symlink(&root, outside.join("database-alias")).unwrap();
+        assert!(inspect_proactive_backup_staging(&outside.join("database-alias/mail.db")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_staging_inventory_preserves_non_unicode_names_and_sparse_lengths() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join(std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec()));
+        std::fs::write(&primary, b"live").unwrap();
+        let mut stage_name = PROACTIVE_STAGING_PREFIX.to_vec();
+        stage_name.push(0xff);
+        let stage = root.join(std::ffi::OsString::from_vec(stage_name));
+        std::fs::create_dir(&stage).unwrap();
+        let large = 24_u64 * 1024 * 1024 * 1024;
+        let snapshot = std::fs::File::create(stage.join("snapshot.sqlite3")).unwrap();
+        snapshot.set_len(large).unwrap();
+        drop(snapshot);
+        let inventory = inspect_proactive_backup_staging(&primary).unwrap();
+        assert_eq!(inventory.directories, 1);
+        assert_eq!(inventory.bytes, large);
+        let stats = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(stats.resident_bytes, large);
+        assert_eq!(stats.reclaimable_bytes, 0);
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
     }
 }

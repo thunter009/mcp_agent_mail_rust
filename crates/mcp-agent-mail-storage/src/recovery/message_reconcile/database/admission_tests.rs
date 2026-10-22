@@ -279,6 +279,14 @@ fn exercise_busy_fence(existing: bool) {
             survivor.as_ref().map(|(_, bytes)| bytes.clone())
         );
         assert_eq!(cursor.tail_after, Some(902));
+        assert_eq!(
+            (
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (2, 0, 2)
+        );
 
         // Deferred work must be reread, not retained as a stale publication
         // payload. The second message has never had any archive copy.
@@ -286,7 +294,14 @@ fn exercise_busy_fence(existing: bool) {
         conn.execute_raw("UPDATE messages SET body_md='Live body after admission reopens', topic='updated' WHERE id=902").unwrap();
         drop(conn);
         let before_resume = database_evidence(cx, pool);
-        assert_eq!(catch_up(cx, pool, config, &mut cursor), 2);
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            (resumed.repaired, resumed.retry_len),
+            (2, 0),
+            "transient refusals must retry on the next pass, without a cursor wrap"
+        );
         assert_recovered(cx, pool, config, 901, existing);
         assert_recovered(cx, pool, config, 902, false);
         assert_eq!(database_evidence(cx, pool), before_resume);
@@ -338,10 +353,287 @@ fn busy_project_is_skipped_while_another_mailbox_project_repairs_then_is_revisit
         assert_eq!(database_evidence(cx, pool), before);
         assert_eq!(active_writer_count(), 0);
         drop(owner);
-        assert_eq!(catch_up(cx, pool, config, &mut cursor), 1);
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (1, 0));
         assert_recovered(cx, pool, config, 901, true);
         assert_eq!(database_evidence(cx, pool), before);
         assert_eq!(fs::read(&survivor).unwrap(), bytes);
+    });
+}
+
+#[test]
+fn large_retained_lock_refusals_cannot_starve_fresh_mail_for_another_project() {
+    fixture(|cx, pool, config| {
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET body_md = ? WHERE id = 901",
+            &["x".repeat(7 * 1024 * 1024 / 2).into()],
+        )
+        .unwrap();
+        for id in 903..=906 {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+                 ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+                 SELECT {id}, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+                 ack_required, created_ts, recipients_json, attachments, archive_metadata_json FROM messages WHERE id = 901"
+            )).unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+                 SELECT {id}, agent_id, kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 901"
+            )).unwrap();
+        }
+        drop(conn);
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        crate::ensure_archive(config, "other").unwrap();
+        crate::flush_async_commits();
+        let process = crate::archive_process_lock(&archive).unwrap();
+        let owner = process.lock().unwrap();
+        let mut cursor = ReconcileCursor::default();
+        for _ in 0..4 {
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+            if cursor.retries.len() == 5 {
+                break;
+            }
+        }
+        assert_eq!(
+            cursor.retries.len(),
+            5,
+            "real lock refusals retain all large rows"
+        );
+        assert!(!archive.root.join("messages").exists());
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages(id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+             ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+             SELECT 907, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+             ack_required, created_ts, recipients_json, attachments, archive_metadata_json FROM messages WHERE id = 902",
+        ).unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+             SELECT 907, agent_id, kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 902",
+        ).unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        // Even when retry owns the first turn, five large refusals cannot
+        // exhaust the byte budget before fresh unrelated mail gets a turn.
+        cursor.next_lane_is_retry = true;
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert!(report.deferred_transient > 0, "{report:?}");
+        assert_eq!(report.retry_len, 5);
+        assert!(report.repaired > 0, "fresh mail was starved: {report:?}");
+        assert!(report.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+        assert!(matches!(
+            process.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert_recovered(cx, pool, config, 907, false);
+        assert!(!archive.root.join("messages").exists());
+        assert_eq!(database_evidence(cx, pool), before);
+        drop(owner);
+    });
+}
+
+#[test]
+fn repeated_fence_refusal_backs_off_without_scan_lanes_bypassing_the_retry() {
+    fixture(|cx, pool, config| {
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        crate::with_archive_snapshot_publication_fence(|| {
+            for attempt in 0..2 {
+                let report =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!((report.deferred_transient, report.retry_len), (2, 2));
+                assert!(cursor.retries.iter().all(|retry| retry.attempts == attempt));
+            }
+            let deadline = Instant::now() + MAX_RETRY_BACKOFF;
+            // Hold the recorded cooldown fixed so a slow test host cannot
+            // accidentally turn this into a wall-clock scheduling test.
+            for retry in &mut cursor.retries {
+                retry.ready_at = deadline;
+            }
+            for _ in 0..3 {
+                let report =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(
+                    (report.scanned, report.deferred, report.retry_len),
+                    (0, 0, 2)
+                );
+            }
+        });
+        assert_eq!(database_evidence(cx, pool), before);
+        assert!(!config.storage_root.join(".git").exists());
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn unavailable_source_query_preserves_an_existing_transient_retry_until_recovery() {
+    fixture(|cx, pool, config| {
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        crate::with_archive_snapshot_publication_fence(|| {
+            let report =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(report.retry_len, 2);
+        });
+        // Keep every source row, but make the real source statement temporarily
+        // unavailable. Selection still succeeds against the messages table.
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("ALTER TABLE agents RENAME TO retained_agents")
+            .unwrap();
+        drop(conn);
+        let unavailable =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("ALTER TABLE retained_agents RENAME TO agents")
+            .unwrap();
+        drop(conn);
+        let report = unavailable.unwrap();
+        assert_eq!(
+            (
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (2, 0, 2),
+            "an unavailable source is not conflict evidence and cannot forget a deferred ID"
+        );
+        assert_eq!(database_evidence(cx, pool), before);
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn conflicting_evidence_is_preserved_and_does_not_enter_the_transient_retry_lane() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let (path, _) = seed_outbox(config, &prepared);
+        let conflict =
+            crate::render_message_bundle_content(&prepared.message, "conflicting body").unwrap();
+        fs::write(&path, &conflict).unwrap();
+        crate::flush_async_commits();
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            (
+                report.repaired,
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (1, 0, 1, 0)
+        );
+        for _ in 0..3 {
+            let report =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                report.deferred, 0,
+                "wrapping history must respect conflict cooldown"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), conflict.as_bytes());
+        assert_eq!(database_evidence(cx, pool), before);
+        for (_, until) in &mut cursor.conflict_backoff {
+            *until = Instant::now();
+        }
+        let mut conflicts = 0;
+        for _ in 0..3 {
+            conflicts +=
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap()
+                    .deferred_conflict;
+        }
+        assert_eq!(
+            conflicts, 1,
+            "a cooled conflict may be checked again without hot-looping"
+        );
+        assert_eq!(fs::read(path).unwrap(), conflict.as_bytes());
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn full_retry_lane_preserves_unconsumed_scan_positions_instead_of_evicting_ids() {
+    fixture(|cx, pool, config| {
+        let deadline = Instant::now() + MAX_RETRY_BACKOFF;
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            retries: (10_000..10_000 + i64::try_from(MAX_RETRY_IDS).unwrap())
+                .map(|id| DeferredRetry {
+                    id,
+                    attempts: 1,
+                    ready_at: deadline,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ids = cursor
+            .retries
+            .iter()
+            .map(|retry| retry.id)
+            .collect::<Vec<_>>();
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((report.scanned, report.retry_len), (0, MAX_RETRY_IDS));
+        assert_eq!(cursor.tail_after, None);
+        assert_eq!(cursor.backfill_ceiling, None);
+        assert_eq!(
+            cursor
+                .retries
+                .iter()
+                .map(|retry| retry.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(!config.storage_root.join(".git").exists());
+        // A due real retry must drain even while the full queue and untouched
+        // normal-first cursor also expose fresh IDs. Do not free capacity by
+        // hand: that would conceal a permanently pinned saturated queue.
+        cursor.retries.front_mut().unwrap().id = 901;
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(resumed.repaired, 2);
+        assert!(resumed.retry_len < MAX_RETRY_IDS);
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
     });
 }
 
@@ -352,6 +644,7 @@ fn retained_cursor() -> ReconcileCursor {
         backfill_ceiling: Some(29),
         next_lane_is_history: true,
         settled_before_us: 1_234_567,
+        ..Default::default()
     }
 }
 
@@ -449,5 +742,368 @@ fn worker_stop_preserves_source_and_cursors_until_a_later_uncancelled_pass() {
         assert_recovered(cx, pool, config, 901, false);
         assert_recovered(cx, pool, config, 902, false);
         assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+fn seed_retention_mail(cx: &Cx, pool: &DbPool, config: &Config) {
+    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+    conn.execute_raw("UPDATE message_recipients SET read_ts=2000000, ack_ts=2500000")
+        .unwrap();
+    drop(conn);
+    for id in [901, 902] {
+        let prepared = prepare_message(cx, pool, id).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+    }
+    crate::flush_async_commits();
+}
+
+#[test]
+fn retention_admission_refuses_promotion_without_consuming_source_or_cursor() {
+    for nested in [false, true] {
+        fixture(|cx, pool, config| {
+            seed_retention_mail(cx, pool, config);
+            let before = database_evidence(cx, pool);
+            let parent = nested.then(begin_write_activity);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let gate = if nested {
+                    let (gate, result) = acquire_promotion_barrier_draining(Duration::ZERO);
+                    assert!(matches!(
+                        result,
+                        DrainOutcome::TimedOut {
+                            remaining_writers: 1
+                        }
+                    ));
+                    gate
+                } else {
+                    try_acquire_promotion_barrier_if_idle().unwrap()
+                };
+                ready_tx.send(()).unwrap();
+                let released = release_rx.recv_timeout(Duration::from_secs(3));
+                drop(gate);
+                released
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut cursor = ArchivePruneCursor {
+                source_identity: "unconsumed source".into(),
+                after: 17,
+                ceiling: Some(1000),
+            };
+            let result = prune_archived_message_batch(
+                cx,
+                pool,
+                config,
+                3_000_000,
+                &mut cursor,
+                &AtomicBool::new(false),
+            );
+            let writers = active_writer_count();
+            let _ = release_tx.send(());
+            let released = owner.join().unwrap();
+            drop(parent);
+            assert!(
+                released.is_ok(),
+                "retention waited for the promotion owner to expire"
+            );
+            assert!(result.unwrap_err().contains("admission contention"));
+            assert_eq!(writers, usize::from(nested));
+            assert_eq!(
+                (
+                    cursor.source_identity.as_str(),
+                    cursor.after,
+                    cursor.ceiling
+                ),
+                ("unconsumed source", 17, Some(1000))
+            );
+            assert_eq!(database_evidence(cx, pool), before);
+            let resumed = prune_archived_message_batch(
+                cx,
+                pool,
+                config,
+                3_000_000,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    resumed.pruned.deleted_messages,
+                    resumed.pruned.deleted_recipients
+                ),
+                (2, 4)
+            );
+            assert_eq!(active_writer_count(), 0);
+        });
+    }
+}
+
+#[test]
+fn retention_admission_defers_busy_fence_without_deleting_verified_mail() {
+    fixture(|cx, pool, config| {
+        seed_retention_mail(cx, pool, config);
+        let before = database_evidence(cx, pool);
+        let repo = git2::Repository::open(&config.storage_root).unwrap();
+        let head = repo.head().unwrap().target();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3))
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut cursor = ArchivePruneCursor::default();
+        let result = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        );
+        let writers = active_writer_count();
+        let _ = release_tx.send(());
+        let released = owner.join().unwrap();
+        assert!(
+            released.is_ok(),
+            "retention waited for the unrelated archive publisher to expire"
+        );
+        let report = result.unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.pruned.deleted_messages
+            ),
+            (2, 2, 0)
+        );
+        assert!(report.pruned.more);
+        assert_eq!(writers, 0);
+        assert_eq!(database_evidence(cx, pool), before);
+        assert_eq!(repo.head().unwrap().target(), head);
+        let resumed = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(resumed.pruned.deleted_messages, 2);
+    });
+}
+
+#[test]
+fn retention_admission_skips_busy_project_and_prunes_other_verified_mail() {
+    fixture(|cx, pool, config| {
+        seed_retention_mail(cx, pool, config);
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let process = crate::archive_process_lock(&archive).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let held = process.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(3));
+            drop(held);
+            released
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut cursor = ArchivePruneCursor::default();
+        let result = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        );
+        let _ = release_tx.send(());
+        let released = owner.join().unwrap();
+        assert!(
+            released.is_ok(),
+            "one project stranded the entire retention sweep"
+        );
+        let report = result.unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.pruned.deleted_messages
+            ),
+            (2, 1, 1)
+        );
+        assert!(report.pruned.more);
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        let ids = conn
+            .query_sync("SELECT id FROM messages ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].get_named::<i64>("id").unwrap(), 901);
+        drop(conn);
+        let resumed = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!((resumed.pruned.deleted_messages, resumed.deferred), (1, 0));
+        assert_eq!(active_writer_count(), 0);
+    });
+}
+
+#[test]
+fn retention_admission_preserves_a_live_filesystem_lock_and_revalidates_deferred_evidence() {
+    use fs2::FileExt;
+    fixture(|cx, pool, config| {
+        seed_retention_mail(cx, pool, config);
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let root = crate::archive_project_root_checked(&archive).unwrap();
+        let lock_path = root.join(".archive.lock");
+        let metadata_path = root.join(".archive.lock.owner.json");
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let metadata = serde_json::to_vec(&json!({"pid":std::process::id(),"created_ts":mcp_agent_mail_db::now_micros() as f64 / 1_000_000.0})).unwrap();
+        fs::write(&metadata_path, &metadata).unwrap();
+        let mut cursor = ArchivePruneCursor::default();
+        let report = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.pruned.deleted_messages
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata);
+        let contender = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(
+            contender.try_lock_exclusive().is_err(),
+            "retention must not replace a held lock inode"
+        );
+        fs2::FileExt::unlock(&held).unwrap();
+        drop(held);
+        // A successful proof before contention is not retained authority. The
+        // next attempt must compare the changed source against committed bytes.
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("UPDATE messages SET body_md='changed while deferred' WHERE id=901")
+            .unwrap();
+        drop(conn);
+        let changed = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!((changed.pruned.deleted_messages, changed.deferred), (0, 1));
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        let rows = conn
+            .query_sync("SELECT body_md FROM messages WHERE id=901", &[])
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("body_md").unwrap(),
+            "changed while deferred"
+        );
+        conn.execute_sync(
+            "UPDATE messages SET body_md=? WHERE id=901",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                "Keep λ and every byte.".into(),
+            )],
+        )
+        .unwrap();
+        drop(conn);
+        let resumed = prune_archived_message_batch(
+            cx,
+            pool,
+            config,
+            3_000_000,
+            &mut cursor,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!((resumed.pruned.deleted_messages, resumed.deferred), (1, 0));
+        assert_eq!(active_writer_count(), 0);
+        assert_eq!(crate::archive_mutations_active(), 0);
+    });
+}
+
+#[test]
+fn retention_admission_shutdown_during_project_wait_preserves_unconsumed_work() {
+    fixture(|cx, pool, config| {
+        seed_retention_mail(cx, pool, config);
+        let before = database_evidence(cx, pool);
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let process = crate::archive_process_lock(&archive).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _held = process.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while crate::archive_mutations_active() == 0 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let observed = crate::archive_mutations_active() > 0;
+            cancel.store(true, Ordering::Release);
+            (observed, release_rx.recv_timeout(Duration::from_secs(5)))
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut cursor = ArchivePruneCursor::default();
+        let result = prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop);
+        let _ = release_tx.send(());
+        let (observed, released) = owner.join().unwrap();
+        assert!(
+            observed && released.is_ok(),
+            "shutdown must finish while the project owner still holds its lock"
+        );
+        let report = result.unwrap();
+        assert!(report.interrupted && report.pruned.more);
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.pruned.deleted_messages,
+                cursor.after
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(cursor.ceiling, Some(902));
+        assert_eq!(database_evidence(cx, pool), before);
+        assert_eq!(active_writer_count(), 0);
+        assert_eq!(crate::archive_mutations_active(), 0);
+        stop.store(false, Ordering::Release);
+        let resumed =
+            prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop).unwrap();
+        assert_eq!(
+            (
+                resumed.pruned.deleted_messages,
+                resumed.pruned.deleted_recipients
+            ),
+            (2, 4)
+        );
     });
 }

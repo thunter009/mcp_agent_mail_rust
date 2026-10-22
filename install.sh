@@ -33,7 +33,11 @@
 #
 set -Eeuo pipefail
 umask 022
-shopt -s lastpipe 2>/dev/null || true
+# lastpipe stays off (GH#342). With lastpipe and no job control, Bash records the
+# pipeline's last element through append_process(), which half-links the job's
+# process list while SIGCHLD is unblocked. A pipeline child exiting in that window
+# crashed a fresh ACFS install with SIGSEGV (exit 139) in a `$(a | b | head -1)`
+# substitution. No pipeline in this script ends in a builtin that would need it.
 
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
@@ -331,9 +335,10 @@ resolve_version() {
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
+  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/'); then
     tag=""
   fi
+  case "$tag" in v[0-9]*|[0-9]*) ;; *) tag="" ;; esac
 
   if [ -n "$tag" ]; then
     VERSION="$tag"
@@ -2950,6 +2955,17 @@ installer_entry_exists() {
   [ -e "$1" ] || [ -L "$1" ]
 }
 
+# Extract a verified release archive into the private staging directory.
+# --no-same-owner: tar running as root (containers, Dockerfile RUN, CI) would
+# otherwise keep the uid/gid recorded in the archive (the build host's user),
+# and the staged-file ownership check below would then refuse every binary
+# (GH#339). GNU tar and bsdtar both accept the flag.
+extract_release_archive() {
+  local archive="$1"
+  local dest="$2"
+  tar --no-same-owner -xf "$archive" -C "$dest"
+}
+
 validate_installer_owned_regular_file() {
   local path="$1"
   local label="$2"
@@ -3541,6 +3557,87 @@ archive_binary_transaction() {
   validate_binary_transaction_source_receipt "$history" || return 1
   BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
   BINARY_TRANSACTION_LAST_ARCHIVE_PATH="$history"
+}
+
+# Whether a live process runs a binary from inside a transaction history entry.
+# A long-lived `am` can run for weeks from an archived `old-cli` (br-gq0gx),
+# so such an entry is never pruned. When liveness cannot be established
+# (no /proc and no lsof), the entry counts as in use.
+binary_transaction_history_in_use() {
+  local entry="$1"
+  local exe="" target="" resolved=""
+  if [ -d /proc/self ] && [ -e /proc/self/exe ]; then
+    # /proc/<pid>/exe names the resolved path, so compare against it.
+    resolved=$(cd "$entry" 2>/dev/null && pwd -P) || return 0
+    for exe in /proc/[0-9]*/exe; do
+      target=$(readlink "$exe" 2>/dev/null) || continue
+      target="${target% (deleted)}"
+      case "$target" in
+        "$resolved"/*) return 0 ;;
+      esac
+    done
+    return 1
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof exits 1 when nothing under the directory is open.
+    if lsof -t +D "$entry" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# Committed and rolled-back transactions keep the previous binary pair
+# (~200 MB each) and used to accumulate forever: 46 entries / 9.2 GB on one
+# host (br-gq0gx). Keep the newest AM_INSTALL_TRANSACTION_HISTORY_KEEP (default
+# 2, minimum 1) plus the entry this run archived; prune older entries that no
+# running process uses.
+prune_binary_transaction_history() {
+  local install_dir="$1"
+  local keep="${AM_INSTALL_TRANSACTION_HISTORY_KEEP:-2}"
+  local entries="" entry="" name="" kept=0 pruned=0
+  case "$keep" in
+    ''|*[!0-9]*) keep=2 ;;
+  esac
+  if [ "$keep" -lt 1 ]; then
+    keep=1
+  fi
+  # Newest first. The entry names are installer-generated and carry no
+  # whitespace; anything else is skipped by the exact-prefix check below.
+  entries=$(ls -1dt -- \
+    "$install_dir"/.mcp-agent-mail-install-transaction.committed.* \
+    "$install_dir"/.mcp-agent-mail-install-transaction.rolled-back.* 2>/dev/null) || true
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="${entry##*/}"
+    case "$name" in
+      .mcp-agent-mail-install-transaction.committed.*|.mcp-agent-mail-install-transaction.rolled-back.*) ;;
+      *) continue ;;
+    esac
+    if [ -L "$entry" ] || [ ! -d "$entry" ]; then
+      continue
+    fi
+    if [ "$entry" = "${BINARY_TRANSACTION_LAST_ARCHIVE_PATH:-}" ] || [ "$kept" -lt "$keep" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if binary_transaction_history_in_use "$entry"; then
+      info "Keeping install history $name: a running process uses a binary inside it"
+      continue
+    fi
+    if rm -rf -- "$entry"; then
+      pruned=$((pruned + 1))
+    else
+      warn "Could not prune install history $entry"
+    fi
+  done <<EOF
+$entries
+EOF
+  if [ "$pruned" -gt 0 ]; then
+    info "Pruned $pruned old install transaction(s) under $install_dir (kept the newest $keep)"
+  fi
+  return 0
 }
 
 recover_binary_pair_transaction_impl() {
@@ -9130,7 +9227,7 @@ else
   info "Extracting"
   EXTRACT_DIR="$TMP/extract"
   mkdir "$EXTRACT_DIR"
-  tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
+  extract_release_archive "$TMP/$TAR" "$EXTRACT_DIR"
   SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
   CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
 fi
@@ -9168,6 +9265,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ok "  Source receipt: $source_receipt_path"
 fi
+prune_binary_transaction_history "$DEST"
 maybe_add_path
 install_local_bin_links
 

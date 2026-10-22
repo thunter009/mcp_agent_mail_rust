@@ -4,21 +4,28 @@
 //! project lock, so an active repair must never replace an existing file. A
 //! concurrent release/renewal wins the destination instead. Only generation-
 //! stamped stable paths are repaired; reusable digest aliases are never written.
+//! Transient failures retain bounded ID-only retry debt, independently of the
+//! finite discovery round. Retrying never restores a captured ACTIVE payload.
 
+mod retry;
+
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use git2::{ObjectType, Oid, Repository};
 use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
-use mcp_agent_mail_db::{DbError, DbPool, corruption_circuit_breaker};
+use mcp_agent_mail_db::{DbConn, DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::agent_reconcile::{committed_artifact, head_tree, read_artifact};
+use retry::RetryQueue;
 
 const IDS_PER_PASS: i64 = 32;
 const WRITES_PER_PASS: usize = 4;
@@ -27,11 +34,16 @@ const ARTIFACT_BYTES: usize = 128 * 1024;
 const GRANT_GRACE_US: i64 = 30 * 1_000_000;
 
 /// Finite ID rounds keep older missing artifacts reachable under new grants.
+/// Retry IDs belong to the same source identity and share the original pass
+/// budgets. Rebinding a replacement source discards both discovery and retry
+/// hints; no stored hint grants authority to publish an artifact.
 #[derive(Debug, Default)]
 pub struct ActiveReservationCursor {
     identity: String,
     after: i64,
     ceiling: Option<i64>,
+    retries: RetryQueue,
+    retry_first: bool,
 }
 
 /// A bounded pass, not a certificate that every active lease is archived.
@@ -42,8 +54,65 @@ pub struct ActiveReservationReport {
     pub attempted: usize,
     pub repaired: usize,
     pub deferred: usize,
+    pub deferred_transient: usize,
+    pub retry_len: usize,
+    /// Discovery has more candidates, or retained retry debt still exists.
+    /// Cooling retries remain debt even when this pass scans no payloads.
     pub more: bool,
     pub interrupted: bool,
+}
+
+#[derive(Debug)]
+struct RepairFailure {
+    detail: String,
+    transient: bool,
+}
+
+impl RepairFailure {
+    fn source_unavailable(error: impl std::fmt::Display) -> Self {
+        Self {
+            detail: source_error(error),
+            transient: true,
+        }
+    }
+}
+
+impl From<String> for RepairFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl From<&str> for RepairFailure {
+    fn from(detail: &str) -> Self {
+        detail.to_string().into()
+    }
+}
+
+impl From<crate::StorageError> for RepairFailure {
+    fn from(error: crate::StorageError) -> Self {
+        let transient = matches!(
+            &error,
+            crate::StorageError::LockContention { .. }
+                | crate::StorageError::LockTimeout(_)
+                | crate::StorageError::GitIndexLock { .. }
+        ) || matches!(&error, crate::StorageError::Git(error)
+            if error.code() == git2::ErrorCode::Locked)
+            || matches!(&error, crate::StorageError::Io(error)
+                if matches!(error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::AlreadyExists));
+        // AlreadyExists can be a concurrent create-only publisher. A retry
+        // revalidates its file; it never changes noclobber into replacement.
+        Self {
+            detail: error.to_string(),
+            transient,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -108,8 +177,15 @@ fn validate_source(cx: &Cx, pool: &DbPool, config: &Config) -> Result<(), String
     Ok(())
 }
 
-fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
+fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, RepairFailure> {
+    let conn = outcome(block_on(pool.acquire(cx))).map_err(|detail| RepairFailure {
+        detail,
+        transient: true,
+    })?;
+    read_source_connection(&conn, id)
+}
+
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
     // One SQL snapshot supplies the holder, generation and both release stores.
     // The size predicate bounds materialized strings, not the SQL engine's work.
     let rows = conn.query_sync(
@@ -128,7 +204,7 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String
                COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?",
         &[id.into(), SOURCE_BYTES.into()],
-    ).map_err(source_error)?;
+    ).map_err(RepairFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "active reservation source missing, oversized, or without holder authority".into(),
@@ -280,19 +356,37 @@ fn repair_one(
     original: &Source,
     attempted: &mut bool,
     stop: &AtomicBool,
-) -> Result<bool, String> {
+) -> Result<bool, RepairFailure> {
+    checkpoint(cx, stop)?;
+    // An exhausted pool may be owned by a borrower that needs this archive
+    // fence before returning its connection. Checkout must precede BOTH
+    // archive locks; all source rechecks below reuse this same connection.
+    let checkout = pool.acquire(cx);
+    #[cfg(test)]
+    let checkout = tests::observe_checkout_pending(checkout);
+    let conn = outcome(block_on(checkout)).map_err(|detail| RepairFailure {
+        detail,
+        transient: true,
+    })?;
     // Keep the source lease out of an unbounded archive wait. Use the same
     // native fence and project locks as terminal/message recovery, not a
     // second publication protocol or a detached writer.
     let _mutation = crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || {
         stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
     })
-    .map_err(|error| error.to_string())?;
-    let archive = crate::ensure_archive(config, &original.slug).map_err(source_error)?;
+    .map_err(RepairFailure::from)?;
+    let archive = crate::ensure_archive(config, &original.slug).map_err(RepairFailure::from)?;
+    // The project-lock closure returns StorageError. Retain the classification
+    // of an unavailable source recheck instead of disguising it as conflicting
+    // archive evidence when crossing that boundary.
+    let mut source_transient = false;
     let publish = || {
         checkpoint(cx, stop)?;
-        if read_source(cx, pool, original.id)
-            .map_err(invalid)?
+        if read_source_connection(&conn, original.id)
+            .map_err(|error| {
+                source_transient |= error.transient;
+                invalid(error.detail)
+            })?
             .as_ref()
             != Some(original)
         {
@@ -366,8 +460,11 @@ fn repair_one(
         if working.is_some() && committed.as_ref().is_some_and(|a| a.bytes == bytes) {
             return Ok(false);
         }
-        if read_source(cx, pool, original.id)
-            .map_err(invalid)?
+        if read_source_connection(&conn, original.id)
+            .map_err(|error| {
+                source_transient |= error.transient;
+                invalid(error.detail)
+            })?
             .as_ref()
             != Some(original)
         {
@@ -375,6 +472,9 @@ fn repair_one(
                 "active reservation source changed during verification",
             ));
         }
+        // Publication needs the outer generation lease, not a pool slot.
+        // Release capacity before filesystem syncs and Git commit work.
+        drop(conn);
         checkpoint(cx, stop)?;
         *attempted = true;
         if working.is_none() {
@@ -407,9 +507,15 @@ fn repair_one(
         }
         Ok(true)
     };
-    archive
-        .with_repair_lock(|| stop.load(Ordering::Acquire) || cx.checkpoint().is_err(), publish)
-        .map_err(|error| error.to_string())
+    let result = archive.with_repair_lock(
+        || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
+        publish,
+    );
+    result.map_err(|error| {
+        let mut failure = RepairFailure::from(error);
+        failure.transient |= source_transient;
+        failure
+    })
 }
 
 fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
@@ -473,9 +579,12 @@ fn select_ids(
 /// but this is not a hard deadline on SQLite, Git or filesystem operations.
 ///
 /// Closed database admission defers before consuming a candidate. A busy global
-/// archive fence or project lock defers that lease within the finite round so
-/// other projects can progress. Worker shutdown reaches lock admission and the
-/// publication checkpoints; completed files remain evidence for a safe retry.
+/// archive fence or project lock retains that lease in a bounded retry lane so
+/// it need not wait behind the rest of a discovery round. Retry and discovery
+/// share the original 32-source/four-write limits and alternate across passes;
+/// repeated contention backs off. Conflicts never enter the retry queue. Worker
+/// shutdown reaches lock admission and publication checkpoints; completed files
+/// remain evidence for a safe retry. All hints remain process-local.
 pub fn reconcile_active_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -492,20 +601,56 @@ pub fn reconcile_active_reservations(
         return Err("active reservation repair refused: corruption breaker open".into());
     }
     let ids = {
-        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
-            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
+            "active reservation repair deferred: recovery promotion or admission contention",
+        )?;
         select_ids(cx, pool, config, cursor)?
     };
     let selected_identity = cursor.identity.clone();
-    report.more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
-    for id in ids {
+    let mut scan_more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
+    let mut scan = ids.into_iter().peekable();
+    let mut retries = cursor.retries.due(Instant::now()).into_iter();
+    let mut seen = HashSet::new();
+    loop {
+        // At capacity only retained IDs can free space. Otherwise alternate
+        // lanes so sustained contention cannot starve unrelated discoveries.
+        let next = if cursor.retry_first || cursor.retries.is_full() {
+            retries
+                .next()
+                .map(|id| (id, true))
+                .or_else(|| scan.next().map(|id| (id, false)))
+        } else {
+            scan.next()
+                .map(|id| (id, false))
+                .or_else(|| retries.next().map(|id| (id, true)))
+        };
+        let Some((id, is_retry)) = next else {
+            break;
+        };
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             report.interrupted = true;
-            report.more = true;
+            scan_more = true;
             break;
         }
-        if report.attempted >= WRITES_PER_PASS {
-            report.more = true;
+        // A scan duplicate may advance its position but cannot bypass a
+        // retained ID's cooldown or consume the retry lane's payload budget.
+        if !is_retry && (cursor.retries.contains(id) || seen.contains(&id)) {
+            cursor.after = id;
+            continue;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if report.attempted >= WRITES_PER_PASS
+            || report.scanned >= usize::try_from(IDS_PER_PASS).expect("small ID bound")
+        {
+            scan_more |= !is_retry || scan.peek().is_some();
+            break;
+        }
+        if cursor.retries.is_full() && !cursor.retries.contains(id) {
+            // Never advance past an ID whose transient failure could not be
+            // retained. Existing retries keep their FIFO positions and bounds.
+            scan_more = true;
             break;
         }
         if corruption_circuit_breaker().is_tripped() {
@@ -513,10 +658,13 @@ pub fn reconcile_active_reservations(
         }
         // A promotion may have run after selection. Never apply a retained ID
         // page to an observed replacement source, and never wait while closed.
-        let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
-            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
+            "active reservation repair deferred: recovery promotion or admission contention",
+        )?;
         if pool.sqlite_identity_key() != selected_identity {
-            return Err("active reservation source changed after selection; rescan required".into());
+            return Err(
+                "active reservation source changed after selection; rescan required".into(),
+            );
         }
         let mut attempted = false;
         let result = read_source(cx, pool, id).and_then(|source| {
@@ -529,24 +677,49 @@ pub fn reconcile_active_reservations(
         report.attempted += usize::from(attempted);
         if checkpoint(cx, stop).is_err() {
             report.interrupted = true;
-            report.more = true;
+            scan_more = true;
             break;
         }
         report.scanned += 1;
+        cursor.retry_first = !is_retry;
         match result {
-            Ok(true) => report.repaired += 1,
-            Ok(false) => report.unchanged += 1,
-            Err(reason) => {
+            Ok(repaired) => {
+                if repaired {
+                    report.repaired += 1;
+                } else {
+                    report.unchanged += 1;
+                }
+                cursor.retries.forget(id);
+            }
+            Err(failure) => {
                 report.deferred += 1;
-                tracing::warn!(target: "maintenance", reservation_id = id, %reason,
+                tracing::warn!(target: "maintenance", reservation_id = id,
+                    reason = %failure.detail, transient = failure.transient,
                     "active reservation repair deferred; existing evidence preserved");
+                if failure.transient {
+                    report.deferred_transient += 1;
+                    if !cursor.retries.defer(id, Instant::now()) {
+                        // Defensive fallback: retain this scan position if a
+                        // future caller ever reaches admission at capacity.
+                        scan_more = true;
+                        break;
+                    }
+                } else {
+                    cursor.retries.forget(id);
+                }
             }
         }
-        cursor.after = id;
+        if !is_retry {
+            cursor.after = id;
+        }
     }
-    if !report.more && !report.interrupted {
+    // Discovery wraps independently of retry debt. A cooling retry must not
+    // pin a completed round or restart it early while there are unvisited IDs.
+    if !scan_more && !report.interrupted {
         cursor.ceiling = None;
     }
+    report.retry_len = cursor.retries.len();
+    report.more = scan_more || report.retry_len > 0;
     Ok(report)
 }
 
@@ -555,6 +728,115 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    std::thread_local! {
+        static CHECKOUT_PENDING: std::cell::RefCell<Option<mpsc::Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Observe a real blocked checkout without substituting its outcome.
+    pub(super) async fn observe_checkout_pending<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|context| {
+            let result = std::future::Future::poll(future.as_mut(), context);
+            if result.is_pending() {
+                CHECKOUT_PENDING.with(|slot| {
+                    if let Some(sender) = slot.borrow_mut().take() {
+                        let _ = sender.send(());
+                    }
+                });
+            }
+            result
+        })
+        .await
+    }
+
+    fn checkout_contention(change: Option<&str>, cancel: bool) {
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let held = outcome(block_on(pool.acquire(cx))).unwrap();
+            let worker_pool = pool.clone();
+            let worker_config = config.clone();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let (pending_tx, pending_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                CHECKOUT_PENDING.with(|slot| *slot.borrow_mut() = Some(pending_tx));
+                let _activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+                    .expect("source admission");
+                let mut attempted = false;
+                let result = repair_one(
+                    &Cx::for_testing(),
+                    &worker_pool,
+                    &worker_config,
+                    &source,
+                    &mut attempted,
+                    &worker_stop,
+                );
+                (result, attempted)
+            });
+            let pending = pending_rx.recv_timeout(Duration::from_secs(5));
+            // The borrower needs the same archive fence before it can return
+            // its sole connection. Never let a broken candidate hang the test:
+            // observe the actual repair admission, then unblock and join it.
+            let borrower_archive =
+                crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || false);
+            let archive_available = borrower_archive.is_ok();
+            let archive_untouched = !config.storage_root.join(".git").exists();
+            drop(borrower_archive);
+            if let Some(sql) = change {
+                held.execute_raw(sql).unwrap();
+            }
+            if cancel {
+                stop.store(true, Ordering::Release);
+            }
+            drop(held);
+            let (result, attempted) = worker.join().unwrap();
+            pending.expect("observe the exhausted real one-connection pool");
+            assert!(
+                archive_available,
+                "active repair holds archive admission while awaiting the borrower's database connection"
+            );
+            assert!(
+                archive_untouched,
+                "source checkout must precede archive initialization"
+            );
+            if change.is_some() || cancel {
+                assert!(
+                    result.is_err(),
+                    "stale or interrupted active payload was published"
+                );
+                assert!(!attempted);
+                assert!(!target(config).exists());
+            } else {
+                assert!(result.unwrap());
+                assert!(attempted);
+                assert_committed(cx, pool, config, 401);
+                assert_eq!(pass(cx, pool, config).repaired, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn active_checkout_contention_leaves_archive_admission_available() {
+        checkout_contention(None, false);
+    }
+
+    #[test]
+    fn active_checkout_contention_revalidates_release_renewal_and_generation() {
+        for change in [
+            "INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES(401,5000000)",
+            "UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401",
+            "UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0",
+        ] {
+            checkout_contention(Some(change), false);
+        }
+    }
+
+    #[test]
+    fn active_checkout_contention_observes_shutdown_before_publication() {
+        checkout_contention(None, true);
+    }
 
     // These tests deliberately hold process-global admission locks. Isolate
     // them from unrelated libtests, while bounding a regressed child's life.
@@ -692,12 +974,16 @@ mod tests {
     #[test]
     fn released_expired_and_in_flight_grants_are_not_recreated() {
         for change in [
-            "UPDATE file_reservations SET released_ts=5000000 WHERE id=401".to_string(),
-            "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)".to_string(),
-            "UPDATE file_reservations SET expires_ts=9000000 WHERE id=401".to_string(),
-            format!("UPDATE file_reservations SET created_ts={} WHERE id=401", mcp_agent_mail_db::now_micros()),
+            "UPDATE file_reservations SET released_ts=5000000 WHERE id=401",
+            "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)",
+            "UPDATE file_reservations SET expires_ts=9000000 WHERE id=401",
+            "UPDATE file_reservations SET created_ts={now} WHERE id=401",
         ] {
             fixture(|cx, pool, config| {
+                // The in-flight grant is stamped as the fixture runs: stamped
+                // before the earlier fixtures, a slow host aged it past
+                // GRANT_GRACE_US and the pass repaired it.
+                let change = change.replace("{now}", &mcp_agent_mail_db::now_micros().to_string());
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
                 conn.execute_raw(&change).unwrap();
                 drop(conn);
@@ -721,7 +1007,17 @@ mod tests {
                 conn.execute_raw(change).unwrap();
                 drop(conn);
                 let mut attempted = false;
-                assert!(repair_one(cx, pool, config, &captured, &mut attempted, &AtomicBool::new(false)).is_err());
+                assert!(
+                    repair_one(
+                        cx,
+                        pool,
+                        config,
+                        &captured,
+                        &mut attempted,
+                        &AtomicBool::new(false)
+                    )
+                    .is_err()
+                );
                 assert!(!attempted);
                 assert!(!target(config).exists());
             });
@@ -753,6 +1049,7 @@ mod tests {
             let head = repo.head().unwrap().target().unwrap();
             let report = pass(cx, pool, config);
             assert_eq!((report.repaired, report.deferred), (0, 1));
+            assert_eq!((report.deferred_transient, report.retry_len), (0, 0));
             assert!(!path.exists());
             assert_eq!(fs::read(retained).unwrap(), bytes);
             assert_eq!(repo.head().unwrap().target().unwrap(), head);
@@ -816,6 +1113,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!((first.repaired, first.deferred), (WRITES_PER_PASS, 1));
+            assert_eq!((first.deferred_transient, first.retry_len), (0, 0));
             assert!(first.more);
             let ceiling = cursor.ceiling;
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
@@ -904,7 +1202,9 @@ mod tests {
         let tree = head_tree(&repo).unwrap().unwrap();
         assert_eq!(
             committed_artifact(&repo, Some(&tree), &relative)
-                .unwrap().unwrap().bytes,
+                .unwrap()
+                .unwrap()
+                .bytes,
             artifact.bytes,
         );
         assert_eq!(read_source(cx, pool, id).unwrap().unwrap(), source);
@@ -926,7 +1226,12 @@ mod tests {
                 let owner = std::thread::spawn(move || {
                     let gate = if parent_writer {
                         let (gate, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-                        assert!(matches!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        assert!(matches!(
+                            outcome,
+                            DrainOutcome::TimedOut {
+                                remaining_writers: 1
+                            }
+                        ));
                         gate
                     } else {
                         try_acquire_promotion_barrier_if_idle().expect("idle promotion")
@@ -938,25 +1243,42 @@ mod tests {
                 });
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let mut cursor = ActiveReservationCursor {
-                    identity: "retained source".into(), after: 17, ceiling: Some(401),
+                    identity: "retained source".into(),
+                    after: 17,
+                    ceiling: Some(401),
+                    ..Default::default()
                 };
                 let refused = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
                 );
                 let writers = active_writer_count();
                 let initialized = config.storage_root.join("projects").exists();
                 drop(parent);
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "repair waited for promotion expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "repair waited for promotion expiry"
+                );
                 assert!(refused.unwrap_err().contains("admission contention"));
                 assert_eq!(writers, usize::from(parent_writer));
                 assert!(!initialized);
-                assert_eq!((&*cursor.identity, cursor.after, cursor.ceiling),
-                           ("retained source", 17, Some(401)));
+                assert_eq!(
+                    (&*cursor.identity, cursor.after, cursor.ceiling),
+                    ("retained source", 17, Some(401))
+                );
                 assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
                 let resumed = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
-                ).unwrap();
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
                 assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
                 assert_committed(cx, pool, config, 401);
                 assert_eq!(active_writer_count(), 0);
@@ -975,7 +1297,10 @@ mod tests {
                     crate::ensure_archive(config, "project").unwrap();
                 }
                 crate::flush_async_commits();
-                let epoch_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+                let epoch_path = config
+                    .storage_root
+                    .join(".git")
+                    .join(crate::ARCHIVE_EPOCH_FILE_NAME);
                 let stamp = fs::read(&epoch_path).ok();
                 let epoch = crate::archive_mutation_epoch();
                 let source = read_source(cx, pool, 401).unwrap().unwrap();
@@ -990,35 +1315,66 @@ mod tests {
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let mut cursor = ActiveReservationCursor::default();
                 let first = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
                 );
                 let writers = active_writer_count();
                 let gate = try_acquire_promotion_barrier_if_idle();
                 let can_promote = gate.is_some();
                 drop(gate);
                 let observations = (
-                    target(config).exists(), config.storage_root.join(".git").exists(),
-                    fs::read(&epoch_path).ok(), crate::archive_mutation_epoch(),
+                    target(config).exists(),
+                    config.storage_root.join(".git").exists(),
+                    fs::read(&epoch_path).ok(),
+                    crate::archive_mutation_epoch(),
                     crate::archive_mutations_active(),
                 );
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "repair waited for fence-owner expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "repair waited for fence-owner expiry"
+                );
                 let first = first.unwrap();
-                assert_eq!((first.scanned, first.deferred, first.repaired, first.attempted), (1, 1, 0, 0));
+                assert_eq!(
+                    (
+                        first.scanned,
+                        first.deferred,
+                        first.repaired,
+                        first.attempted
+                    ),
+                    (1, 1, 0, 0)
+                );
+                assert_eq!((first.deferred_transient, first.retry_len), (1, 1));
+                assert!(first.more);
                 assert_eq!(observations, (false, existing_archive, stamp, epoch, 0));
                 assert_eq!(writers, 0);
                 assert!(can_promote);
-                assert!(cursor.ceiling.is_none(), "the finite round must revisit deferrals");
+                assert!(
+                    cursor.ceiling.is_none(),
+                    "the finite discovery round must finish independently of retry debt"
+                );
                 assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
                 conn.execute_raw("UPDATE file_reservations SET reason='renewed while deferred', expires_ts=expires_ts+1000000 WHERE id=401").unwrap();
                 drop(conn);
                 let resumed = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
-                ).unwrap();
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
                 assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
+                assert_eq!(resumed.retry_len, 0);
                 assert_committed(cx, pool, config, 401);
-                assert_eq!(read_artifact(&target(config)).unwrap().unwrap().value["reason"], "renewed while deferred");
+                assert_eq!(
+                    read_artifact(&target(config)).unwrap().unwrap().value["reason"],
+                    "renewed while deferred"
+                );
                 assert_eq!(active_writer_count(), 0);
             });
         }
@@ -1046,27 +1402,49 @@ mod tests {
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut cursor = ActiveReservationCursor::default();
             let first = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
             );
             let missing = !target(config).exists();
-            let other = config.storage_root.join("projects/other/file_reservations/id-501-gaabb.json");
+            let other = config
+                .storage_root
+                .join("projects/other/file_reservations/id-501-gaabb.json");
             let other_present = other.exists();
             let _ = release_tx.send(());
-            assert!(owner.join().unwrap().is_ok(), "repair waited for project-owner expiry");
+            assert!(
+                owner.join().unwrap().is_ok(),
+                "repair waited for project-owner expiry"
+            );
             let first = first.unwrap();
             assert_eq!((first.scanned, first.deferred, first.repaired), (2, 1, 1));
+            assert_eq!((first.deferred_transient, first.retry_len), (1, 1));
             assert!(missing && other_present);
             assert_committed(cx, pool, config, 501);
             // Release the previously active row while its repair is deferred.
-            // The next round must consult both release stores, never a payload
+            // The retry must consult both release stores, never a payload
             // captured before contention. Keep the same cursor, without reset.
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)").unwrap();
             drop(conn);
             let resumed = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
-            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (0, 1, 0));
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.unchanged, resumed.deferred),
+                (0, 2, 0)
+            );
+            assert_eq!(
+                resumed.retry_len, 0,
+                "the released retry is settled, not replayed"
+            );
             assert!(!target(config).exists());
             assert!(read_source(cx, pool, 401).unwrap().is_none());
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
@@ -1107,15 +1485,149 @@ mod tests {
             assert!(observed && released.is_ok());
             let interrupted = interrupted.unwrap();
             assert!(interrupted.interrupted && interrupted.more);
-            assert_eq!((interrupted.scanned, interrupted.attempted, cursor.after), (0, 0, 0));
+            assert_eq!(
+                (interrupted.scanned, interrupted.attempted, cursor.after),
+                (0, 0, 0)
+            );
             assert!(absent);
             assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             let resumed = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
             assert_committed(cx, pool, config, 401);
         });
+    }
+
+    #[test]
+    fn contended_active_lease_is_retried_before_the_discovery_round_finishes() {
+        fixture(|cx, pool, config| {
+            let original = read_source(cx, pool, 401).unwrap().unwrap();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..=480 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            drop(conn);
+            crate::ensure_archive(config, "project").unwrap();
+            crate::flush_async_commits();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                crate::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10))
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut cursor = ActiveReservationCursor::default();
+            let refused = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            );
+            let before = (cursor.after, cursor.ceiling, target(config).exists());
+            let _ = release_tx.send(());
+            assert!(
+                owner.join().unwrap().is_ok(),
+                "repair must not wait for the fence"
+            );
+            let refused = refused.unwrap();
+            assert_eq!(
+                (refused.scanned, refused.attempted, refused.repaired),
+                (32, 0, 0)
+            );
+            assert_eq!((refused.deferred_transient, refused.retry_len), (32, 32));
+            assert_eq!(before, (432, Some(480), false));
+
+            let resumed = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(resumed.repaired, WRITES_PER_PASS);
+            assert_eq!(resumed.deferred, 0);
+            assert!(resumed.scanned <= 32 && resumed.attempted <= WRITES_PER_PASS);
+            assert_eq!(
+                resumed.retry_len, 30,
+                "two retry and two discovery repairs share the budget"
+            );
+            assert_eq!(cursor.ceiling, Some(480));
+            assert!(
+                cursor.after > 432 && cursor.after < 480,
+                "discovery must also progress"
+            );
+            assert_committed(cx, pool, config, 401);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), original);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn source_rebinding_discards_old_retry_debt_before_reading_new_ids() {
+        fixture(|cx, pool, config| {
+            let mut cursor = ActiveReservationCursor {
+                identity: "retired mailbox generation".into(),
+                after: 9_000,
+                ceiling: Some(10_000),
+                retry_first: true,
+                ..Default::default()
+            };
+            assert!(cursor.retries.defer(9_001, Instant::now()));
+            let report = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (report.scanned, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
+            assert_eq!(report.retry_len, 0);
+            assert_eq!(cursor.identity, pool.sqlite_identity_key());
+            assert_committed(cx, pool, config, 401);
+        });
+    }
+
+    #[test]
+    fn retry_classification_does_not_turn_conflicts_or_permissions_into_contention() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let failure =
+                RepairFailure::from(crate::StorageError::Io(std::io::Error::new(kind, "test")));
+            assert!(failure.transient, "{kind:?}");
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let failure =
+                RepairFailure::from(crate::StorageError::Io(std::io::Error::new(kind, "test")));
+            assert!(!failure.transient, "{kind:?}");
+        }
+        assert!(!RepairFailure::from(invalid("terminal evidence must be preserved")).transient);
+        assert!(!RepairFailure::from("malformed source identity").transient);
+        assert!(
+            RepairFailure::from(crate::StorageError::LockContention {
+                message: "publication fence busy".to_string(),
+            })
+            .transient
+        );
     }
 }

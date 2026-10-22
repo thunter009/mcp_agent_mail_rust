@@ -88,6 +88,9 @@ fn checkpoint(control: Option<RepairControl<'_>>) -> crate::Result<()> {
 /// Git blobs within the same bundle budget. Missing attachment authority defers
 /// repair; no image conversion or external fetch is attempted. Thread digests
 /// are not reconstructed here.
+/// Project-mailbox addresses remain in the frontmatter, but do not name agent
+/// inbox directories. A shared-only message therefore has two message copies:
+/// canonical and sender outbox, regardless of the project's agent population.
 ///
 /// # Errors
 ///
@@ -109,7 +112,8 @@ pub fn reconcile_message_bundle(
 /// as [`reconcile_message_bundle`]. A busy global publication fence defers
 /// immediately; project mutex/flock waits share a 250 ms acquisition budget.
 /// The worker stop flag and Cx are checked before admission, while waiting for
-/// project locks, between file publications, and before committing. Completed
+/// project locks, during canonical identity scans, between file publications,
+/// and before committing. Completed
 /// files survive cancellation and are revalidated on retry, never redelivered.
 ///
 /// # Errors
@@ -163,41 +167,7 @@ fn reconcile_message_bundle_inner(
             "archive reconciliation message byte budget exceeded",
         ));
     }
-    if entry.recipients.len() > MAX_RECIPIENTS {
-        return Err(invalid("archive reconciliation recipient budget exceeded"));
-    }
-    let mut recipients = Vec::new();
-    for kind in ["to", "cc", "bcc"] {
-        let names = entry
-            .message
-            .get(kind)
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "archive reconciliation requires an explicit {kind} array"
-                ))
-            })?;
-        for name in names {
-            let name = name
-                .as_str()
-                .ok_or_else(|| invalid("recipient must be a string"))?;
-            crate::validate_archive_component("recipient", name)?;
-            recipients.push(name.to_string());
-            if recipients.len() > MAX_RECIPIENTS {
-                return Err(invalid("archive reconciliation recipient budget exceeded"));
-            }
-        }
-    }
-    recipients.sort_unstable();
-    recipients.dedup();
-    let mut supplied = entry.recipients.to_vec();
-    supplied.sort_unstable();
-    supplied.dedup();
-    if recipients != supplied || recipients.is_empty() {
-        return Err(invalid(
-            "archive reconciliation recipient routing does not match frontmatter",
-        ));
-    }
+    let recipients = reconciliation_inboxes(archive, entry.message, entry.recipients)?;
     if !entry.extra_paths.is_empty() {
         return Err(invalid(
             "archive reconciliation does not authorize extra commit paths",
@@ -282,7 +252,10 @@ fn reconcile_message_bundle_inner(
         // Disk loss does not erase a canonical ID recorded under another Git
         // path. Share one budget across both namespaces. An interrupted repair
         // with all files present still needs this proof before its first commit.
-        let mut identity_budget = CanonicalScanBudget::default();
+        let mut identity_budget = CanonicalScanBudget {
+            control,
+            ..Default::default()
+        };
         let canonical_committed = identity::preflight(
             &repo,
             archive,
@@ -341,22 +314,113 @@ fn reconcile_message_bundle_inner(
     })
 }
 
-struct CanonicalScanBudget {
-    entries_left: usize,
-    bytes_left: u64,
+/// Validate the complete routing envelope before any archive publication, but
+/// return only physical agent inboxes. The live-source projection canonicalizes
+/// shared delivery to `project:<slug>`; a different project, alias, BCC slot or
+/// repeated shared address is not authority to manufacture another delivery.
+fn reconciliation_inboxes(
+    archive: &ProjectArchive,
+    message: &serde_json::Value,
+    supplied: &[String],
+) -> crate::Result<Vec<String>> {
+    if supplied.len() > MAX_RECIPIENTS {
+        return Err(invalid("archive reconciliation recipient budget exceeded"));
+    }
+    let address = mcp_agent_mail_db::project_mailbox::project_mailbox_address(&archive.slug);
+    let mut shared = false;
+    let mut addressed = 0;
+    let mut recipients = Vec::new();
+    for kind in ["to", "cc", "bcc"] {
+        let names = message
+            .get(kind)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "archive reconciliation requires an explicit {kind} array"
+                ))
+            })?;
+        if names.len() > MAX_RECIPIENTS - addressed {
+            return Err(invalid("archive reconciliation recipient budget exceeded"));
+        }
+        addressed += names.len();
+        for name in names {
+            let name = name
+                .as_str()
+                .ok_or_else(|| invalid("recipient must be a string"))?;
+            if mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_some() {
+                if shared || kind == "bcc" || name != address {
+                    return Err(invalid(
+                        "archive reconciliation requires one canonical same-project mailbox address in to or cc",
+                    ));
+                }
+                shared = true;
+            } else {
+                crate::validate_archive_component("recipient", name)?;
+                recipients.push(name.to_string());
+            }
+        }
+    }
+    recipients.sort_unstable();
+    recipients.dedup();
+    let mut supplied = supplied.to_vec();
+    supplied.sort_unstable();
+    supplied.dedup();
+    if recipients != supplied || addressed == 0 {
+        return Err(invalid(
+            "archive reconciliation recipient routing does not match frontmatter",
+        ));
+    }
+    Ok(recipients)
 }
 
-impl Default for CanonicalScanBudget {
+struct CanonicalScanBudget<'a> {
+    entries_left: usize,
+    bytes_left: u64,
+    control: Option<RepairControl<'a>>,
+}
+
+impl Default for CanonicalScanBudget<'_> {
     fn default() -> Self {
         Self {
             entries_left: MAX_CANONICAL_SCAN_ENTRIES,
             bytes_left: MAX_CANONICAL_SCAN_BYTES,
+            control: None,
         }
     }
 }
 
-impl CanonicalScanBudget {
+#[cfg(test)]
+type ScanHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+std::thread_local! {
+    // Observe real scan boundaries; no filesystem/Git result is substituted.
+    static SCAN_HOOK: std::cell::RefCell<Option<ScanHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl CanonicalScanBudget<'_> {
+    fn checkpoint(&self, stage: &'static str) -> crate::Result<()> {
+        #[cfg(test)]
+        if self.control.is_some() {
+            SCAN_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(stage);
+                }
+            });
+        }
+        if self.control.is_some_and(RepairControl::cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("message archive repair cancelled during canonical {stage}"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn visit(&mut self) -> crate::Result<()> {
+        self.checkpoint("entry")?;
         self.entries_left = self.entries_left.checked_sub(1).ok_or_else(|| {
             invalid("canonical recovery scan entry budget exceeded; repair refused")
         })?;
@@ -366,6 +430,7 @@ impl CanonicalScanBudget {
     /// Read only frontmatter. Charge actual buffered reads (including any
     /// read-ahead), not the decoded JSON size; a huge body is never materialized.
     fn read_id(&mut self, path: &Path) -> crate::Result<i64> {
+        self.checkpoint("disk open")?;
         let limit = self.bytes_left.min(MAX_MESSAGE_ARTIFACT_BYTES as u64);
         if limit == 0 {
             return Err(invalid(
@@ -377,12 +442,14 @@ impl CanonicalScanBudget {
         let mut reader = BufReader::with_capacity(1024, file.take(limit + 1));
         let result = (|| -> crate::Result<i64> {
             let mut line = String::new();
+            self.checkpoint("disk header")?;
             reader.read_line(&mut line)?;
             if line != "---json\n" {
                 return Err(invalid("canonical recovery source has invalid frontmatter"));
             }
             let mut header = String::new();
             loop {
+                self.checkpoint("disk header")?;
                 line.clear();
                 if reader.read_line(&mut line)? == 0 {
                     return Err(invalid(
@@ -394,7 +461,9 @@ impl CanonicalScanBudget {
                 }
                 header.push_str(&line);
             }
+            self.checkpoint("disk decode")?;
             let message: serde_json::Value = serde_json::from_str(&header)?;
+            self.checkpoint("disk result")?;
             crate::positive_message_id(&message)
                 .ok_or_else(|| invalid("canonical recovery source has no positive message ID"))
         })();
@@ -412,8 +481,9 @@ impl CanonicalScanBudget {
 fn canonical_date_directories(
     root: &Path,
     width: usize,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<Vec<PathBuf>> {
+    budget.checkpoint("disk directory")?;
     if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(invalid(
             "canonical recovery directory is not a real directory",
@@ -438,6 +508,7 @@ fn canonical_date_directories(
         }
         directories.push(entry.path());
     }
+    budget.checkpoint("disk directory result")?;
     Ok(directories)
 }
 
@@ -450,8 +521,9 @@ fn reject_recovery_canonical_id_collision(
     archive: &ProjectArchive,
     message_id: i64,
     target: &Path,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<()> {
+    budget.checkpoint("disk root")?;
     let root = crate::archive_project_root_checked(archive)?.join("messages");
     if crate::path_existing_prefix_has_symlink(&root)? {
         return Err(invalid("canonical recovery root has a symlinked authority"));
@@ -463,6 +535,7 @@ fn reject_recovery_canonical_id_collision(
     }
     for year in canonical_date_directories(&root, 4, budget)? {
         for month in canonical_date_directories(&year, 2, budget)? {
+            budget.checkpoint("disk month")?;
             // Revalidate at descent rather than intentionally following a
             // directory replaced by a symlink since enumeration.
             if !std::fs::symlink_metadata(&month)?.file_type().is_dir() {
@@ -493,7 +566,7 @@ fn reject_recovery_canonical_id_collision(
             }
         }
     }
-    Ok(())
+    budget.checkpoint("disk scan result")
 }
 
 /// A repair may fill a missing Git path or restore an object whose expected
@@ -938,6 +1011,7 @@ mod tests {
         let mut budget = CanonicalScanBudget {
             entries_left: 10,
             bytes_left: 2048,
+            ..Default::default()
         };
         reject_recovery_canonical_id_collision(&archive, 42, &paths.canonical, &mut budget)
             .unwrap();
@@ -960,10 +1034,12 @@ mod tests {
             CanonicalScanBudget {
                 entries_left: 2,
                 bytes_left: 2048,
+                ..Default::default()
             },
             CanonicalScanBudget {
                 entries_left: 10,
                 bytes_left: 16,
+                ..Default::default()
             },
         ] {
             let error =
@@ -1149,5 +1225,317 @@ mod tests {
         assert!(!head_contains(&repo, &paths, &[oid]).unwrap());
         assert_eq!(repo.blob(bytes).unwrap(), oid);
         assert!(head_contains(&repo, &paths, &[oid]).unwrap());
+    }
+
+    #[test]
+    fn shared_only_repair_commits_two_copies_without_fanout() {
+        if cancellable_tests::isolated() {
+            return;
+        }
+        for kind in ["to", "cc"] {
+            let (_dir, config, archive, mut message, _) = fixture();
+            message["to"] = json!([]);
+            message["cc"] = json!([]);
+            message["bcc"] = json!([]);
+            message[kind] = json!(["project:reconcile-project"]);
+            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])
+                .unwrap()
+                .0;
+            let cx = Cx::for_testing();
+            let result = reconcile_message_bundle_cancellable(
+                &cx,
+                &archive,
+                &config,
+                entry(&message, &[]),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(result.files_created, 2);
+            assert!(result.git_commit_needed);
+            assert!(paths.inbox.is_empty());
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().peel_to_tree().unwrap();
+            let bytes =
+                crate::render_message_bundle_content(&message, entry(&message, &[]).body_md)
+                    .unwrap();
+            for path in [&paths.canonical, &paths.outbox] {
+                assert_eq!(std::fs::read(path).unwrap(), bytes.as_bytes());
+                let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                let object = head.get_path(Path::new(&relative)).unwrap();
+                assert_eq!(
+                    repo.find_blob(object.id()).unwrap().content(),
+                    bytes.as_bytes()
+                );
+            }
+            assert!(
+                !archive
+                    .root
+                    .join("agents/project:reconcile-project")
+                    .exists()
+            );
+            assert!(!archive.root.join("agents/GreenStone/inbox").exists());
+            let before = repo.head().unwrap().target().unwrap();
+            assert_eq!(
+                reconcile_message_bundle(&archive, &config, entry(&message, &[])).unwrap(),
+                ReconcileResult::default()
+            );
+            assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn mixed_shared_repair_keeps_direct_copies_and_bcc_redaction() {
+        let (_dir, config, archive, mut message, recipients) = fixture();
+        message["cc"] = json!(["project:reconcile-project"]);
+        let result =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        assert_eq!(result.files_created, 4);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        assert_eq!(paths.inbox.len(), 2);
+        assert_eq!(
+            read_surviving_message(&paths.canonical).unwrap().unwrap().0,
+            message
+        );
+        for path in &paths.inbox {
+            let (observed, body) = read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(observed, crate::redact_message_bcc_for_inbox(&message));
+            assert_eq!(observed["cc"], json!(["project:reconcile-project"]));
+            assert_eq!(observed["bcc"], json!([]));
+            assert_eq!(body, entry(&message, &recipients).body_md);
+        }
+        assert!(
+            !archive
+                .root
+                .join("agents/project:reconcile-project")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn shared_routing_refuses_foreign_duplicate_private_and_phantom_inboxes() {
+        let (_dir, config, archive, mut message, _) = fixture();
+        message["to"] = json!([]);
+        message["cc"] = json!([]);
+        message["bcc"] = json!([]);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().ok().and_then(|head| head.target());
+        for address in [
+            "project:other",
+            "project:",
+            "project:../outside",
+            " project:reconcile-project ",
+        ] {
+            message["to"] = json!([address]);
+            assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
+        }
+        message["to"] = json!([]);
+        message["bcc"] = json!(["project:reconcile-project"]);
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
+        message["bcc"] = json!([]);
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
+        message["to"] = json!(["project:reconcile-project"]);
+        message["cc"] = message["to"].clone();
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
+        message["cc"] = json!([]);
+        for phantom in ["project:reconcile-project", "GreenStone"] {
+            assert!(
+                reconcile_message_bundle(
+                    &archive,
+                    &config,
+                    entry(&message, &[phantom.to_string()])
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(repo.head().ok().and_then(|head| head.target()), before);
+        assert!(!archive.root.join("agents/BlueLake/outbox").exists());
+        assert!(!archive.root.join("agents/GreenStone/inbox").exists());
+    }
+
+    #[test]
+    fn shared_address_consumes_the_same_routing_budget_as_direct_recipients() {
+        let (_dir, _config, archive, mut message, _) = fixture();
+        let supplied = vec!["GreenStone".to_string()];
+        message["to"] = json!(vec!["GreenStone"; MAX_RECIPIENTS - 1]);
+        message["cc"] = json!(["project:reconcile-project"]);
+        message["bcc"] = json!([]);
+        assert_eq!(
+            reconciliation_inboxes(&archive, &message, &supplied).unwrap(),
+            supplied
+        );
+        message["to"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("GreenStone"));
+        assert!(reconciliation_inboxes(&archive, &message, &supplied).is_err());
+        message["to"] = json!(vec!["project:reconcile-project"; MAX_RECIPIENTS + 1]);
+        message["cc"] = json!([]);
+        assert!(reconciliation_inboxes(&archive, &message, &[]).is_err());
+    }
+
+    #[test]
+    fn shared_repair_preserves_conflicting_evidence_and_honors_cancellation() {
+        let (_dir, config, archive, mut message, _) = fixture();
+        message["to"] = json!(["project:reconcile-project"]);
+        message["cc"] = json!([]);
+        message["bcc"] = json!([]);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])
+            .unwrap()
+            .0;
+        assert!(
+            reconcile_message_bundle_cancellable(
+                &Cx::for_testing(),
+                &archive,
+                &config,
+                entry(&message, &[]),
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        crate::ensure_parent_dir(&paths.canonical).unwrap();
+        std::fs::write(&paths.canonical, b"keep conflicting source").unwrap();
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
+        assert_eq!(
+            std::fs::read(&paths.canonical).unwrap(),
+            b"keep conflicting source"
+        );
+        assert!(!paths.outbox.exists());
+    }
+
+    #[test]
+    fn shared_repair_restores_committed_disk_loss_without_another_commit() {
+        let (_dir, config, archive, mut message, _) = fixture();
+        message["to"] = json!(["project:reconcile-project"]);
+        message["cc"] = json!([]);
+        message["bcc"] = json!([]);
+        reconcile_message_bundle(&archive, &config, entry(&message, &[])).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])
+            .unwrap()
+            .0;
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let bytes = std::fs::read(&paths.canonical).unwrap();
+        std::fs::rename(
+            &paths.canonical,
+            config.storage_root.join("shared-canonical-evidence.md"),
+        )
+        .unwrap();
+        std::fs::rename(
+            &paths.outbox,
+            config.storage_root.join("shared-outbox-evidence.md"),
+        )
+        .unwrap();
+        let result = reconcile_message_bundle(&archive, &config, entry(&message, &[])).unwrap();
+        assert_eq!(result.files_created, 2);
+        assert!(!result.git_commit_needed);
+        assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        assert_eq!(std::fs::read(&paths.canonical).unwrap(), bytes);
+        assert_eq!(std::fs::read(&paths.outbox).unwrap(), bytes);
+        assert!(paths.inbox.is_empty());
+    }
+
+    #[test]
+    fn live_shared_source_reconciles_without_touching_delivery_or_receipt_state() {
+        if cancellable_tests::isolated() {
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let config = Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
+                storage_root: temp.path().join("archive"),
+                ..Config::default()
+            };
+            std::fs::create_dir_all(&config.storage_root).unwrap();
+            let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
+            for sql in [
+                "INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'reconcile-project', '/test/reconcile', 1)",
+                "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(101, 101, 'BlueLake', 'test', 'test', 1, 1), (102, 101, 'GreenStone', 'test', 'test', 1, 1), (103, 101, 'RedFox', 'test', 'test', 1, 1)",
+                "INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) VALUES(901, 101, 101, 'shared recovery', 'body', 'normal', 1, 1000000, '{\"to\":[\"project:reconcile-project\"],\"cc\":[],\"bcc\":[]}', '[]', '{}')",
+                "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES(901, 101, 'to', 1000000)",
+                "INSERT INTO project_mailbox_receipts(message_id, agent_id, read_ts, ack_ts) VALUES(901, 102, 15, 17)",
+            ] {
+                conn.execute_raw(sql).unwrap();
+            }
+            drop(conn);
+            let mut cursor = database::ReconcileCursor::default();
+            let report = database::reconcile_message_batch(
+                &cx,
+                &pool,
+                &config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (report.repaired, report.files_created, report.deferred),
+                (1, 2, 0)
+            );
+            let archive = crate::open_archive(&config, "reconcile-project")
+                .unwrap()
+                .unwrap();
+            let message = json!({
+                "id": 901, "from": "BlueLake", "to": ["project:reconcile-project"],
+                "cc": [], "bcc": [], "subject": "shared recovery", "thread_id": null,
+                "topic": null, "created": mcp_agent_mail_db::micros_to_iso(1_000_000),
+                "project": "/test/reconcile", "project_slug": "reconcile-project",
+                "importance": "normal", "ack_required": true, "attachments": [],
+            });
+            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])
+                .unwrap()
+                .0;
+            for path in [&paths.canonical, &paths.outbox] {
+                assert_eq!(
+                    read_surviving_message(path).unwrap().unwrap(),
+                    (message.clone(), "body".to_string())
+                );
+            }
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
+            for (table, expected) in [
+                ("messages", 1),
+                ("message_recipients", 0),
+                ("project_mailbox_deliveries", 1),
+                ("project_mailbox_receipts", 1),
+            ] {
+                assert_eq!(
+                    conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap(),
+                    expected
+                );
+            }
+            let rows = conn
+                .query_sync(
+                    "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 102);
+            assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 15);
+            assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 17);
+            assert!(!archive.root.join("agents/GreenStone/inbox").exists());
+            assert!(!archive.root.join("agents/RedFox/inbox").exists());
+            assert!(paths.inbox.is_empty());
+        });
     }
 }
