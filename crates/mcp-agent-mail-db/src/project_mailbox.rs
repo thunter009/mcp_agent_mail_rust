@@ -563,7 +563,7 @@ fn reference_project_mailbox_rows_from_conn(
 #[must_use]
 pub fn product_inbox_select_sql(body_select: &str) -> String {
     format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.reply_to, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 '{PROJECT_MAILBOX_KIND}' AS kind, COALESCE(s.name, ?) AS sender_name, \
                 pr.read_ts, pr.ack_ts \
@@ -1360,6 +1360,7 @@ mod tests {
             "agents ADD COLUMN name TEXT NOT NULL DEFAULT 'Viewer'",
             "messages ADD COLUMN thread_id TEXT",
             "messages ADD COLUMN topic TEXT",
+            "messages ADD COLUMN reply_to INTEGER",
             "messages ADD COLUMN subject TEXT NOT NULL DEFAULT 'shared'",
             "messages ADD COLUMN body_md TEXT NOT NULL DEFAULT 'body'",
             "messages ADD COLUMN importance TEXT NOT NULL DEFAULT 'normal'",
