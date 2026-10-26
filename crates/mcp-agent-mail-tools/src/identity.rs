@@ -597,6 +597,11 @@ fn health_check_retention_block(
         Some((policy, now_us)),
     )
     .map_err(|error| format!("inspecting retention footprint: {error}"))?;
+    let staging = mcp_agent_mail_db::recovery_retention::staging::assess_automatic_backup_staging(
+        database_path,
+        stats.proactive_backup_staging,
+    )
+    .map_err(|error| format!("automatic backup staging assessment unavailable: {error}"))?;
     let reclaimable_attention = stats.reclaimable_attention(config.doctor_retention_alert_bytes);
     let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
     Ok(Some(RetentionHealthResponse {
@@ -611,6 +616,7 @@ fn health_check_retention_block(
         live_database_bytes: stats.live_database_bytes,
         reclaimable_attention,
         resident_attention,
+        automatic_backup_staging: Some(BackupStagingHealthResponse::from_assessment(staging)),
     }))
 }
 
@@ -634,10 +640,24 @@ fn retention_health_verdict(
             "in-memory mailbox has no filesystem retention footprint",
         ),
         Ok(Some(retention)) => {
-            let attention = retention.resident_attention || retention.reclaimable_attention;
+            let staging = retention.automatic_backup_staging.as_ref();
+            let staging_refusal = staging.and_then(|assessment| assessment.refusal.as_deref());
+            let attention = retention.resident_attention
+                || retention.reclaimable_attention
+                || staging_refusal.is_some()
+                || staging.is_none();
             let live_database = retention
                 .live_database_bytes
                 .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string());
+            let next_step = match staging_refusal {
+                Some(reason) => format!(
+                    "automatic backups refused: {reason}; {}",
+                    mcp_agent_mail_db::recovery_retention::staging::STAGING_REMEDIATION
+                ),
+                None if staging.is_none() => "automatic backup staging assessment unavailable; request a fresh health check before treating backups as available".to_string(),
+                None if attention => "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption".to_string(),
+                None => "staging budget permits an attempt; retention is below the configured alert thresholds, or byte alerts are disabled".to_string(),
+            };
             HealthVerdict::new(
                 if attention {
                     HealthLevel::Yellow
@@ -646,17 +666,17 @@ fn retention_health_verdict(
                 },
                 false,
                 format!(
-                    "resident_bytes={} live_database_bytes={} reclaimable_bytes={} resident_attention={} reclaimable_attention={}; {}",
+                    "resident_bytes={} live_database_bytes={} reclaimable_bytes={} resident_attention={} reclaimable_attention={} retained_staging_artifacts={}; {}",
                     retention.resident_bytes,
                     live_database,
                     retention.reclaimable_bytes,
                     retention.resident_attention,
                     retention.reclaimable_attention,
-                    if attention {
-                        "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption"
-                    } else {
-                        "retention is below the configured alert thresholds, or alerts are disabled"
-                    }
+                    staging.map_or_else(
+                        || "unavailable".to_string(),
+                        |assessment| assessment.retained_artifacts.to_string()
+                    ),
+                    next_step,
                 ),
             )
         }
@@ -1706,6 +1726,39 @@ pub struct RetentionHealthResponse {
     /// protected backups and stage copies; it is not reclamation authority.
     #[serde(default)]
     pub resident_attention: bool,
+    /// The same count and projected-byte policy the automatic exporter uses.
+    /// An observed refusal degrades health even when byte alerts are disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_backup_staging: Option<BackupStagingHealthResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupStagingHealthResponse {
+    pub retained_artifacts: usize,
+    pub retained_bytes: u64,
+    pub projected_bytes: u64,
+    pub artifact_limit: usize,
+    pub byte_limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+impl BackupStagingHealthResponse {
+    fn from_assessment(
+        assessment: mcp_agent_mail_db::recovery_retention::staging::AutomaticBackupStagingAssessment,
+    ) -> Self {
+        Self {
+            retained_artifacts: assessment.inventory.artifacts(),
+            retained_bytes: assessment.inventory.bytes,
+            projected_bytes: assessment.projected_bytes,
+            artifact_limit: mcp_agent_mail_db::recovery_retention::staging::MAX_RETAINED_STAGES,
+            byte_limit: assessment.byte_limit,
+            refusal: assessment
+                .check_budget()
+                .err()
+                .map(|error| error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2166,6 +2219,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // queue capacity/soft-cap values even before the first write/commit.
     mcp_agent_mail_storage::wbq_start();
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
+    let disk_sample = if config.disk_space_monitor_enabled {
+        Some(mcp_agent_mail_core::disk::sample_and_record(config))
+    } else {
+        None
+    };
+    // Include the disk sample in the same observation used for pressure
+    // classification, reported queue gauges, and the pressure explanation.
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let timeout_diagnostics = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(
         mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS.saturating_mul(1_000),
@@ -2174,12 +2234,6 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         metrics.storage.commit_queue_latency_us.p99,
         config.health_commit_coalescer_p99_degraded_ms,
     );
-    let disk_sample = if config.disk_space_monitor_enabled {
-        Some(mcp_agent_mail_core::disk::sample_and_record(config))
-    } else {
-        None
-    };
-
     let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
     let over_80_for_s = if metrics.db.pool_over_80_since_us == 0 {
         0
@@ -2203,8 +2257,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let archive_drain_stall = archive_drain_stall_detail(&archive_lag, archive_lag_critical_us);
     let archive_drain_stalled = archive_drain_stall.is_some();
 
-    // Refresh the cached health level (pressure-derived) from live metrics.
-    let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+    // br-kp1in.44: an idle pool must not hide memory-driven red. Classify,
+    // cache and explain one observation rather than taking another snapshot.
+    let pressure_signals = mcp_agent_mail_core::HealthSignals::from_snapshot(&metrics, now_us);
+    let (pressure_level, _changed) =
+        mcp_agent_mail_core::backpressure::refresh_health_level_from_snapshot(&metrics, now_us);
 
     // C1 (br-bvq1x.3.1): decompose health into independent verdicts and roll up
     // strictly, so a green top-level can never coexist with a broken critical
@@ -2281,7 +2338,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         HealthLevelContributor {
             name: "pressure".to_string(),
             level: pressure_level.to_string(),
-            detail: "live pool/queue pressure level".to_string(),
+            detail: pressure_signals.pressure_detail(&metrics.system, config),
         },
         HealthLevelContributor {
             name: "archive_lag".to_string(),
@@ -4976,6 +5033,131 @@ mod tests {
         assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
     }
 
+    #[test]
+    fn retained_stage_count_degrades_health_even_with_byte_alerts_disabled() {
+        use mcp_agent_mail_core::HealthLevel;
+        for legacy in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let primary = root.join("retention.db");
+            std::fs::write(&primary, [0_u8; 128]).unwrap();
+            let config = Config {
+                database_url: format!("sqlite:///{}", primary.display()),
+                storage_root: root.clone(),
+                doctor_retention_alert_bytes: 0,
+                ..Config::default()
+            };
+            for ordinal in 0..3 {
+                if legacy {
+                    std::fs::write(
+                        root.join(format!(".snapshot-inspect-{ordinal}.sqlite3")),
+                        b"evidence",
+                    )
+                    .unwrap();
+                } else {
+                    let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal}"));
+                    std::fs::create_dir(&stage).unwrap();
+                    std::fs::write(stage.join("snapshot.sqlite3"), b"evidence").unwrap();
+                }
+                let result = health_check_retention_block(&config);
+                let response = result.as_ref().unwrap().as_ref().unwrap();
+                let staging = response.automatic_backup_staging.as_ref().unwrap();
+                assert_eq!(staging.retained_artifacts, ordinal + 1);
+                assert_eq!(
+                    staging.retained_bytes,
+                    8 * u64::try_from(ordinal + 1).unwrap()
+                );
+                assert!(!response.resident_attention);
+                assert!(!response.reclaimable_attention);
+                let verdict = retention_health_verdict(&result);
+                if ordinal < 2 {
+                    assert_eq!(verdict.level(), HealthLevel::Green, "{}", verdict.detail);
+                    assert!(staging.refusal.is_none());
+                } else {
+                    assert_eq!(verdict.level(), HealthLevel::Yellow, "{}", verdict.detail);
+                    assert!(!verdict.critical);
+                    assert!(
+                        verdict
+                            .detail
+                            .contains("automatic backups refused: 3 retained staging artifacts")
+                    );
+                    assert!(
+                        verdict
+                            .detail
+                            .contains("am doctor reclaim does not move these stages")
+                    );
+                    let value = serde_json::to_value(response).unwrap();
+                    assert_eq!(value["automatic_backup_staging"]["retained_artifacts"], 3);
+                    assert!(value["automatic_backup_staging"]["refusal"].is_string());
+                }
+            }
+            assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 4);
+        }
+    }
+
+    #[test]
+    fn retained_legacy_bytes_refuse_health_before_the_count_limit() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let legacy = root.join(".snapshot-inspect-large.sqlite3");
+        let limit = mcp_agent_mail_db::recovery_retention::staging::STAGING_BYTES_FLOOR;
+        std::fs::File::create(&legacy)
+            .unwrap()
+            .set_len(limit)
+            .unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        let staging = response.automatic_backup_staging.as_ref().unwrap();
+        assert_eq!(staging.retained_artifacts, 1);
+        assert_eq!(staging.projected_bytes, 256);
+        assert!(staging.refusal.as_ref().unwrap().contains("exceed"));
+        assert_eq!(
+            response.resident_bytes_by_category["proactive_backup_staging"],
+            limit
+        );
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(std::fs::metadata(&legacy).unwrap().len(), limit);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn unknown_wal_size_is_unavailable_backup_evidence_not_an_empty_generation() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        std::fs::create_dir(root.join("retention.db-wal")).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .contains("assessment unavailable")
+        );
+        let verdict = retention_health_verdict(&result);
+        assert_eq!(verdict.level(), HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert!(!verdict.detail.contains("automatic backups refused"));
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn retention_probe_does_not_hide_a_staging_symlink_as_an_absent_block() {
@@ -5128,6 +5310,12 @@ mod tests {
         let response: RetentionHealthResponse = serde_json::from_value(legacy).unwrap();
         assert!(!response.resident_attention);
         assert_eq!(response.resident_bytes, 1_024);
+        assert!(response.automatic_backup_staging.is_none());
+        assert_eq!(
+            retention_health_verdict(&Ok(Some(response))).level(),
+            mcp_agent_mail_core::HealthLevel::Yellow,
+            "an older payload without staging evidence cannot prove admission"
+        );
     }
 
     #[test]
@@ -5977,6 +6165,14 @@ mod tests {
             live_database_bytes: None,
             reclaimable_attention: true,
             resident_attention: true,
+            automatic_backup_staging: Some(BackupStagingHealthResponse {
+                retained_artifacts: 0,
+                retained_bytes: 0,
+                projected_bytes: 128,
+                artifact_limit: 3,
+                byte_limit: 512 * 1024 * 1024,
+                refusal: None,
+            }),
         };
         let value = serde_json::to_value(&r).unwrap();
         let object = value.as_object().expect("retention object");

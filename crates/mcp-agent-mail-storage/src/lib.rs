@@ -607,6 +607,51 @@ fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
         .set(oldest_fence_wait_start(waits));
 }
 
+/// Direct (request-path) writers currently retrying the publication fence
+/// (see [`admit_direct_publication`]).
+static DIRECT_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Longest a blocking fence acquirer gives way to waiting direct writers.
+///
+/// The fence is a plain `Mutex`. A writer that releases it and takes it again
+/// at once (the WBQ drain between batches, the commit coalescer between
+/// commits) beats a direct writer that sleeps between attempts. At swarm
+/// saturation those back-to-back holds keep the fence busy about 97% of the
+/// time while no single hold reaches 250 ms (kp48), so direct writers ran out
+/// their whole admission budget (br-9ott5). A short pause at each blocking
+/// acquisition lets a waiting direct write in, and bounds the delay to
+/// background work.
+const DIRECT_WAITER_GIVE_WAY: Duration = Duration::from_millis(5);
+
+/// Registers one direct writer as waiting for the fence while alive.
+struct DirectFenceWaiter;
+
+impl DirectFenceWaiter {
+    fn register() -> Self {
+        DIRECT_FENCE_WAITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for DirectFenceWaiter {
+    fn drop(&mut self) {
+        DIRECT_FENCE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Before a blocking acquisition, wait up to [`DIRECT_WAITER_GIVE_WAY`] for
+/// waiting direct writers to take and release the fence. One atomic load when
+/// none is waiting.
+fn give_way_to_direct_writers() {
+    if DIRECT_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let deadline = Instant::now() + DIRECT_WAITER_GIVE_WAY;
+    while DIRECT_FENCE_WAITERS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -617,6 +662,7 @@ impl FenceLease {
     #[track_caller]
     fn acquire() -> Self {
         let site = std::panic::Location::caller();
+        give_way_to_direct_writers();
         let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -769,10 +815,16 @@ fn rewrite_archive_epoch_file(git_dir: &Path) {
 
 /// Read and validate the persisted mutation-epoch token from `git_dir`.
 /// Returns `None` when the file is missing or does not parse (unknown format
-/// version, empty/non-hex token), which readers treat as "no epoch protocol"
-/// and fall back to their conservative full-scan gate.
+/// version, empty/non-hex token). Callers requiring the epoch protocol then
+/// fall back to their conservative inventory gate.
 fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
-    let bytes = fs::read(git_dir.join(ARCHIVE_EPOCH_FILE_NAME)).ok()?;
+    // Every indexed read samples this file. Keep both allocation and I/O
+    // bounded even when a malformed control file is unexpectedly large.
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &git_dir.join(ARCHIVE_EPOCH_FILE_NAME),
+        129,
+    )
+    .ok()?;
     let (&version, token) = bytes.split_first()?;
     if version != ARCHIVE_EPOCH_FORMAT_VERSION
         || token.is_empty()
@@ -794,6 +846,7 @@ struct ArchiveMutationGuard {
 }
 
 impl ArchiveMutationGuard {
+    #[cfg(test)]
     #[track_caller]
     fn begin() -> Self {
         Self::begin_inner(None)
@@ -890,14 +943,19 @@ pub fn archive_mutations_active() -> usize {
     ARCHIVE_MUTATIONS_ACTIVE.load(Ordering::Acquire)
 }
 
-/// O(1) archive marker for consumers that need to fence an archive-backed
+/// O(1) archive marker for consumers that need to validate an archive-backed
 /// read without walking the `projects/` working tree.
 ///
 /// The marker combines the resolved Git `HEAD`, the Git index's filesystem
-/// generation, and the in-process physical-mutation epoch.  Archive readers
-/// must sample it before and after their reconstruction and compare the two
-/// markers; storage writers advance the epoch on both edges of every physical
-/// mutation window.  This deliberately does not try to discover arbitrary
+/// generation, the in-process physical-mutation epoch, and the persisted
+/// per-repo epoch token when available. Archive readers compare markers around
+/// reconstruction so completed remote writes invalidate cached reads even
+/// before the Git coalescer advances `HEAD` or the index.
+///
+/// This is an observation, not cross-process exclusion: a remote mutation can
+/// span both samples, and persisted token writes are best-effort. Equal markers
+/// do not authorize archive publication, deletion, or durability-debt clearance.
+/// This deliberately does not try to discover arbitrary
 /// uncoordinated writes beneath `projects/`: the storage write API and Git
 /// index/ref protocol are the archive authorities, and a full tree scan made
 /// the read gate scale with the whole mailbox instead of the read operation.
@@ -906,6 +964,7 @@ pub struct ArchiveReadGeneration {
     head: Option<git2::Oid>,
     index: ArchiveReadIndexStamp,
     mutation_epoch: u64,
+    epoch_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1016,13 +1075,20 @@ fn archive_read_head(repo: &Repository) -> Result<Option<git2::Oid>> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Sample the indexed/incremental generation marker for an archive root.
 ///
 /// This is constant with respect to archive working-tree size: it resolves
-/// `HEAD` and stats the Git index, rather than recursively hashing
-/// `projects/`. A concurrent in-process storage mutation or a Git
-/// `index.lock` is reported as contention so callers can retry instead of
-/// publishing a mixed read.
+/// `HEAD`, samples the Git index and reads the small persisted epoch token,
+/// rather than recursively hashing `projects/`. A concurrent in-process storage
+/// mutation, Git `index.lock`, or token change during sampling is reported as
+/// contention. The token remains optional for uninitialized/older archives;
+/// its appearance or disappearance also changes the returned generation.
 pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGeneration> {
     let mutation_epoch = archive_mutation_epoch();
     if archive_mutations_active() != 0 {
@@ -1050,16 +1116,27 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
                 head: None,
                 index: ArchiveReadIndexStamp::default(),
                 mutation_epoch,
+                epoch_token: None,
             });
         }
         Err(error) => return Err(error.into()),
     };
+    let token_before = read_archive_epoch_token(repo.path());
     let head_before = archive_read_head(&repo)?;
     let index_before = archive_read_index_stamp(repo.path())?;
+    #[cfg(test)]
+    {
+        let hook = ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     let head_after = archive_read_head(&repo)?;
     let index_after = archive_read_index_stamp(repo.path())?;
+    let token_after = read_archive_epoch_token(repo.path());
     if head_before != head_after
         || index_before != index_after
+        || token_before != token_after
         || archive_mutations_active() != 0
         || archive_mutation_epoch() != mutation_epoch
     {
@@ -1072,16 +1149,15 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
         head: head_after,
         index: index_after,
         mutation_epoch,
+        epoch_token: token_after,
     })
 }
 
-/// Persisted cross-process archive read stamp: the O(1) generation marker
-/// (`HEAD` + Git index stamp + in-process mutation epoch) combined with the
-/// per-repo epoch token every physical mutation window rewrites on disk.
+/// Archive read generation with a present, valid persisted epoch token.
 ///
-/// Two equal stamps sampled around an archive read guarantee no mutation
-/// window — in this process or any other — touched the archive in between,
-/// without walking the working tree.
+/// Like [`ArchiveReadGeneration`], this detects observed remote token changes
+/// without walking the working tree. It does not exclude a remote mutation
+/// spanning both samples and must not be used as publication/deletion authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEpochReadStamp {
     generation: ArchiveReadGeneration,
@@ -1098,24 +1174,13 @@ pub struct ArchiveEpochReadStamp {
 /// - `Err(..)`: contention (active mutation window, Git `index.lock`, token
 ///   rewritten mid-sample). Callers must not cache the read.
 pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpochReadStamp>> {
-    let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
-    let git_dir = match Repository::open(&storage_root) {
-        Ok(repo) => repo.path().to_path_buf(),
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(token_before) = read_archive_epoch_token(&git_dir) else {
+    let generation = archive_read_generation(storage_root)?;
+    let Some(epoch_token) = generation.epoch_token.clone() else {
         return Ok(None);
     };
-    let generation = archive_read_generation(&storage_root)?;
-    if read_archive_epoch_token(&git_dir).as_deref() != Some(token_before.as_str()) {
-        return Err(StorageError::LockContention {
-            message: "archive epoch token changed while being sampled".to_string(),
-        });
-    }
     Ok(Some(ArchiveEpochReadStamp {
         generation,
-        epoch_token: token_before,
+        epoch_token,
     }))
 }
 
@@ -1309,6 +1374,30 @@ std::thread_local! {
     // tests can let the real drain finish before the enqueue call returns.
     static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Inject a failure after the real drain enters an archive attempt, so
+    // panic regressions exercise lock unwinding and queue progress.
+    static WBQ_BEFORE_EXECUTE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    // Observe a real failed attempt after its guards unwind and before retry
+    // backoff, so liveness tests do not depend on catching a timed sleep.
+    static WBQ_BEFORE_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn wbq_run_before_execute_test_hook() {
+    let hook = WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn wbq_run_before_retry_test_hook() {
+    let hook = WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn wbq_try_send_counted(
@@ -1477,7 +1566,17 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
 pub fn write_op_sync(op: &WriteOp) -> Result<()> {
     let metrics = mcp_agent_mail_core::global_metrics();
     let started = Instant::now();
-    let result = wbq_execute_op(op, "archive-sync");
+    let result =
+        std::panic::catch_unwind(|| wbq_execute_op(op, "archive-sync")).unwrap_or_else(|_| {
+            // Unwind the writer's mutation/project guards before accounting
+            // for failure. The durable backlog must retain its journal and
+            // advance its retry budget instead of losing its only drainer.
+            // The panic hook already records the payload; do not copy possible
+            // message content into storage diagnostics or the dead-letter log.
+            Err(StorageError::Io(std::io::Error::other(
+                "archive write panicked; the affected operation requires reconciliation",
+            )))
+        });
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
         .storage
@@ -1522,6 +1621,58 @@ pub enum DirectArchiveWrite {
     Failed(StorageError),
 }
 
+/// How long a direct (request-path) archive write waits for the publication
+/// fence before it is refused.
+///
+/// GH#351 rules out the unbounded `ARCHIVE_PUBLICATION_FENCE.lock()` on a
+/// request thread, because a writer stalled on a slow disk can hold the fence
+/// for minutes. A single try-lock, though, refused the write whenever any
+/// writer held the fence even for a rename. At 60-agent swarm load about 91% of
+/// reservation grants then left the artifact the pre-commit guard reads to
+/// reconcile-on-read, which breaks the GH#178 durable-on-return contract.
+/// Within this budget short holds are waited out; a stalled holder still
+/// refuses the write well inside the 30 s client deadline.
+///
+/// 5 s, not 500 ms: on a loaded host, drain and coalescer holds routinely
+/// outlast 500 ms. In fb25 (paired-concurrent, 60 agents per arm), refusals
+/// per 1,000 grants were 61.7 at 500 ms vs 3.8 at 5 s (P6), and 169.6 vs 34.9
+/// (P2). The cost is longer-held dispatch threads at extreme saturation:
+/// docs/evidence/release_smoke/2026-10-23_fb25-fence-admission-levers_ab.json.
+const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Longest pause between two direct fence admission attempts. It also bounds
+/// how long a cancelled caller can keep waiting, and it is shorter than
+/// [`DIRECT_WAITER_GIVE_WAY`], so a waiting writer notices the opening that
+/// blocking acquirers leave it.
+const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
+
+/// Admit a direct write to the publication fence. Contention is retried with a
+/// doubling pause until [`DIRECT_FENCE_ADMISSION_BUDGET`] runs out; every
+/// attempt checks `cancelled` first, and any other error returns at once.
+/// While it retries, the writer is registered so blocking acquirers give way
+/// to it ([`give_way_to_direct_writers`]).
+fn admit_direct_publication(
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<ArchiveMutationGuard> {
+    let deadline = Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET;
+    let mut pause = Duration::from_micros(200);
+    let mut waiting = None;
+    loop {
+        let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
+            Err(error @ StorageError::LockContention { .. }) => error,
+            admitted_or_failed => return admitted_or_failed,
+        };
+        waiting.get_or_insert_with(DirectFenceWaiter::register);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(contention);
+        }
+        std::thread::sleep(pause.min(remaining));
+        pause = (pause * 2).min(DIRECT_FENCE_ADMISSION_MAX_PAUSE);
+    }
+}
+
 /// Write an archive op synchronously and directly on the caller thread,
 /// honoring disk-critical backpressure.
 ///
@@ -1553,15 +1704,15 @@ fn write_op_sync_direct_with_cancel(
 
     // GH#351: direct request-path publication must never enter the blocking
     // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
-    // mutation guard used by recovery: try_lock first, preserve the existing
-    // fence -> epoch -> filesystem ordering, and refuse contention before any
-    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
-    // this thread and therefore reuse this already-held publication window.
-    let _publication =
-        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
-            Ok(guard) => guard,
-            Err(error) => return DirectArchiveWrite::Failed(error),
-        };
+    // mutation guard used by recovery, retried within a bounded budget:
+    // preserve the existing fence -> epoch -> filesystem ordering, and refuse
+    // contention before any mutation bookkeeping changes. wbq_execute_op's
+    // guards are then nested on this thread and therefore reuse this
+    // already-held publication window.
+    let _publication = match admit_direct_publication(write_op_storage_root(op), &mut cancelled) {
+        Ok(guard) => guard,
+        Err(error) => return DirectArchiveWrite::Failed(error),
+    };
 
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
@@ -2338,8 +2489,9 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
 }
 
 /// Background drain loop. Single drainer, so the front entry is stable across
-/// the unlocked `write_op_sync` call (only pushes append to the back). Never
-/// returns; a panic is caught by `ensure_drain`'s respawn.
+/// the unlocked `write_op_sync` call (only pushes append to the back). Writer
+/// panics become failed attempts in `write_op_sync`, so they retain the journal
+/// for retry and eventually reach the normal dead-letter bound.
 ///
 /// Materialization is via `write_op_sync` (NOT `wbq_enqueue`): the write-behind
 /// queue is in-memory, so handing the op back to it and dropping the journal
@@ -3420,11 +3572,7 @@ fn wbq_drain_loop(
         while idx < batch.len() {
             let end = wbq_message_bundle_batch_end(&batch, idx);
             let envelopes = &batch[idx..end];
-            let result = if envelopes.len() > 1 {
-                wbq_execute_message_bundle_batch(envelopes)
-            } else {
-                wbq_execute_op(&envelopes[0].op, "wbq-drain")
-            };
+            let result = wbq_execute_envelopes(envelopes);
             let group_failed = result.is_err();
             let reservation_version_refused = matches!(
                 &result,
@@ -3442,9 +3590,8 @@ fn wbq_drain_loop(
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
             }
             if let Err(error) = result {
-                // Retry budget was already exhausted inside wbq_execute_op /
-                // wbq_execute_message_bundle_batch. Reaching this branch means
-                // the row enqueued via the API was never persisted — that's
+                // Execution exhausted its retry budget or panicked. Reaching
+                // this branch means archive persistence is not confirmed — that's
                 // a durability failure that must be visible to the API gate
                 // so future send_message calls refuse instead of accepting
                 // writes that will silently disappear. See #122.
@@ -3536,7 +3683,7 @@ fn wbq_drain_loop(
                 }
 
                 wbq_mark_batch_in_flight(std::slice::from_ref(&envelope));
-                let r = wbq_execute_op(&envelope.op, "wbq-drain");
+                let r = wbq_execute_envelopes(std::slice::from_ref(&envelope));
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -3602,6 +3749,27 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
     end
 }
 
+/// Keep an archive-writer panic inside its group, after mutation and project
+/// guards have unwound. A dequeued batch is no longer in the receiver slot or
+/// queue-depth count, so respawning a dead drain cannot salvage it. Returning
+/// an error instead sends EVERY op in the possibly partially written group
+/// through the normal durability ledger while later groups keep draining.
+/// Panics are not retried here; deterministic failures must not spin forever.
+fn wbq_execute_envelopes(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    std::panic::catch_unwind(|| match envelopes {
+        [] => Ok(()),
+        [envelope] => wbq_execute_op(&envelope.op, "wbq-drain"),
+        _ => wbq_execute_message_bundle_batch(envelopes),
+    })
+    .unwrap_or_else(|_| {
+        // The panic hook already records the panic. Do not copy an arbitrary
+        // payload (which may contain message content) into storage diagnostics.
+        Err(StorageError::Io(std::io::Error::other(
+            "archive write panicked; the affected operations require reconciliation",
+        )))
+    })
+}
+
 /// Storage root mutated by a write-behind op, used to anchor the persisted
 /// archive mutation epoch (GH#235).
 fn write_op_storage_root(op: &WriteOp) -> &Path {
@@ -3615,16 +3783,15 @@ fn write_op_storage_root(op: &WriteOp) -> &Path {
 }
 
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
-    let _mutation = envelopes
-        .first()
-        .map_or_else(ArchiveMutationGuard::begin, |envelope| {
-            ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
-        });
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
     loop {
-        match wbq_execute_message_bundle_batch_inner(envelopes) {
+        let result = wbq_execute_message_bundle_batch_inner(envelopes);
+        // The bundle writer owns its admission window, including the complete
+        // project-locked canonical identity proof. Do not extend that window
+        // over its read-only scan or over retry backoff.
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3639,6 +3806,8 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
                         tracing::warn!(
                             "[wbq-drain] batch failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -3649,6 +3818,9 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
 }
 
 fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     let Some(WriteOp::MessageBundle {
         project_slug,
         config,
@@ -3685,34 +3857,33 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
 }
 
 fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
-    // SAFETY (lock order, concurrency audit F3): the archive snapshot
-    // publication fence (`ARCHIVE_PUBLICATION_FENCE`, taken by the outermost
-    // `ArchiveMutationGuard` below) must be acquired BEFORE any per-project
-    // archive lock (`.archive.lock`, taken inside the write_* helpers via
-    // `ensure_archive`/commit paths). Taking them in the opposite order on two
-    // threads would deadlock: thread A holds a project lock and waits on the
-    // fence while thread B (a publication check) holds the fence and... the
-    // fence callback never touches project locks, so today the reverse edge
-    // cannot form — all production archive writes enter through this function
-    // (or `wbq_execute_message_bundle_batch`, same shape), which takes the
-    // fence first, and `with_archive_snapshot_publication_fence` callbacks are
-    // documented (and debug-asserted) not to initiate archive writes. Keep it
-    // that way: never acquire the fence from code already holding a
-    // per-project archive lock.
+    // Blocking admission always takes the publication fence before project
+    // locks. Immutable message writers may prepare under the project locks
+    // first, but only TRY the fence there: on contention they release both
+    // project locks before entering the established blocking order. Their
+    // native guard must therefore be owned by the bundle writer itself.
     //
     // A reservation op takes no outer window (br-9bwnb): it stages and syncs
-    // its artifacts outside the fence and holds it only to rename them into
-    // place, and it takes no per-project archive lock. Holding the fence
+    // its artifacts outside the fence and holds it only for bounded project
+    // admission, lifecycle validation and publication. Holding the fence
     // across its fsyncs serialized every agent's reservation behind every
     // other's, the swarm-scale p99 of ~25 s.
-    let _mutation = if matches!(op, WriteOp::FileReservation { .. }) {
+    // Immutable messages release their window during retry backoff; every
+    // attempt rechecks canonical identity under its project lock.
+    // Mutable profiles/signals retain one window across retries so an older
+    // failed write cannot interleave with and replace a newer publication.
+    let _mutation = if matches!(
+        op,
+        WriteOp::FileReservation { .. } | WriteOp::MessageBundle { .. }
+    ) {
         None
     } else {
         Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
     };
     let mut attempts = 0;
     loop {
-        match wbq_execute_op_inner(op) {
+        let result = wbq_execute_op_inner(op);
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3727,6 +3898,8 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
                         tracing::warn!(
                             "[{log_context}] op failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -3737,6 +3910,9 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
 }
 
 fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     match op {
         WriteOp::MessageBundle {
             project_slug,
@@ -4066,12 +4242,32 @@ impl FileLock {
     /// matter what budget the caller configured, spurious-failing under
     /// exactly the contention the timeout exists to absorb.
     pub fn acquire(&mut self) -> Result<()> {
+        self.acquire_inner(true)
+    }
+
+    /// Acquire a read-only preparation lease without creating its parent.
+    /// No archive mutation fence may be acquired while that scan is admitted.
+    fn acquire_existing_parent(&mut self) -> Result<()> {
+        self.acquire_inner(false)
+    }
+
+    fn acquire_inner(&mut self, create_parent: bool) -> Result<()> {
         use fs2::FileExt;
 
         let start = Instant::now();
 
         self.validate_paths()?;
-        ensure_parent_dir(&self.path)?;
+        if create_parent {
+            ensure_parent_dir(&self.path)?;
+        } else {
+            let parent = self.path.parent().unwrap_or(Path::new("."));
+            if !fs::symlink_metadata(parent)?.file_type().is_dir() {
+                return Err(StorageError::InvalidPath(format!(
+                    "archive lock parent is not an existing directory: {}",
+                    parent.display()
+                )));
+            }
+        }
 
         let mut attempts = 0_usize;
         loop {
@@ -4081,10 +4277,11 @@ impl FileLock {
                 break;
             }
 
-            if self.path.exists() && self.cleanup_if_stale()? {
-                // Stale lock quarantined; retry immediately with a fresh lock path.
-                attempts += 1;
-                continue;
+            if self.path.exists() {
+                // Reclaiming an abandoned artifact is preparation for this
+                // attempt, not contention. A zero-timeout caller must still
+                // get its first real open/flock attempt on the fresh path.
+                self.cleanup_if_stale()?;
             }
 
             // Try to create and exclusively lock the file
@@ -4173,7 +4370,18 @@ impl FileLock {
                 .unwrap_or_default()
                 .as_secs_f64(),
         };
-        write_json(&self.metadata_path, &serde_json::to_value(&meta)?, false)
+        // Lock diagnostics are not mailbox content, just like the lock file
+        // itself and its removal on release. Acquiring the content fence here
+        // would invert the lock order for a project-locked read-only scan.
+        // Preserve the same atomic, symlink-refusing publication primitive;
+        // acquire() has already established the parent directory.
+        let content = serde_json::to_string_pretty(&serde_json::to_value(&meta)?)?;
+        let staged = stage_atomic_write(&self.metadata_path, content.as_bytes(), false)?;
+        if let Err(error) = fs::rename(&staged, &self.metadata_path) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Verify that the locked file handle corresponds to the file currently at `self.path`.
@@ -4311,6 +4519,13 @@ pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
+    with_project_lock_inner(archive, true, f)
+}
+
+fn with_project_lock_inner<F, T>(archive: &ProjectArchive, create_parent: bool, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
     let process_lock = archive_process_lock(archive)?;
     let project_root = archive_project_root_checked(archive)?;
     let _guard = process_lock
@@ -4319,7 +4534,11 @@ where
 
     let mut lock = FileLock::new(project_root.join(".archive.lock"));
     let lock_start = std::time::Instant::now();
-    lock.acquire()?;
+    if create_parent {
+        lock.acquire()?;
+    } else {
+        lock.acquire_existing_parent()?;
+    }
     mcp_agent_mail_core::global_metrics()
         .storage
         .archive_lock_wait_us
@@ -9118,6 +9337,31 @@ pub fn message_paths(
     })
 }
 
+/// Keys of a message's archive envelope, in the order every writer emits them;
+/// a reply appends `reply_to`.
+///
+/// The canonical file is the pretty-printed envelope (key order preserved), and
+/// the canonical-id collision check refuses a same-path file with different
+/// bytes. The tool-side writers and the DB-to-archive reconciler must therefore
+/// render a message identically. Otherwise a reconciler repair that races a
+/// still-queued write turns that write into a durability failure.
+pub const MESSAGE_ARCHIVE_ENVELOPE_KEYS: [&str; 14] = [
+    "id",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "created",
+    "thread_id",
+    "topic",
+    "project",
+    "project_slug",
+    "importance",
+    "ack_required",
+    "attachments",
+];
+
 fn render_message_bundle_content(message: &serde_json::Value, body_md: &str) -> Result<String> {
     let frontmatter = serde_json::to_string_pretty(message)?;
     Ok(format!("---json\n{frontmatter}\n---\n\n{body_md}"))
@@ -9134,12 +9378,13 @@ fn collect_canonical_message_paths_with_id(
     messages_root: &Path,
     message_id: i64,
     matches: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
     let wanted_ids = HashSet::from([message_id]);
-    let index = collect_canonical_message_id_index(messages_root, &wanted_ids);
+    let index = collect_canonical_message_id_index(messages_root, &wanted_ids)?;
     if let Some(paths) = index.get(&message_id) {
         matches.extend(paths.iter().cloned());
     }
+    Ok(())
 }
 
 /// Stat identity of a canonical message file; see [`CanonicalIdCache`].
@@ -9218,8 +9463,9 @@ fn unix_time_ns(time: SystemTime) -> i128 {
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
-) -> HashMap<i64, Vec<PathBuf>> {
-    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW)
+        .map(|(index, _parsed)| index)
 }
 
 /// The id index for `wanted_ids`, and how many files had to be parsed.
@@ -9227,24 +9473,33 @@ fn collect_canonical_message_id_index_with_window(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
     racy_window: Duration,
-) -> (HashMap<i64, Vec<PathBuf>>, usize) {
+) -> Result<(HashMap<i64, Vec<PathBuf>>, usize)> {
     let mut index = HashMap::new();
     let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return (index, parsed);
+        return Ok((index, parsed));
     }
-    if !path_is_nonsymlink_dir(messages_root) {
-        return (index, parsed);
+    if path_existing_prefix_has_symlink(messages_root)? {
+        return Err(StorageError::InvalidPath(format!(
+            "canonical message directory must not include symlinks: {}",
+            messages_root.display()
+        )));
     }
-    // `read_message_file` refuses every file under a symlinked prefix, so no
-    // file can match; cached ids must not be served through one either.
-    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
-        return (index, parsed);
+    match fs::symlink_metadata(messages_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message root is not a directory: {}",
+                messages_root.display()
+            )));
+        }
+        // A newly initialized project has no message namespace yet.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((index, parsed));
+        }
+        Err(error) => return Err(error.into()),
     }
-
-    let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return (index, parsed);
-    };
+    let year_entries = fs::read_dir(messages_root)?;
     let cache = {
         let mut caches = CANONICAL_ID_CACHES
             .lock()
@@ -9256,59 +9511,52 @@ fn collect_canonical_message_id_index_with_window(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
     let mut seen = HashSet::with_capacity(cache.files.len());
-    for year_entry in year_entries.flatten() {
+    for year_entry in year_entries {
+        let year_entry = year_entry?;
         let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
-            continue;
-        };
-        if !year_type.is_dir() || year_type.is_symlink() {
-            continue;
-        }
         let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        if !year_entry.file_type()?.is_dir() {
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message year is not a regular directory: {}",
+                year_path.display()
+            )));
+        }
 
-        let Ok(month_entries) = fs::read_dir(&year_path) else {
-            continue;
-        };
-        for month_entry in month_entries.flatten() {
+        for month_entry in fs::read_dir(&year_path)? {
+            let month_entry = month_entry?;
             let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
-                continue;
-            };
-            if !month_type.is_dir() || month_type.is_symlink() {
-                continue;
-            }
             let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
+            if !month_entry.file_type()?.is_dir() {
+                return Err(StorageError::InvalidPath(format!(
+                    "canonical message month is not a regular directory: {}",
+                    month_path.display()
+                )));
+            }
 
-            let Ok(file_entries) = fs::read_dir(&month_path) else {
-                continue;
-            };
-            for file_entry in file_entries.flatten() {
+            for file_entry in fs::read_dir(&month_path)? {
+                let file_entry = file_entry?;
                 let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_file()
-                    || file_type.is_symlink()
-                    || file_path.extension().is_none_or(|ext| ext != "md")
-                {
+                if file_path.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
-
-                let stamp = file_entry
-                    .metadata()
-                    .ok()
-                    .as_ref()
-                    .and_then(message_file_stamp);
+                let metadata = fs::symlink_metadata(&file_path)?;
+                if !metadata.file_type().is_file() {
+                    return Err(StorageError::InvalidPath(format!(
+                        "canonical message is not a regular file: {}",
+                        file_path.display()
+                    )));
+                }
+                let stamp = message_file_stamp(&metadata);
                 seen.insert(file_path.clone());
                 let cached = stamp.and_then(|stamp| {
                     cache
@@ -9322,11 +9570,26 @@ fn collect_canonical_message_id_index_with_window(
                 } else {
                     parsed += 1;
                     let parsed_at_ns = unix_time_ns(SystemTime::now());
-                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                        // Never cache a failed read: it may be transient.
-                        cache.files.remove(&file_path);
-                        continue;
+                    let (frontmatter, _body) = match read_message_file_inner(&file_path, true) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            // A failed read is not evidence that the id is free.
+                            cache.files.remove(&file_path);
+                            return Err(error);
+                        }
                     };
+                    let after = fs::symlink_metadata(&file_path)?;
+                    if !after.file_type().is_file() || message_file_stamp(&after) != stamp {
+                        cache.files.remove(&file_path);
+                        return Err(StorageError::LockContention {
+                            message: format!(
+                                "canonical message changed during identity inspection: {}",
+                                file_path.display()
+                            ),
+                        });
+                    }
+                    // Legacy messages without a positive integer id remain
+                    // readable; their destination bytes are checked separately.
                     let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
                     if let Some(stamp) = stamp {
                         cache.files.insert(
@@ -9353,7 +9616,50 @@ fn collect_canonical_message_id_index_with_window(
         }
     }
     cache.files.retain(|path, _| seen.contains(path));
-    (index, parsed)
+    Ok((index, parsed))
+}
+
+/// A missing immutable copy may be created. Every existing copy must be a
+/// regular, non-symlinked file with exactly the requested bytes, irrespective
+/// of whether its envelope contains a usable message id. Return the checked
+/// handle so a publication retry can sync the existing file before success.
+fn existing_immutable_message_copy(
+    path: &Path,
+    expected: &[u8],
+    for_sync: bool,
+) -> Result<Option<fs::File>> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to write through symlinked message path: {}",
+            path.display()
+        )));
+    }
+    // FlushFileBuffers requires write access on Windows. Compare bytes on
+    // that same no-follow handle before accepting an idempotent replay.
+    let opened = if for_sync && cfg!(windows) {
+        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+    } else {
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(path)
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let expected_len = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+    let mut content = Vec::with_capacity(expected.len().min(64 * 1024));
+    if file.metadata()?.len() == expected_len {
+        (&file)
+            .take(expected_len.saturating_add(1))
+            .read_to_end(&mut content)?;
+        if content == expected {
+            return Ok(Some(file));
+        }
+    }
+    Err(StorageError::InvalidPath(format!(
+        "immutable message copy already exists at {}; refusing to overwrite it with different content",
+        path.display()
+    )))
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -9364,14 +9670,24 @@ fn reject_canonical_message_id_collision_against_matches(
 ) -> Result<()> {
     for existing_path in matches {
         if existing_path == target_path {
-            let existing_content = fs::read_to_string(existing_path)?;
-            if existing_content == target_content {
-                continue;
-            }
-            return Err(StorageError::InvalidPath(format!(
-                "canonical message id {message_id} already exists at {}; refusing to overwrite it with different content",
-                existing_path.display()
-            )));
+            let _existing =
+                existing_immutable_message_copy(existing_path, target_content.as_bytes(), false)
+                    .map_err(|error| match error {
+                        StorageError::InvalidPath(message) => StorageError::InvalidPath(format!(
+                            "canonical message id {message_id}: {message}"
+                        )),
+                        other => other,
+                    })?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "canonical message disappeared during identity inspection: {}",
+                                existing_path.display()
+                            ),
+                        )
+                    })?;
+            continue;
         }
 
         return Err(StorageError::InvalidPath(format!(
@@ -9396,7 +9712,7 @@ fn reject_canonical_message_id_collision(
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
     let mut matches = Vec::new();
-    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches);
+    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches)?;
     reject_canonical_message_id_collision_against_matches(
         message_id,
         &matches,
@@ -9443,10 +9759,74 @@ fn collect_existing_batch_message_ids(
     }
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
-    Ok(collect_canonical_message_id_index(
-        &messages_root,
-        &wanted_ids,
-    ))
+    collect_canonical_message_id_index(&messages_root, &wanted_ids)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MESSAGE_PUBLICATION_AFTER_PREPARE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static MESSAGE_PUBLICATION_BEFORE_WRITE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keep an immutable message's complete identity scan out of the global fence
+/// when possible, without reusing a proof after releasing its project locks.
+///
+/// `prepare` is read-only and may run twice. Both existing project locks remain
+/// held from its observation through `publish`. Taking a blocking fence here
+/// would invert the established fence-before-project order, so this first
+/// attempt ONLY tries admission. Contention releases both project locks and
+/// discards the proof before the conservative fence-first path rescans.
+/// Nested callers already own the fence and use that established path too.
+fn with_prepared_message_publication<P, T>(
+    archive: &ProjectArchive,
+    mut prepare: impl FnMut() -> Result<P>,
+    mut publish: impl FnMut(P) -> Result<T>,
+) -> Result<T> {
+    let repo_root = archive_repo_root_checked(archive)?;
+    let mut publish = |prepared| {
+        #[cfg(test)]
+        if let Some(hook) =
+            MESSAGE_PUBLICATION_BEFORE_WRITE_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+        {
+            hook();
+        }
+        publish(prepared)
+    };
+    if ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get) == 0 {
+        let published = with_project_lock_inner(archive, false, || {
+            let prepared = prepare()?;
+            #[cfg(test)]
+            if let Some(hook) =
+                MESSAGE_PUBLICATION_AFTER_PREPARE_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+            {
+                hook();
+            }
+            let _mutation = match ArchiveMutationGuard::try_begin_repair(repo_root, || false) {
+                Ok(mutation) => mutation,
+                Err(StorageError::LockContention { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            publish(prepared).map(Some)
+        })?;
+        if let Some(result) = published {
+            return Ok(result);
+        }
+        #[cfg(test)]
+        if let Some(hook) =
+            MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+        {
+            hook();
+        }
+    }
+
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+    with_project_lock(archive, || publish(prepare()?))
 }
 
 fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
@@ -9559,40 +9939,93 @@ fn message_paths_for_bundle(
     Ok((paths, created, timestamp_str))
 }
 
-fn reject_message_bundle_archive_collision_from_index(
-    existing_ids: &HashMap<i64, Vec<PathBuf>>,
-    archive: &ProjectArchive,
-    message: &serde_json::Value,
-    body_md: &str,
-    sender: &str,
-    recipients: &[String],
-) -> Result<()> {
-    let (paths, _created, _timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
-    let full_content = render_message_bundle_content(message, body_md)?;
-    reject_canonical_message_id_collision_from_index(
-        existing_ids,
-        message,
-        &paths.canonical,
-        &full_content,
-    )
-}
-
 fn append_message_bundle_files(
     archive: &ProjectArchive,
     entry: MessageBundleBatchEntry<'_>,
     rel_paths: &mut Vec<String>,
     existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
 ) -> Result<MessageBundleCommitMeta> {
+    let prepared = prepare_message_bundle_files(archive, entry, existing_ids)?;
+    let mut writes = StagedArchiveWrites::default();
+    let mut targets = Vec::new();
+    prepared.stage(&mut writes, &mut targets)?;
+    writes.publish_immutable_messages()?;
+    record_published_paths(archive, &targets, rel_paths)?;
+    finish_message_bundle(
+        archive,
+        entry,
+        &prepared.paths.canonical,
+        &prepared.timestamp_str,
+        rel_paths,
+    )
+}
+
+/// One message's canonical, outbox and inbox copies, rendered and checked for
+/// canonical-id and destination-content conflicts but not yet written.
+struct PreparedMessageBundle {
+    paths: MessageArchivePaths,
+    full_content: String,
+    /// The BCC-redacted inbox rendering, when it differs from `full_content`.
+    inbox_content: Option<String>,
+    timestamp_str: String,
+}
+
+impl PreparedMessageBundle {
+    fn copies(&self) -> impl Iterator<Item = (&Path, &str)> {
+        let inbox_content = self.inbox_content.as_deref().unwrap_or(&self.full_content);
+        [
+            (self.paths.canonical.as_path(), self.full_content.as_str()),
+            (self.paths.outbox.as_path(), self.full_content.as_str()),
+        ]
+        .into_iter()
+        .chain(
+            self.paths
+                .inbox
+                .iter()
+                .map(move |path| (path.as_path(), inbox_content)),
+        )
+    }
+
+    fn check_existing_copies(&self) -> Result<()> {
+        for (path, content) in self.copies() {
+            let _existing = existing_immutable_message_copy(path, content.as_bytes(), false)?;
+        }
+        Ok(())
+    }
+
+    /// Stage the canonical, outbox and inbox copies, in that order, into
+    /// `writes` (creating parent directories), and record their targets.
+    fn stage(&self, writes: &mut StagedArchiveWrites, targets: &mut Vec<PathBuf>) -> Result<()> {
+        for (path, content) in self.copies() {
+            ensure_parent_dir(path)?;
+            writes.add(path.to_path_buf(), content.as_bytes())?;
+            targets.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+}
+
+/// Record the repo-relative paths of published archive files.
+fn record_published_paths(
+    archive: &ProjectArchive,
+    targets: &[PathBuf],
+    rel_paths: &mut Vec<String>,
+) -> Result<()> {
+    for path in targets {
+        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, path)?);
+    }
+    Ok(())
+}
+
+fn prepare_message_bundle_files(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
+) -> Result<PreparedMessageBundle> {
     let message = entry.message;
     let body_md = entry.body_md;
-    let sender = entry.sender;
-    let recipients = entry.recipients;
-    let extra_paths = entry.extra_paths;
-
-    let visible_recipients = message_visible_recipients(message);
     let (paths, _created, timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
+        message_paths_for_bundle(archive, message, entry.sender, entry.recipients)?;
 
     let full_content = render_message_bundle_content(message, body_md)?;
     let inbox_message = redact_message_bcc_for_inbox(message);
@@ -9601,7 +10034,6 @@ fn append_message_bundle_files(
     } else {
         Some(render_message_bundle_content(&inbox_message, body_md)?)
     };
-    let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
 
     if let Some(existing_ids) = existing_ids {
         reject_canonical_message_id_collision_from_index(
@@ -9614,38 +10046,42 @@ fn append_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    write_text(&paths.canonical, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
-        &archive.canonical_repo_root,
-        &paths.canonical,
-    )?);
+    let prepared = PreparedMessageBundle {
+        paths,
+        full_content,
+        inbox_content,
+        timestamp_str,
+    };
+    prepared.check_existing_copies()?;
+    Ok(prepared)
+}
 
-    write_text(&paths.outbox, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
-        &archive.canonical_repo_root,
-        &paths.outbox,
-    )?);
-
-    for inbox_path in &paths.inbox {
-        write_text(inbox_path, inbox_content_ref, true)?;
-        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
-    }
-
+/// After a message's files are published: append it to its thread digest and
+/// record its attachment paths.
+fn finish_message_bundle(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    canonical: &Path,
+    timestamp_str: &str,
+    rel_paths: &mut Vec<String>,
+) -> Result<MessageBundleCommitMeta> {
+    let message = entry.message;
+    let visible_recipients = message_visible_recipients(message);
     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
         let thread_id = thread_id.trim();
         if !thread_id.is_empty() {
-            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, canonical)?;
             if let Ok(digest_rel) = update_thread_digest(
                 archive,
                 thread_id,
-                sender,
+                entry.sender,
                 &visible_recipients,
                 message
                     .get("subject")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
-                &timestamp_str,
-                body_md,
+                timestamp_str,
+                entry.body_md,
                 &canonical_rel,
             ) {
                 rel_paths.push(digest_rel);
@@ -9653,16 +10089,16 @@ fn append_message_bundle_files(
         }
     }
 
-    for p in extra_paths {
+    for p in entry.extra_paths {
         let p = validate_repo_relative_path("extra_path", p)?;
         rel_paths.push(p.to_string());
     }
 
     Ok(build_message_bundle_commit_meta(
         message,
-        sender,
+        entry.sender,
         &visible_recipients,
-        &timestamp_str,
+        timestamp_str,
     ))
 }
 
@@ -9774,9 +10210,6 @@ pub fn write_message_batch_bundle(
     );
 
     let repo_root = archive_repo_root_checked(archive)?;
-    // Direct callers need the same fence-before-project-lock order as WBQ.
-    // Nested guards reuse the outer mutation window on the current thread.
-    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
     let estimated_rel_paths = entries
         .iter()
         .map(|entry| {
@@ -9796,28 +10229,62 @@ pub fn write_message_batch_bundle(
     let mut single_auto_commit_message: Option<String> = None;
 
     let disk_started = Instant::now();
-    with_project_lock(archive, || {
-        let existing_message_ids = collect_existing_batch_message_ids(archive, entries)?;
+    with_prepared_message_publication(
+        archive,
+        || collect_existing_batch_message_ids(archive, entries),
+        |existing_message_ids| {
+            // Check every destination before creating even the first staged
+            // file. Legacy id-less entries can also collide with each other.
+            let bundles = entries
+                .iter()
+                .map(|entry| {
+                    prepare_message_bundle_files(archive, *entry, Some(&existing_message_ids))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut destinations = HashMap::new();
+            for bundle in &bundles {
+                for (path, content) in bundle.copies() {
+                    if let Some(previous) = destinations.insert(path, content)
+                        && previous != content
+                    {
+                        return Err(StorageError::InvalidPath(format!(
+                            "message batch contains conflicting content for {}; refusing partial archive write",
+                            path.display()
+                        )));
+                    }
+                }
+            }
 
-        for entry in entries {
-            reject_message_bundle_archive_collision_from_index(
-                &existing_message_ids,
-                archive,
-                entry.message,
-                entry.body_md,
-                entry.sender,
-                entry.recipients,
-            )?;
-        }
-
-        for entry in entries {
-            let commit_meta = match append_message_bundle_files(
-                archive,
-                *entry,
-                &mut rel_paths,
-                Some(&existing_message_ids),
-            ) {
-                Ok(meta) => meta,
+            // Stage the whole batch and sync its files in groups rather than one
+            // file at a time: this writer holds the publication fence throughout
+            // (br-9ott5). A failure before publication leaves no entry half
+            // written; renames still run in entry order.
+            let written = (|| {
+                let mut writes = StagedArchiveWrites::default();
+                let mut targets = Vec::new();
+                let mut published = Vec::with_capacity(entries.len());
+                for bundle in &bundles {
+                    bundle.stage(&mut writes, &mut targets)?;
+                    published.push((&bundle.paths.canonical, &bundle.timestamp_str));
+                }
+                writes.publish_immutable_messages()?;
+                record_published_paths(archive, &targets, &mut rel_paths)?;
+                entries
+                    .iter()
+                    .zip(published)
+                    .map(|(entry, (canonical, timestamp_str))| {
+                        finish_message_bundle(
+                            archive,
+                            *entry,
+                            canonical,
+                            timestamp_str,
+                            &mut rel_paths,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })();
+            let commit_metas = match written {
+                Ok(metas) => metas,
                 Err(err) => {
                     let error_kind = err.to_string();
                     let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
@@ -9853,13 +10320,15 @@ pub fn write_message_batch_bundle(
                     return Err(err);
                 }
             };
-            if entries.len() == 1 {
-                single_auto_commit_message = Some(commit_meta.auto_commit_message);
+            for commit_meta in commit_metas {
+                if entries.len() == 1 {
+                    single_auto_commit_message = Some(commit_meta.auto_commit_message);
+                }
+                summary_lines.push(commit_meta.summary_line);
             }
-            summary_lines.push(commit_meta.summary_line);
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     tracing::info!(
         target: "mcp_agent_mail::storage::archive::batch_write",
         repo_slug = repo_slug,
@@ -9932,36 +10401,42 @@ pub fn write_message_bundle(
     commit_text: Option<&str>,
 ) -> Result<()> {
     let repo_root = archive_repo_root_checked(archive)?;
-    // Retention holds the publication fence through its project-locked proof
-    // and DB commit. Acquire that fence before this writer's project lock too.
-    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
-    with_project_lock(archive, || {
-        let mut rel_paths = Vec::with_capacity(
-            2 + recipients.len()
-                + extra_paths.len()
-                + usize::from(
-                    message
-                        .get("thread_id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|thread_id| !thread_id.trim().is_empty()),
-                ),
-        );
-        let entry = MessageBundleBatchEntry {
-            message,
-            body_md,
-            sender,
-            recipients,
-            extra_paths,
-        };
-        let commit_meta = append_message_bundle_files(archive, entry, &mut rel_paths, None)?;
-        let commit_message = commit_text
-            .map(ToString::to_string)
-            .unwrap_or(commit_meta.auto_commit_message);
+    let entry = MessageBundleBatchEntry {
+        message,
+        body_md,
+        sender,
+        recipients,
+        extra_paths,
+    };
+    with_prepared_message_publication(
+        archive,
+        || collect_existing_batch_message_ids(archive, std::slice::from_ref(&entry)),
+        |existing_message_ids| {
+            let mut rel_paths = Vec::with_capacity(
+                2 + recipients.len()
+                    + extra_paths.len()
+                    + usize::from(
+                        message
+                            .get("thread_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|thread_id| !thread_id.trim().is_empty()),
+                    ),
+            );
+            let commit_meta = append_message_bundle_files(
+                archive,
+                entry,
+                &mut rel_paths,
+                Some(&existing_message_ids),
+            )?;
+            let commit_message = commit_text
+                .map(ToString::to_string)
+                .unwrap_or(commit_meta.auto_commit_message);
 
-        enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
+            enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn message_visible_recipients(message: &serde_json::Value) -> Vec<String> {
@@ -12583,6 +13058,13 @@ pub fn get_timeline_commits(
 ///
 /// Returns `(frontmatter_json, body_markdown)`.
 pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
+    read_message_file_inner(path, false)
+}
+
+fn read_message_file_inner(
+    path: &Path,
+    require_complete_frontmatter: bool,
+) -> Result<(serde_json::Value, String)> {
     if path_existing_prefix_has_symlink(path)? {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -12611,7 +13093,22 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
         )));
     }
 
-    let content = fs::read_to_string(path)?;
+    let bytes =
+        mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(path, 50 * 1024 * 1024)?;
+    let content = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // Public readers retain legacy body-only behavior. A canonical identity
+    // proof cannot treat a crash-truncated envelope as evidence of no id.
+    if require_complete_frontmatter
+        && content
+            .strip_prefix("---json\n")
+            .is_some_and(|rest| !rest.contains("\n---\n"))
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "unterminated canonical message frontmatter: {}",
+            path.display()
+        )));
+    }
 
     // Parse ---json frontmatter
     if let Some(rest) = content.strip_prefix("---json\n")
@@ -13814,26 +14311,52 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
 /// (br-9bwnb). Staging needs no publication fence: readers only open named
 /// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
 /// Whatever is still staged when this drops is removed.
+#[derive(Default)]
 struct StagedArchiveWrites {
     /// `(temp path, target path)` pairs not yet renamed into place.
     staged: Vec<(PathBuf, PathBuf)>,
+    /// Open temp files written but not yet synced, at most
+    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] of them.
+    unsynced: Vec<fs::File>,
 }
 
 impl StagedArchiveWrites {
-    /// Write and `fdatasync` each file under a temp name beside its target.
+    /// Stage every file and sync it before returning.
     fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
-        let mut writes = Self {
-            staged: Vec::with_capacity(files.len()),
-        };
+        let mut writes = Self::default();
         for (path, data) in files {
-            let tmp_path = stage_atomic_write(&path, &data, true)?;
-            writes.staged.push((tmp_path, path));
+            writes.add(path, &data)?;
         }
+        writes.sync()?;
         Ok(writes)
     }
 
+    /// Write `data` under a temp name beside `path`. Its `fdatasync` joins the
+    /// current group, which is synced once it holds
+    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] files (see [`sync_archive_file_group`]);
+    /// that also bounds how many temp files are open at once.
+    fn add(&mut self, path: PathBuf, data: &[u8]) -> Result<()> {
+        let (tmp_path, file) = stage_atomic_write_unsynced(&path, data)?;
+        self.staged.push((tmp_path, path));
+        self.unsynced.push(file);
+        if self.unsynced.len() == MAX_PARALLEL_ARCHIVE_SYNCS {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// `fdatasync` every added file that is not synced yet.
+    fn sync(&mut self) -> Result<()> {
+        sync_archive_file_group(&self.unsynced)?;
+        self.unsynced.clear();
+        Ok(())
+    }
+
     /// Rename every staged file into place inside one archive mutation window.
+    /// Files still unsynced are synced first: nothing is published before its
+    /// data is durable.
     fn publish(mut self) -> Result<()> {
+        self.sync()?;
         let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
             return Ok(());
         };
@@ -13848,6 +14371,56 @@ impl StagedArchiveWrites {
         }
         Ok(())
     }
+
+    /// Publish immutable message copies without replacing an existing name.
+    /// The earlier batch preflight catches known conflicts before staging;
+    /// no-clobber persistence also protects a target appearing after that
+    /// check. Identical retries keep the existing inode and sync its bytes.
+    fn publish_immutable_messages(mut self) -> Result<()> {
+        self.sync()?;
+        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        #[cfg(test)]
+        if let Some(hook) =
+            MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+        {
+            hook();
+        }
+        for (tmp_path, path) in &self.staged {
+            if path_existing_prefix_has_symlink(path)? {
+                return Err(StorageError::InvalidPath(format!(
+                    "refusing to write through symlinked message path: {}",
+                    path.display()
+                )));
+            }
+            let staged = tempfile::TempPath::try_from_path(tmp_path.clone())?;
+            match staged.persist_noclobber(path) {
+                Ok(()) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let expected = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                        &error.path,
+                        fs::symlink_metadata(&error.path)?.len(),
+                    )?;
+                    let existing = existing_immutable_message_copy(path, &expected, true)?
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "message copy disappeared during publication: {}",
+                                    path.display()
+                                ),
+                            )
+                        })?;
+                    existing.sync_data()?;
+                }
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        // Drop cleans any temp links left by a platform's no-clobber fallback.
+        Ok(())
+    }
 }
 
 impl Drop for StagedArchiveWrites {
@@ -13858,10 +14431,83 @@ impl Drop for StagedArchiveWrites {
     }
 }
 
+/// Most archive files staged before their group is synced, and so the most
+/// `fdatasync` calls (and open temp files) one group has at once.
+const MAX_PARALLEL_ARCHIVE_SYNCS: usize = 16;
+
+/// Make the data of every file in `files` durable, syncing them concurrently.
+///
+/// Each `fdatasync` on ext4 waits for a journal commit, about 9 ms on a busy
+/// host, and syncing a group's files one after another pays one commit per
+/// file: the WBQ drain spent 76% of its time in those waits under swarm load,
+/// holding the publication fence (br-9ott5). Syncs issued concurrently join
+/// one commit, so a 7-file group takes ~20 ms instead of ~64 ms. Every file is
+/// still synced before this returns, so callers keep "data durable before
+/// rename". A thread that cannot be spawned syncs its file inline instead.
+fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
+    let Some((first, rest)) = files.split_first() else {
+        return Ok(());
+    };
+    std::thread::scope(|scope| {
+        let pending = rest
+            .iter()
+            .map(|file| {
+                std::thread::Builder::new()
+                    .name("archive-sync".to_string())
+                    .spawn_scoped(scope, || file.sync_data())
+                    .map_err(|_| file)
+            })
+            .collect::<Vec<_>>();
+        let mut result = first.sync_data();
+        note_archive_group_sync(&result);
+        for spawned in pending {
+            let synced = match spawned {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(std::io::Error::other("archive file sync thread panicked"))
+                }),
+                Err(file) => file.sync_data(),
+            };
+            note_archive_group_sync(&synced);
+            if result.is_ok() {
+                result = synced;
+            }
+        }
+        result
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Completed file syncs [`sync_archive_file_group`] returned on this thread.
+    static ARCHIVE_GROUP_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_archive_group_sync(synced: &std::io::Result<()>) {
+    if synced.is_ok() {
+        ARCHIVE_GROUP_SYNCS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+#[cfg(not(test))]
+const fn note_archive_group_sync(_synced: &std::io::Result<()>) {}
+
 /// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
 /// return the temp path for the caller to rename into place. `create_new`
 /// means a pre-existing file or symlink at a temp name is never clobbered.
 fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+    let (tmp_path, file) = stage_atomic_write_unsynced(path, data)?;
+    if sync && let Err(err) = file.sync_data() {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(tmp_path)
+}
+
+/// [`stage_atomic_write`] without the sync. The open temp file is returned so
+/// a caller staging several files can sync them as one group.
+fn stage_atomic_write_unsynced(path: &Path, data: &[u8]) -> Result<(PathBuf, fs::File)> {
     use std::io::Write as _;
 
     #[cfg(test)]
@@ -13894,20 +14540,17 @@ fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = atomic_write_tmp_path(parent, path, seq);
 
-        let result: std::io::Result<()> = (|| {
+        let result: std::io::Result<fs::File> = (|| {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp_path)?;
             f.write_all(data)?;
-            if sync {
-                f.sync_data()?;
-            }
-            Ok(())
+            Ok(f)
         })();
 
         match result {
-            Ok(()) => return Ok(tmp_path),
+            Ok(file) => return Ok((tmp_path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -16253,11 +16896,11 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 9]);
 
         let (first, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 3);
         assert_eq!(names(&first, 2), ["b__2.md"]);
         let (second, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0, "unchanged files must be served from the cache");
         assert_eq!(second, first);
 
@@ -16265,14 +16908,14 @@ mod tests {
         // keep reporting id 2 and miss a collision on id 9.
         write("b__2.md", 9, "b, rewritten under another id");
         let (rewritten, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 1);
         assert!(names(&rewritten, 2).is_empty());
         assert_eq!(names(&rewritten, 9), ["b__2.md"]);
 
         fs::remove_file(month.join("c__3.md")).unwrap();
         let (deleted, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0);
         assert!(names(&deleted, 3).is_empty());
 
@@ -16281,7 +16924,8 @@ mod tests {
             &root,
             &wanted,
             Duration::from_secs(3600),
-        );
+        )
+        .unwrap();
         assert_eq!(parsed, 2);
     }
 
@@ -16332,6 +16976,423 @@ mod tests {
             .expect("canonical file");
         let (_frontmatter, body) = read_message_file(&canonical_path).unwrap();
         assert_eq!(body, "first body");
+    }
+
+    #[test]
+    fn message_publication_preserves_existing_canonical_evidence() {
+        for batch in [false, true] {
+            for existing in [
+                "---json\n{\"id\": 999}\n---\n\nother message",
+                "---json\n{broken json\n---\n\noriginal evidence",
+                "legacy message without frontmatter",
+                "---json\n{\"subject\": \"legacy\"}\n---\n\noriginal evidence",
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "proj").unwrap();
+                let message = serde_json::json!({
+                    "id": 43,
+                    "subject": "Stable path",
+                    "created_ts": "2026-01-15T10:00:00Z",
+                    "project": "proj",
+                });
+                let recipients = vec!["RecipientAgent".to_string()];
+                let (paths, _, _) =
+                    message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients)
+                        .unwrap();
+                fs::create_dir_all(paths.canonical.parent().unwrap()).unwrap();
+                fs::write(&paths.canonical, existing).unwrap();
+
+                let result = if batch {
+                    write_message_batch_bundle(
+                        &archive,
+                        &config,
+                        &[MessageBundleBatchEntry {
+                            message: &message,
+                            body_md: "replacement body",
+                            sender: "SenderAgent",
+                            recipients: &recipients,
+                            extra_paths: &[],
+                        }],
+                        None,
+                    )
+                } else {
+                    write_message_bundle(
+                        &archive,
+                        &config,
+                        &message,
+                        "replacement body",
+                        "SenderAgent",
+                        &recipients,
+                        &[],
+                        None,
+                    )
+                };
+
+                assert!(result.is_err(), "batch={batch} must preserve {existing:?}");
+                assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), existing);
+                assert!(!paths.outbox.exists());
+                assert!(paths.inbox.iter().all(|path| !path.exists()));
+            }
+        }
+    }
+
+    #[test]
+    fn message_batch_preflights_every_mailbox_destination() {
+        for block_inbox in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let first = serde_json::json!({
+                "id": 901,
+                "subject": "First new message",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let second = serde_json::json!({
+                "id": 902,
+                "subject": "Second blocked message",
+                "created_ts": "2026-01-15T10:01:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (first_paths, _, _) =
+                message_paths_for_bundle(&archive, &first, "SenderAgent", &recipients).unwrap();
+            let (second_paths, _, _) =
+                message_paths_for_bundle(&archive, &second, "SenderAgent", &recipients).unwrap();
+            let blocked = if block_inbox {
+                &second_paths.inbox[0]
+            } else {
+                &second_paths.outbox
+            };
+            fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            fs::write(blocked, "mailbox evidence must survive").unwrap();
+            let entries = [&first, &second].map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "new body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            });
+
+            write_message_batch_bundle(&archive, &config, &entries, None)
+                .expect_err("a conflict in a later mailbox must reject the whole batch");
+
+            assert_eq!(
+                fs::read_to_string(blocked).unwrap(),
+                "mailbox evidence must survive"
+            );
+            assert!(!first_paths.canonical.exists());
+            assert!(!first_paths.outbox.exists());
+            assert!(first_paths.inbox.iter().all(|path| !path.exists()));
+            assert!(!second_paths.canonical.exists());
+            assert!(staged_temp_files(blocked.parent().unwrap()).is_empty());
+        }
+    }
+
+    #[test]
+    fn message_publication_fails_closed_on_unreadable_canonical_identity() {
+        for batch in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let damaged = archive.root.join("messages/2025/12/damaged.md");
+            fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+            let damaged_content = if batch {
+                "---json\n{\"id\": 903, \"subject\": \"truncated evidence\"}"
+            } else {
+                "---json\n{damaged envelope\n---\n\nevidence"
+            };
+            fs::write(&damaged, damaged_content).unwrap();
+            let message = serde_json::json!({
+                "id": 903,
+                "subject": "No incomplete identity proof",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+            let result = if batch {
+                write_message_batch_bundle(
+                    &archive,
+                    &config,
+                    &[MessageBundleBatchEntry {
+                        message: &message,
+                        body_md: "new body",
+                        sender: "SenderAgent",
+                        recipients: &recipients,
+                        extra_paths: &[],
+                    }],
+                    None,
+                )
+            } else {
+                write_message_bundle(
+                    &archive,
+                    &config,
+                    &message,
+                    "new body",
+                    "SenderAgent",
+                    &recipients,
+                    &[],
+                    None,
+                )
+            };
+            assert!(
+                result.is_err(),
+                "batch={batch} must fail an incomplete identity scan"
+            );
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(fs::read_to_string(&damaged).unwrap(), damaged_content);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn message_publication_rejects_symlinked_canonical_shards() {
+        use std::os::unix::fs::symlink;
+
+        for symlink_month in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let outside = TempDir::new().unwrap();
+            fs::write(outside.path().join("evidence.md"), "must survive").unwrap();
+            let shard = if symlink_month {
+                archive.root.join("messages/2025/12")
+            } else {
+                archive.root.join("messages/2025")
+            };
+            fs::create_dir_all(shard.parent().unwrap()).unwrap();
+            symlink(outside.path(), &shard).unwrap();
+            let message = serde_json::json!({
+                "id": 904,
+                "subject": "No skipped canonical shard",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "new body",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .expect_err("a canonical date shard cannot be silently skipped");
+
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(
+                fs::read_to_string(outside.path().join("evidence.md")).unwrap(),
+                "must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn message_publication_keeps_idempotent_legacy_and_bcc_replays() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let legacy = archive.root.join("messages/2025/12/legacy-body.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "legacy body without an envelope").unwrap();
+        let recipients = vec!["VisibleAgent".to_string(), "HiddenAgent".to_string()];
+        for id in [None, Some(0), Some(905)] {
+            let mut message = serde_json::json!({
+                "subject": format!("Replay {id:?}"),
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+                "to": ["VisibleAgent"],
+                "bcc": ["HiddenAgent"],
+            });
+            if let Some(id) = id {
+                message["id"] = id.into();
+            }
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "same body",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+            write_message_batch_bundle(
+                &archive,
+                &config,
+                &[MessageBundleBatchEntry {
+                    message: &message,
+                    body_md: "same body",
+                    sender: "SenderAgent",
+                    recipients: &recipients,
+                    extra_paths: &[],
+                }],
+                None,
+            )
+            .expect("identical messages including legacy IDs are valid retries");
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+            let full_content = render_message_bundle_content(&message, "same body").unwrap();
+            assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), full_content);
+            assert_eq!(fs::read_to_string(&paths.outbox).unwrap(), full_content);
+            for inbox in &paths.inbox {
+                let (frontmatter, body) = read_message_file(inbox).unwrap();
+                assert_eq!(frontmatter["bcc"], serde_json::json!([]));
+                assert_eq!(body, "same body");
+            }
+        }
+    }
+
+    #[test]
+    fn message_publication_never_clobbers_a_target_appearing_after_preflight() {
+        for batch in [false, true] {
+            for identical in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "proj").unwrap();
+                let message = serde_json::json!({
+                    "id": 906,
+                    "subject": "Target appeared during publication",
+                    "created_ts": "2026-01-15T10:00:00Z",
+                    "project": "proj",
+                });
+                let recipients = vec!["RecipientAgent".to_string()];
+                let (paths, _, _) =
+                    message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients)
+                        .unwrap();
+                let full_content = render_message_bundle_content(&message, "same body").unwrap();
+                let late_content = if identical {
+                    full_content.clone()
+                } else {
+                    "evidence that appeared after preflight".to_string()
+                };
+                let late_path = paths.canonical.clone();
+                let injected_content = late_content.clone();
+                let injected = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&injected);
+                #[cfg(unix)]
+                let late_inode = Arc::new(AtomicU64::new(0));
+                #[cfg(unix)]
+                let injected_inode = Arc::clone(&late_inode);
+                MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        assert!(
+                            !late_path.exists(),
+                            "preflight observed a missing destination"
+                        );
+                        assert!(
+                            !staged_temp_files(late_path.parent().unwrap()).is_empty(),
+                            "inject the target after files have been staged and synced"
+                        );
+                        fs::write(&late_path, injected_content).unwrap();
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt as _;
+                            injected_inode
+                                .store(fs::metadata(&late_path).unwrap().ino(), Ordering::Release);
+                        }
+                        observed.store(true, Ordering::Release);
+                    }));
+                });
+
+                let result = if batch {
+                    write_message_batch_bundle(
+                        &archive,
+                        &config,
+                        &[MessageBundleBatchEntry {
+                            message: &message,
+                            body_md: "same body",
+                            sender: "SenderAgent",
+                            recipients: &recipients,
+                            extra_paths: &[],
+                        }],
+                        None,
+                    )
+                } else {
+                    write_message_bundle(
+                        &archive,
+                        &config,
+                        &message,
+                        "same body",
+                        "SenderAgent",
+                        &recipients,
+                        &[],
+                        None,
+                    )
+                };
+                assert!(injected.load(Ordering::Acquire));
+                assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), late_content);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    assert_eq!(
+                        fs::metadata(&paths.canonical).unwrap().ino(),
+                        late_inode.load(Ordering::Acquire),
+                        "publication must retain an existing copy's inode"
+                    );
+                }
+                if identical {
+                    result.expect("a late identical copy is a safe idempotent publication");
+                    assert_eq!(fs::read_to_string(&paths.outbox).unwrap(), full_content);
+                    for inbox in &paths.inbox {
+                        assert_eq!(fs::read_to_string(inbox).unwrap(), full_content);
+                    }
+                } else {
+                    result.expect_err("a late conflicting copy must never be overwritten");
+                    assert!(!paths.outbox.exists());
+                    assert!(paths.inbox.iter().all(|path| !path.exists()));
+                }
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(&paths.inbox)
+                {
+                    assert!(staged_temp_files(path.parent().unwrap()).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn message_batch_rejects_conflicting_legacy_destinations_before_staging() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let message = serde_json::json!({
+            "subject": "Shared legacy path",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        let recipients = vec!["RecipientAgent".to_string()];
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+        let entries = ["first body", "conflicting body"].map(|body_md| MessageBundleBatchEntry {
+            message: &message,
+            body_md,
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        });
+
+        write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("legacy messages sharing a destination must agree before publication");
+
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        assert!(!paths.canonical.parent().unwrap().exists());
     }
 
     #[test]
@@ -16612,6 +17673,210 @@ mod tests {
             1,
             "batch preflight must leave only the pre-existing canonical file"
         );
+    }
+
+    fn temp_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(path);
+                } else if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    fn archive_group_syncs() -> usize {
+        ARCHIVE_GROUP_SYNCS.with(std::cell::Cell::get)
+    }
+
+    /// br-9ott5: staging syncs every file, in groups of at most
+    /// `MAX_PARALLEL_ARCHIVE_SYNCS`, before anything is renamed into place.
+    #[test]
+    fn staged_archive_writes_sync_every_file_before_publication() {
+        let tmp = TempDir::new().unwrap();
+        let count = MAX_PARALLEL_ARCHIVE_SYNCS * 2 + 3;
+        let body = |i: usize| format!("{{\"i\":{i}}}");
+        let files = (0..count)
+            .map(|i| (tmp.path().join(format!("f{i}.json")), body(i).into_bytes()))
+            .collect::<Vec<_>>();
+
+        let before = archive_group_syncs();
+        let staged = StagedArchiveWrites::stage(files).unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            count,
+            "every staged file is synced before stage returns"
+        );
+        assert_eq!(staged_temp_files(tmp.path()).len(), count);
+        assert!(
+            !tmp.path().join("f0.json").exists(),
+            "nothing is published before publish()"
+        );
+
+        staged.publish().unwrap();
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        for i in 0..count {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(format!("f{i}.json"))).unwrap(),
+                body(i)
+            );
+        }
+    }
+
+    /// Files added below a full group stay unsynced until publication, which
+    /// syncs them before renaming anything.
+    #[test]
+    fn staged_archive_writes_publish_syncs_files_left_pending() {
+        let tmp = TempDir::new().unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        let before = archive_group_syncs();
+        for i in 0..3 {
+            writes
+                .add(tmp.path().join(format!("p{i}.json")), b"{}")
+                .unwrap();
+        }
+        assert_eq!(archive_group_syncs() - before, 0, "a partial group waits");
+        assert_eq!(staged_temp_files(tmp.path()).len(), 3);
+
+        writes.publish().unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            3,
+            "publication syncs every pending file first"
+        );
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        for i in 0..3 {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(format!("p{i}.json"))).unwrap(),
+                "{}"
+            );
+        }
+    }
+
+    /// br-9ott5: a WBQ batch syncs each bundle file (canonical, outbox, every
+    /// inbox) before publishing it, and leaves no temp file behind.
+    #[test]
+    fn write_message_batch_bundle_syncs_every_bundle_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let recipients = vec!["RecipientOne".to_string(), "RecipientTwo".to_string()];
+        let messages = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                    "id": 80 + i,
+                    "subject": format!("Synced batch entry {i}"),
+                    "created_ts": format!("2026-01-15T10:0{i}:00Z"),
+                    "project": "proj",
+                })
+            })
+            .collect::<Vec<_>>();
+        let entries = messages
+            .iter()
+            .map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "synced body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            })
+            .collect::<Vec<_>>();
+
+        let before = archive_group_syncs();
+        write_message_batch_bundle(&archive, &config, &entries, None).unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            messages.len() * (2 + recipients.len()),
+            "canonical, outbox and both inbox copies of every message are synced"
+        );
+        for message in &messages {
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, message, "SenderAgent", &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox]
+                .into_iter()
+                .chain(&paths.inbox)
+            {
+                let text = fs::read_to_string(path).unwrap();
+                assert!(
+                    text.contains("synced body"),
+                    "{} lacks the body",
+                    path.display()
+                );
+                assert!(text.contains(&format!("\"id\": {}", message["id"])));
+            }
+        }
+        assert!(temp_files_under(&archive.root).is_empty());
+    }
+
+    /// A batch whose later file cannot be staged publishes none of its entries.
+    /// Writing entries one at a time left the first entry and the second's
+    /// canonical file behind.
+    #[cfg(unix)]
+    #[test]
+    fn write_message_batch_bundle_publishes_nothing_when_a_later_file_cannot_be_staged() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let recipients = vec!["RecipientAgent".to_string()];
+        let first = serde_json::json!({
+            "id": 91,
+            "subject": "First entry",
+            "created_ts": "2026-01-15T11:00:00Z",
+            "project": "proj",
+        });
+        let second = serde_json::json!({
+            "id": 92,
+            "subject": "Second entry",
+            "created_ts": "2026-01-15T11:01:00Z",
+            "project": "proj",
+        });
+        let (first_paths, _, _) =
+            message_paths_for_bundle(&archive, &first, "SenderAgent", &recipients).unwrap();
+        let (second_paths, _, _) =
+            message_paths_for_bundle(&archive, &second, "SenderAgent", &recipients).unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        ensure_parent_dir(&second_paths.outbox).unwrap();
+        symlink(&outside, &second_paths.outbox).unwrap();
+        let entries = [&first, &second].map(|message| MessageBundleBatchEntry {
+            message,
+            body_md: "body",
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        });
+
+        let err = write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("a symlinked bundle target refuses the batch");
+        assert!(
+            err.to_string()
+                .contains("refusing to write through symlink"),
+            "unexpected error: {err}"
+        );
+        for path in [
+            &first_paths.canonical,
+            &first_paths.outbox,
+            &second_paths.canonical,
+        ]
+        .into_iter()
+        .chain(&first_paths.inbox)
+        {
+            assert!(
+                !path.exists(),
+                "{} was published although the batch failed before publication",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+        assert!(temp_files_under(&archive.root).is_empty());
     }
 
     #[test]
@@ -20309,6 +21574,11 @@ mod tests {
             sample_epoch_stamp_for_test(&config.storage_root).is_none(),
             "a non-hex token must disable the epoch protocol"
         );
+        fs::write(&epoch_path, format!("1{}", "ab".repeat(65))).unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "an oversized token must disable the epoch protocol"
+        );
     }
 
     #[test]
@@ -20589,6 +21859,588 @@ mod tests {
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
     }
 
+    #[test]
+    fn wbq_message_identity_scan_allows_unrelated_reservations() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_message_identity_scan_allows_unrelated_reservations",
+        ) {
+            return;
+        }
+
+        for message_count in [1_i64, 2] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let message_project = "identity-scan-messages";
+            let archive = ensure_archive(&config, message_project).unwrap();
+            let history = archive.root.join("messages/2026/01/history__7.md");
+            fs::create_dir_all(history.parent().unwrap()).unwrap();
+            fs::write(
+                &history,
+                render_message_bundle_content(&serde_json::json!({ "id": 7 }), "history").unwrap(),
+            )
+            .unwrap();
+            let reservation_project = "identity-scan-reservations";
+            let reservation_archive = ensure_archive(&config, reservation_project).unwrap();
+            let reservation = publication_test_reservation(message_count, "aabbccdd");
+            let reservation_op = WriteOp::FileReservation {
+                project_slug: reservation_project.to_string(),
+                config: config.clone(),
+                reservations: vec![reservation.clone()],
+            };
+            let process_lock = archive_process_lock(&archive).unwrap();
+            let prepared = Arc::new(AtomicBool::new(false));
+            let observed_prepare = Arc::clone(&prepared);
+            MESSAGE_PUBLICATION_AFTER_PREPARE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                    assert!(matches!(
+                        process_lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    // A different thread cannot reuse this writer's nested
+                    // mutation guard. Its real reservation publication proves
+                    // the history scan does not retain the global fence.
+                    let result = std::thread::spawn(move || write_op_sync_direct(&reservation_op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    observed_prepare.store(true, Ordering::Release);
+                }));
+            });
+            let fenced = Arc::new(AtomicBool::new(false));
+            let observed_write = Arc::clone(&fenced);
+            let root = archive.repo_root.clone();
+            MESSAGE_PUBLICATION_BEFORE_WRITE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let refused = std::thread::spawn(move || {
+                        matches!(
+                            ArchiveMutationGuard::try_begin_repair(&root, || false),
+                            Err(StorageError::LockContention { .. })
+                        )
+                    })
+                    .join()
+                    .unwrap();
+                    assert!(
+                        refused,
+                        "physical message writes must retain the global fence"
+                    );
+                    observed_write.store(true, Ordering::Release);
+                }));
+            });
+
+            let envelopes: Vec<_> = (41..41 + message_count)
+                .map(|id| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(backlog_test_message_op(&config, message_project, id)),
+                })
+                .collect();
+            wbq_execute_envelopes(&envelopes).unwrap();
+            flush_async_commits();
+            assert!(prepared.load(Ordering::Acquire));
+            assert!(fenced.load(Ordering::Acquire));
+            let (stable, alias) = publication_test_paths(&reservation_archive, &reservation);
+            for path in [stable, alias] {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(published, reservation);
+            }
+            let mut expected_canonical = BTreeSet::from([history]);
+            for envelope in &envelopes {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    sender,
+                    recipients,
+                    ..
+                } = envelope.op.as_ref()
+                else {
+                    unreachable!();
+                };
+                expected_canonical.insert(
+                    message_paths_for_bundle(&archive, message_json, sender, recipients)
+                        .unwrap()
+                        .0
+                        .canonical,
+                );
+            }
+            // The fixture also writes a Markdown thread digest. Compare the
+            // canonical namespace, rather than counting that digest as mail.
+            let thread_digests = archive.root.join("messages/threads");
+            let actual_canonical: BTreeSet<_> = list_message_files(&archive.root.join("messages"))
+                .unwrap()
+                .into_iter()
+                .filter(|path| !path.starts_with(&thread_digests))
+                .collect();
+            assert_eq!(actual_canonical, expected_canonical);
+        }
+    }
+
+    #[test]
+    fn message_publication_fallback_releases_project_locks_and_rechecks_history() {
+        if !isolated_coalescer_regression(
+            "tests::message_publication_fallback_releases_project_locks_and_rechecks_history",
+        ) {
+            return;
+        }
+
+        for message_count in [1_i64, 2] {
+            for conflict in ["different-path", "in-place-id", "same-path-content"] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "identity-fallback").unwrap();
+                let ops: Vec<_> = (41..41 + message_count)
+                    .map(|id| backlog_test_message_op(&config, &archive.slug, id))
+                    .collect();
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = ops.last().unwrap()
+                else {
+                    unreachable!();
+                };
+                let (paths, _, _) =
+                    message_paths_for_bundle(&archive, message_json, sender, recipients).unwrap();
+                let history = archive.root.join("messages/2026/01/history__7.md");
+                fs::create_dir_all(history.parent().unwrap()).unwrap();
+                let changed_path = if conflict == "same-path-content" {
+                    fs::create_dir_all(paths.canonical.parent().unwrap()).unwrap();
+                    fs::write(
+                        &paths.canonical,
+                        render_message_bundle_content(message_json, body_md).unwrap(),
+                    )
+                    .unwrap();
+                    paths.canonical.clone()
+                } else {
+                    fs::write(
+                        &history,
+                        render_message_bundle_content(&serde_json::json!({ "id": 7 }), "history")
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if conflict == "in-place-id" {
+                        history
+                    } else {
+                        history.with_file_name("new-conflict.md")
+                    }
+                };
+                let changed_bytes =
+                    render_message_bundle_content(message_json, "retained conflict")
+                        .unwrap()
+                        .into_bytes();
+                let first_canonical = if message_count == 2 {
+                    let WriteOp::MessageBundle {
+                        message_json,
+                        sender,
+                        recipients,
+                        ..
+                    } = &ops[0]
+                    else {
+                        unreachable!();
+                    };
+                    Some(
+                        message_paths_for_bundle(&archive, message_json, sender, recipients)
+                            .unwrap()
+                            .0
+                            .canonical,
+                    )
+                } else {
+                    None
+                };
+                let (deferred_tx, deferred_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+                let writer_archive = archive.clone();
+                let writer = std::thread::spawn(move || {
+                    MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            deferred_tx.send(()).unwrap();
+                            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }));
+                    });
+                    let entries: Vec<_> = ops
+                        .iter()
+                        .map(|op| {
+                            let WriteOp::MessageBundle {
+                                message_json,
+                                body_md,
+                                sender,
+                                recipients,
+                                extra_paths,
+                                ..
+                            } = op
+                            else {
+                                unreachable!();
+                            };
+                            MessageBundleBatchEntry {
+                                message: message_json,
+                                body_md,
+                                sender,
+                                recipients,
+                                extra_paths,
+                            }
+                        })
+                        .collect();
+                    if let [entry] = entries.as_slice() {
+                        write_message_bundle(
+                            &writer_archive,
+                            &config,
+                            entry.message,
+                            entry.body_md,
+                            entry.sender,
+                            entry.recipients,
+                            entry.extra_paths,
+                            None,
+                        )
+                    } else {
+                        write_message_batch_bundle(&writer_archive, &config, &entries, None)
+                    }
+                });
+                let deferred = deferred_rx.recv_timeout(Duration::from_secs(5));
+                let process_lock = archive_process_lock(&archive).unwrap();
+                let mut locks_released = false;
+                if deferred.is_ok()
+                    && let Ok(_process) = process_lock.try_lock()
+                {
+                    let mut lock = FileLock::new(archive.root.join(".archive.lock"))
+                        .with_timeout(Duration::ZERO)
+                        .with_max_retries(0);
+                    if lock.acquire().is_ok() {
+                        locks_released = true;
+                        // Simulate a legitimate writer winning between the
+                        // discarded scan and the conservative fallback. The
+                        // existing project locks and fence cover this edit.
+                        fs::write(&changed_path, &changed_bytes).unwrap();
+                        lock.release().unwrap();
+                    }
+                }
+                drop(fence);
+                let _ = resume_tx.send(());
+                let result = writer.join().unwrap();
+                assert!(
+                    deferred.is_ok(),
+                    "read-only preparation waited for the fence"
+                );
+                assert!(locks_released, "fence fallback retained a project lock");
+                let error = result.expect_err("fallback must repeat its canonical identity proof");
+                assert!(
+                    error.to_string().contains("canonical message id"),
+                    "{conflict}: {error}"
+                );
+                assert_eq!(fs::read(&changed_path).unwrap(), changed_bytes);
+                assert!(!paths.outbox.exists());
+                for inbox in paths.inbox {
+                    assert!(!inbox.exists());
+                }
+                if let Some(first_canonical) = first_canonical {
+                    assert!(
+                        !first_canonical.exists(),
+                        "a later batch conflict must refuse before publishing the first message"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn message_preparation_refuses_a_missing_project_without_waiting_for_the_fence() {
+        if !isolated_coalescer_regression(
+            "tests::message_preparation_refuses_a_missing_project_without_waiting_for_the_fence",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "missing-preparation").unwrap();
+        let retained = archive.root.with_extension("retained");
+        fs::write(archive.root.join("sentinel"), b"retained project").unwrap();
+        fs::rename(&archive.root, &retained).unwrap();
+        DIR_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&archive.root);
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer_archive = archive.clone();
+        let writer = std::thread::spawn(move || {
+            let result = write_message_bundle(
+                &writer_archive,
+                &config,
+                &serde_json::json!({ "id": 41, "created": "2026-01-01T00:00:00Z" }),
+                "must not recreate the project",
+                "Sender",
+                &[],
+                &[],
+                None,
+            );
+            let _ = finished_tx.send(matches!(
+                result,
+                Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound
+            ));
+        });
+        let refused_while_fenced = finished_rx.recv_timeout(Duration::from_secs(2));
+        drop(fence);
+        writer.join().unwrap();
+        assert!(refused_while_fenced.unwrap());
+        assert!(!archive.root.exists());
+        assert_eq!(
+            fs::read(retained.join("sentinel")).unwrap(),
+            b"retained project"
+        );
+    }
+
+    #[test]
+    fn wbq_message_retry_backoff_releases_fence_for_reservations() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_message_retry_backoff_releases_fence_for_reservations",
+        ) {
+            return;
+        }
+
+        for message_count in [1_i64, 2] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let reservation_project = "retry-unrelated-reservation";
+            let reservation_archive = ensure_archive(&config, reservation_project).unwrap();
+            let message_project = "retry-obstructed-messages";
+            let obstructed = reservation_archive
+                .repo_root
+                .join("projects")
+                .join(message_project);
+            let retained = obstructed.with_extension("retained");
+            // An ordinary file in place of the project directory makes the
+            // first real archive attempt fail with a retryable I/O error.
+            fs::write(&obstructed, b"temporary directory obstruction").unwrap();
+            let reservation = publication_test_reservation(message_count, "aabbccdd");
+            let reservation_op = WriteOp::FileReservation {
+                project_slug: reservation_project.to_string(),
+                config: config.clone(),
+                reservations: vec![reservation.clone()],
+            };
+            let retained_for_retry = retained.clone();
+            WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Another thread cannot reuse the failing writer's nested
+                    // guard. Admission therefore proves the global fence is
+                    // available before its retry, without racing a sleep.
+                    let result = std::thread::spawn(move || write_op_sync_direct(&reservation_op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    fs::rename(&obstructed, &retained_for_retry).unwrap();
+                }));
+            });
+
+            let envelopes: Vec<_> = (41..41 + message_count)
+                .map(|id| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(backlog_test_message_op(&config, message_project, id)),
+                })
+                .collect();
+            wbq_execute_envelopes(&envelopes).expect(
+                "both single and batched messages must succeed after the obstruction clears",
+            );
+            flush_async_commits();
+            assert_eq!(
+                fs::read(&retained).unwrap(),
+                b"temporary directory obstruction",
+                "the real failed attempt must have reached its retry boundary",
+            );
+            let (stable, alias) = publication_test_paths(&reservation_archive, &reservation);
+            for path in [stable, alias] {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(published, reservation);
+            }
+
+            let message_archive = ensure_archive(&config, message_project).unwrap();
+            for envelope in &envelopes {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = envelope.op.as_ref()
+                else {
+                    unreachable!();
+                };
+                let (paths, _, _) =
+                    message_paths_for_bundle(&message_archive, message_json, sender, recipients)
+                        .unwrap();
+                for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                    let (message, body) = read_message_file(path).unwrap();
+                    assert_eq!(message["id"], message_json["id"]);
+                    assert_eq!(body.trim(), body_md.as_str());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wbq_drain_survives_writer_panics_without_losing_remaining_ops() {
+        const CHILD: &str = "AM_TEST_WBQ_PANIC_SCENARIO";
+        const COMPLETED: &str = "WBQ writer panic recovery verified";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            // Failure accounting and the durability ledger are process-wide.
+            // Isolate both the single/batched paths and the final shutdown drain
+            // from other tests instead of resetting their shared state.
+            for scenario in ["single", "batch", "shutdown"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::wbq_drain_survives_writer_panics_without_losing_remaining_ops",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            }
+            return;
+        };
+
+        let final_drain = scenario == "shutdown";
+        let group_size: u64 = if scenario == "batch" { 2 } else { 1 };
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "wbq-panic-recovery";
+        let archive = ensure_archive(&config, project).unwrap();
+        let partial_op = backlog_test_message_op(&config, project, 41);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let depth = Arc::new(AtomicU64::new(0));
+        let profile_op = |name: &str| WriteOp::AgentProfile {
+            project_slug: project.to_string(),
+            config: config.clone(),
+            agent_json: serde_json::json!({"name": name, "program": "test", "model": "test"}),
+        };
+        if final_drain {
+            tx.send(WbqMsg::Shutdown).unwrap();
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, profile_op("WarmupAgent")),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        for id in 41..41 + i64::try_from(group_size).unwrap() {
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, id)),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        // The profile separates message groups without using a fake writer.
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, profile_op("FollowingAgent")),
+            WbqEnqueueResult::Enqueued,
+        );
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, 99)),
+            WbqEnqueueResult::Enqueued,
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Flush(done_tx)).unwrap();
+
+        let worker_depth = Arc::clone(&depth);
+        let panic_archive = archive.clone();
+        let worker = std::thread::spawn(move || {
+            let inject_panic: Box<dyn FnOnce()> = Box::new(move || {
+                // Materialize only the first message before the batch fails.
+                // All its ops still need verification, including this one.
+                wbq_execute_op_inner(&partial_op).unwrap();
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    panic!("injected archive writer panic after partial materialization");
+                });
+            });
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(if final_drain {
+                    // The first batch consumes Shutdown + one healthy warmup
+                    // op; the next execution is in the final-drain branch.
+                    Box::new(move || {
+                        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some(inject_panic);
+                        });
+                    })
+                } else {
+                    inject_panic
+                });
+            });
+            wbq_drain_loop(
+                Arc::new(Mutex::new(Some(rx))),
+                worker_depth,
+                8,
+                if final_drain { 1 } else { 8 },
+            );
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a panicked write must not lose later writes or the flush acknowledgement");
+        if !final_drain {
+            assert!(
+                !worker.is_finished(),
+                "the archive worker must remain alive"
+            );
+            tx.send(WbqMsg::Shutdown).unwrap();
+        }
+        worker.join().expect("the archive panic must be contained");
+        flush_async_commits();
+
+        let stats = wbq_stats();
+        assert_eq!(stats.enqueued, group_size + 2 + u64::from(final_drain));
+        assert_eq!(stats.drained, stats.enqueued);
+        assert_eq!(stats.errors, group_size);
+        assert_eq!(stats.unrecoverable_errors, group_size);
+        assert!(
+            durability_degraded(),
+            "partial writes must not report healthy"
+        );
+        assert!(stats.last_unrecoverable_error_us > 0);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert!(
+            read_agent_profile(&archive, "FollowingAgent")
+                .unwrap()
+                .is_some()
+        );
+
+        for id in [41, 99] {
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                ..
+            } = backlog_test_message_op(&config, project, id)
+            else {
+                unreachable!();
+            };
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                let (message, body) = read_message_file(path).unwrap();
+                assert_eq!(message["id"], id);
+                assert_eq!(body.trim(), body_md);
+            }
+        }
+        if group_size == 2 {
+            let mut missing_paths = Vec::new();
+            collect_canonical_message_paths_with_id(
+                &archive.root.join("messages"),
+                42,
+                &mut missing_paths,
+            )
+            .unwrap();
+            assert!(missing_paths.is_empty());
+        }
+        println!("{COMPLETED}");
+    }
+
     // ── Ack-fast durable archive retry backlog (br-ack-fast-storage-commit-reply-3ac88) ──
 
     fn backlog_test_message_op(config: &Config, slug: &str, id: i64) -> WriteOp {
@@ -20718,6 +22570,218 @@ mod tests {
         // The message is now durably in the git archive.
         let archive = ensure_archive(&config, "local-drain").unwrap();
         assert!(!get_recent_commits(&archive, 4, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_retries_partial_bundle_after_writer_panic() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_retries_partial_bundle_after_writer_panic",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "backlog-panic-partial").unwrap();
+        let op = backlog_test_message_op(&config, "backlog-panic-partial", 8081);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = &op
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, message_json, sender, recipients).unwrap();
+        let canonical_content = render_message_bundle_content(message_json, body_md).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        let panic_archive = archive.clone();
+        let partial_path = paths.canonical.clone();
+        let partial_content = canonical_content.clone();
+        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    // Publish one real, durable copy before unwinding both
+                    // locks. Retry must preserve it and fill the missing copies.
+                    ensure_parent_dir(&partial_path)?;
+                    let mut writes = StagedArchiveWrites::default();
+                    writes.add(partial_path, partial_content.as_bytes())?;
+                    writes.publish()?;
+                    panic!("injected archive writer panic after canonical publication");
+                });
+            }));
+        });
+
+        let errors_before = mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_direct_write_errors_total
+            .load();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(1)
+        ));
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(
+            std::fs::read_to_string(&paths.canonical).unwrap(),
+            canonical_content
+        );
+        assert!(!paths.outbox.exists());
+        assert!(!paths.inbox[0].exists());
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .archive_direct_write_errors_total
+                .load(),
+            errors_before + 1
+        );
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(!journal.exists());
+        let resolved = journal
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(resolved).unwrap(), journal_bytes);
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), canonical_content);
+        }
+        let mut canonical_paths = Vec::new();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            8081,
+            &mut canonical_paths,
+        )
+        .unwrap();
+        assert_eq!(canonical_paths, vec![paths.canonical]);
+    }
+
+    #[test]
+    fn archive_backlog_dead_letters_writer_panics_and_drains_following_mail() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_dead_letters_writer_panics_and_drains_following_mail",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "backlog-panic-poison";
+        let archive = ensure_archive(&config, project).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8082), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8083), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+
+        for attempt in 1..=ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            let panic_archive = archive.clone();
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let _: Result<()> = with_project_lock(&panic_archive, || {
+                        panic!("private message content from injected writer panic");
+                    });
+                }));
+            });
+            let outcome = backlog.drain_step();
+            if attempt < ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::RetryLater(n) if n == attempt));
+                assert_eq!(backlog.backlog_state().0, 2);
+                assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+            } else {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::DeadLettered));
+            }
+        }
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert!(!journal.exists());
+        let failed = journal
+            .parent()
+            .unwrap()
+            .join("failed")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(failed).unwrap(), journal_bytes);
+        let ledger =
+            std::fs::read_to_string(config.storage_root.join("doctor/backlog_dead_letter.jsonl"))
+                .unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["attempts"], ARCHIVE_BACKLOG_MAX_ATTEMPTS);
+        assert_eq!(records[0]["op"]["message_json"]["id"], 8082);
+        assert!(
+            records[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("archive write panicked")
+        );
+        assert!(!ledger.contains("private message content"));
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Empty
+        ));
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = backlog_test_message_op(&config, project, 8083)
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (message, body) = read_message_file(path).unwrap();
+            assert_eq!(message["id"], 8083);
+            assert_eq!(body.trim(), body_md);
+        }
     }
 
     #[test]
@@ -22249,6 +24313,244 @@ mod tests {
                 .iter()
                 .all(|row| row.archive_key != key),
             "a host-pressure skip must not feed the per-archive circuit breaker"
+        );
+    }
+
+    /// Hold the publication fence on a helper thread until `release` fires.
+    fn hold_publication_fence() -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        (release_tx, holder)
+    }
+
+    fn direct_clear_signal_op(tmp: &TempDir, slug: &str) -> WriteOp {
+        WriteOp::ClearSignal {
+            config: test_config(tmp.path()),
+            project_slug: slug.to_string(),
+            agent_name: "DirectFenceAgent".to_string(),
+        }
+    }
+
+    /// A direct write waits out a short fence hold and lands (GH#178). A
+    /// single try-lock refuses it instead, which left most reservation
+    /// artifacts to reconcile-on-read under swarm load.
+    #[test]
+    fn write_op_sync_direct_waits_out_a_short_fence_hold() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-short-hold");
+        let (release, holder) = hold_publication_fence();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            release.send(()).expect("release the fence");
+        });
+
+        let started = Instant::now();
+        let result = write_op_sync_direct(&op);
+        let waited = started.elapsed();
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(
+            waited >= Duration::from_millis(30),
+            "the write must have waited for the held fence: {waited:?}"
+        );
+    }
+
+    /// A fence held for 1.5 s is waited out and the write lands. On a loaded
+    /// host, drain and coalescer holds of that length are routine (fb25), and
+    /// the former 500 ms budget refused them as reservation archive outages.
+    #[test]
+    fn write_op_sync_direct_waits_out_a_multi_second_fence_hold() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-long-hold");
+        let (release, holder) = hold_publication_fence();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_500));
+            release.send(()).expect("release the fence");
+        });
+
+        let started = Instant::now();
+        let result = write_op_sync_direct(&op);
+        let waited = started.elapsed();
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(
+            waited >= Duration::from_millis(1_400),
+            "the write must have waited for the held fence: {waited:?}"
+        );
+    }
+
+    /// A stalled holder (GH#351) still refuses the direct write, within the
+    /// admission budget rather than until the holder lets go.
+    #[test]
+    fn write_op_sync_direct_refuses_a_stalled_fence_within_its_budget() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-stalled-hold");
+        let (release, holder) = hold_publication_fence();
+
+        // On a helper thread with a deadline, so a regression to an unbounded
+        // wait fails instead of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = write_op_sync_direct(&op);
+            done_tx
+                .send((result, started.elapsed()))
+                .expect("report the outcome");
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+        release.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer.join().expect("writer thread");
+
+        let (result, waited) = outcome.expect("the direct write must give up on a stalled fence");
+        assert!(
+            matches!(
+                result,
+                DirectArchiveWrite::Failed(StorageError::LockContention { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            waited >= DIRECT_FENCE_ADMISSION_BUDGET,
+            "refused before its budget ran out: {waited:?}"
+        );
+        assert!(
+            waited < DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(2),
+            "waited far past its budget: {waited:?}"
+        );
+    }
+
+    /// Cancellation ends the admission wait at the next attempt.
+    #[test]
+    fn write_op_sync_direct_cancellation_ends_the_fence_wait() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-cancelled-wait");
+        let (release, holder) = hold_publication_fence();
+
+        let mut checks = 0;
+        let started = Instant::now();
+        let result = write_op_sync_direct_with_cancel(&op, || {
+            checks += 1;
+            checks > 2
+        });
+        let waited = started.elapsed();
+        release.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+
+        assert!(
+            matches!(
+                &result,
+                DirectArchiveWrite::Failed(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "{result:?}"
+        );
+        assert!(
+            waited < DIRECT_FENCE_ADMISSION_BUDGET / 2,
+            "a cancelled caller must not sit out the budget: {waited:?}"
+        );
+    }
+
+    /// While a direct writer is registered as waiting, a blocking acquisition
+    /// first gives way for [`DIRECT_WAITER_GIVE_WAY`]; with no waiter it does
+    /// not pause at all (br-9ott5). This pins the mechanism deterministically:
+    /// the timing-based test below can pass by luck without it.
+    #[test]
+    fn blocking_fence_acquisition_gives_way_only_while_a_direct_writer_waits() {
+        let idle_started = Instant::now();
+        give_way_to_direct_writers();
+        let idle = idle_started.elapsed();
+        assert!(
+            idle < Duration::from_micros(2_500),
+            "no waiter, so no pause: {idle:?}"
+        );
+
+        let waiter = DirectFenceWaiter::register();
+        let started = Instant::now();
+        give_way_to_direct_writers();
+        let paused = started.elapsed();
+        drop(waiter);
+        // A fixed floor as well as the constant: a zero window must fail here.
+        assert!(
+            paused >= Duration::from_millis(4) && paused >= DIRECT_WAITER_GIVE_WAY,
+            "a waiting direct writer must get the give-way window: {paused:?}"
+        );
+        assert!(
+            paused < DIRECT_WAITER_GIVE_WAY + Duration::from_millis(200),
+            "the give-way pause is bounded: {paused:?}"
+        );
+        assert_eq!(DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    /// A writer that releases the fence and takes it straight back, as the WBQ
+    /// drain does between batches, must not starve direct writes: blocking
+    /// acquirers give way to registered direct writers (br-9ott5), so a direct
+    /// write lands at the next release, within a few milliseconds. Without
+    /// that it lands only when a poll happens to hit the release gap: in
+    /// practice hundreds of milliseconds, or not within its budget.
+    #[test]
+    fn write_op_sync_direct_lands_against_a_writer_that_retakes_the_fence() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let barger = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut first_hold = Some(held_tx);
+                while !stop.load(Ordering::Acquire) {
+                    let guard = ArchiveMutationGuard::begin();
+                    if let Some(held) = first_hold.take() {
+                        held.send(()).expect("report the first hold");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(guard);
+                }
+            })
+        };
+        held_rx.recv().expect("fence held");
+
+        let outcomes = (0..10)
+            .map(|attempt| {
+                let op = direct_clear_signal_op(&tmp, &format!("direct-retaken-{attempt}"));
+                let started = Instant::now();
+                let result = write_op_sync_direct(&op);
+                (result, started.elapsed())
+            })
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Release);
+        barger.join().expect("barging thread");
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|(result, _)| matches!(result, DirectArchiveWrite::Written)),
+            "{outcomes:?}"
+        );
+        let mut waits = outcomes
+            .iter()
+            .map(|(_, waited)| *waited)
+            .collect::<Vec<_>>();
+        waits.sort();
+        // The median tolerates a few scheduling outliers on a loaded host.
+        assert!(
+            waits[waits.len() / 2] < Duration::from_millis(50),
+            "direct writes must land at the next release, not by luck: {waits:?}"
         );
     }
 
@@ -24135,6 +26437,72 @@ mod tests {
     }
 
     #[test]
+    fn archive_read_generation_tracks_external_epoch_changes_without_git_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            let absent = archive_read_generation(tmp.path()).unwrap();
+            assert!(absent.epoch_token.is_none());
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let first = archive_read_generation(tmp.path()).unwrap();
+            assert_ne!(
+                absent, first,
+                "a newly participating writer invalidates reads"
+            );
+
+            // Disk-only rewrite models another process: no local counter,
+            // commit or index change can explain the invalidation.
+            fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+            let second = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(first.head, second.head);
+            assert_eq!(first.index, second.index);
+            assert_eq!(first.mutation_epoch, second.mutation_epoch);
+            assert_ne!(first, second);
+
+            fs::rename(&epoch_path, tmp.path().join("retained-epoch")).unwrap();
+            let missing = archive_read_generation(tmp.path()).unwrap();
+            assert!(missing.epoch_token.is_none());
+            assert_ne!(
+                second, missing,
+                "losing the token cannot retain a cached read"
+            );
+        });
+    }
+
+    #[test]
+    fn archive_read_generation_rejects_an_epoch_rewrite_during_sampling() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let before = archive_read_generation(tmp.path()).unwrap();
+            ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+                }));
+            });
+            let sampled = archive_read_generation(tmp.path());
+            let pending =
+                ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            assert!(
+                pending.is_none(),
+                "the real sampling path must run the rewrite"
+            );
+            assert!(
+                matches!(sampled, Err(StorageError::LockContention { message })
+                if message.contains("changed while being sampled"))
+            );
+            let after = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(before.head, after.head);
+            assert_eq!(before.index, after.index);
+            assert_eq!(before.mutation_epoch, after.mutation_epoch);
+            assert_ne!(before, after);
+        });
+    }
+
+    #[test]
     fn archive_read_generation_refuses_an_active_git_index_lock() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -25854,6 +28222,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark; unreliable under CI/parallel test load — run with --ignored"]
     fn spill_path_btreeset_benchmark_random_order_stability() {
         use std::time::Instant;
 

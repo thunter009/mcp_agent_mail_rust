@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
+mod archive_diagnostics;
 pub mod bench;
 pub mod ci;
 pub mod context;
@@ -57,6 +58,8 @@ use mcp_agent_mail_db::archive_anomaly::{
 };
 use mcp_agent_mail_share as share;
 use serde::{Deserialize, Serialize};
+
+use archive_diagnostics::{ArchiveDiagnostics, ArchivePhase};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -1778,6 +1781,9 @@ pub enum ArchiveCommand {
         scrub_preset: String,
         #[arg(long, short = 'l')]
         label: Option<String>,
+        /// Emit content-free phase timings and file/byte counters to stderr.
+        #[arg(long)]
+        diagnostics: bool,
     },
     List {
         #[arg(long, short = 'n', default_value_t = 0)]
@@ -2935,8 +2941,8 @@ pub enum DoctorCommand {
     /// Print the paste-ready agent handbook (Markdown).
     ///
     /// Single source of truth for an agent invoking `am doctor` cold.
-    /// Documents the 10 verbs, 11 exit codes, 5 common workflows, and
-    /// the 11 subsystems. No external lookup needed.
+    /// Documents every verb, the exit codes, the common workflows, and
+    /// the subsystems. No external lookup needed.
     #[command(name = "robot-docs")]
     RobotDocs,
 
@@ -5962,10 +5968,10 @@ fn quarantine_stale_activity_lock_if_unheld(
     };
 
     if metadata.file_type().is_symlink() {
-        return quarantine_startup_activity_lock_if_exists(lock_path, context);
+        return quarantine_startup_artifact_if_exists(lock_path, context, None);
     }
     if !metadata.file_type().is_file() {
-        let quarantined = quarantine_startup_activity_lock_if_exists(lock_path, context)?;
+        let quarantined = quarantine_startup_artifact_if_exists(lock_path, context, None)?;
         if let Some(ref quarantined_path) = quarantined {
             tracing::warn!(
                 path = %lock_path.display(),
@@ -5976,11 +5982,7 @@ fn quarantine_stale_activity_lock_if_unheld(
         return Ok(quarantined);
     }
 
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock_path)
-    {
+    let file = match mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(CliError::Io(error)),
@@ -5993,7 +5995,67 @@ fn quarantine_stale_activity_lock_if_unheld(
         return Ok(None);
     }
 
-    quarantine_startup_activity_lock_if_exists(lock_path, context)
+    // Keep the advisory lock on this exact file until publication and its
+    // directory barrier finish. A replacement at the pathname is not covered
+    // by this lock and must never be treated as the observed stale lock.
+    quarantine_startup_artifact_if_exists(lock_path, context, Some(&file))
+}
+
+fn verify_startup_held_file_identity(path: &Path, held: &std::fs::File) -> std::io::Result<()> {
+    let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+    let retained_identity = same_file::Handle::from_file(held.try_clone()?)?;
+    let current_identity = same_file::Handle::from_file(current)?;
+    if retained_identity != current_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "startup artifact {} no longer names the retained file; refusing publication",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sync_startup_artifact_parents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Match the recovery publishers' Unix directory durability barrier. Rust's
+    // portable File::open cannot open Windows directories; copied file bytes
+    // are still synced on every platform before this additional barrier.
+    #[cfg(unix)]
+    {
+        let parent = |path: &Path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        let source_parent = parent(source);
+        let destination_parent = parent(destination);
+        std::fs::File::open(&source_parent)?.sync_all()?;
+        if destination_parent != source_parent {
+            std::fs::File::open(&destination_parent)?.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (source, destination);
+    Ok(())
+}
+
+#[cfg(test)]
+type StartupArtifactPublicationHook = Box<dyn FnOnce(&Path, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static STARTUP_ARTIFACT_BEFORE_PUBLICATION: std::cell::RefCell<Option<StartupArtifactPublicationHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn startup_artifact_before_publication(source: &Path, destination: &Path) {
+    let hook = STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(source, destination);
+    }
 }
 
 fn next_startup_sqlite_sidecar_artifact_path(
@@ -6026,27 +6088,47 @@ fn next_startup_sqlite_sidecar_snapshot_path(sidecar_path: &Path, timestamp: &st
     next_startup_sqlite_sidecar_artifact_path(sidecar_path, "startup-precheckpoint", timestamp)
 }
 
-fn quarantine_startup_activity_lock_if_exists(
-    lock_path: &Path,
+fn quarantine_startup_artifact_if_exists(
+    artifact_path: &Path,
     context: &str,
+    held_file: Option<&std::fs::File>,
 ) -> CliResult<Option<PathBuf>> {
-    match std::fs::symlink_metadata(lock_path) {
+    match std::fs::symlink_metadata(artifact_path) {
         Ok(_) => {}
         Err(e) => {
-            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+            if held_file.is_none() && matches!(e.kind(), std::io::ErrorKind::NotFound) {
                 return Ok(None);
             }
             return Err(CliError::Io(e));
         }
     }
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined = next_startup_sqlite_sidecar_quarantine_path(lock_path, &timestamp);
-    match std::fs::rename(lock_path, &quarantined) {
-        Ok(()) => Ok(Some(quarantined)),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
+    let quarantined = next_startup_sqlite_sidecar_quarantine_path(artifact_path, &timestamp);
+    #[cfg(test)]
+    startup_artifact_before_publication(artifact_path, &quarantined);
+    if let Some(file) = held_file {
+        verify_startup_held_file_identity(artifact_path, file)?;
+    }
+    // The name allocator is only a convenience. Atomic no-replace publication
+    // is what protects evidence created after that check, including dangling
+    // symlinks. Unsupported platforms fail closed in the shared primitive.
+    match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(artifact_path, &quarantined) {
+        Ok(()) => {
+            sync_startup_artifact_parents(artifact_path, &quarantined).map_err(|error| {
+                CliError::Other(format!(
+                    "quarantined {context} {} to {}, but could not sync its directory; preserved the quarantine for inspection: {error}",
+                    artifact_path.display(),
+                    quarantined.display()
+                ))
+            })?;
+            Ok(Some(quarantined))
+        }
+        Err(e) if held_file.is_none() && matches!(e.kind(), std::io::ErrorKind::NotFound) => {
+            Ok(None)
+        }
         Err(e) => Err(CliError::Other(format!(
             "failed to quarantine {context} {} to {}: {e}",
-            lock_path.display(),
+            artifact_path.display(),
             quarantined.display()
         ))),
     }
@@ -6056,26 +6138,7 @@ fn quarantine_startup_sqlite_sidecar_if_exists(
     sidecar_path: &Path,
     context: &str,
 ) -> CliResult<Option<PathBuf>> {
-    match std::fs::symlink_metadata(sidecar_path) {
-        Ok(_) => {}
-        Err(e) => {
-            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                return Ok(None);
-            }
-            return Err(CliError::Io(e));
-        }
-    }
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined = next_startup_sqlite_sidecar_quarantine_path(sidecar_path, &timestamp);
-    match std::fs::rename(sidecar_path, &quarantined) {
-        Ok(()) => Ok(Some(quarantined)),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
-        Err(e) => Err(CliError::Other(format!(
-            "failed to quarantine {context} sidecar {} to {}: {e}",
-            sidecar_path.display(),
-            quarantined.display()
-        ))),
-    }
+    quarantine_startup_artifact_if_exists(sidecar_path, &format!("{context} sidecar"), None)
 }
 
 fn quarantine_startup_sqlite_sidecar(sidecar_path: &Path, context: &str) -> CliResult<PathBuf> {
@@ -6104,11 +6167,24 @@ fn copy_startup_sqlite_sidecar_snapshot(
         return Ok(None);
     }
 
+    let mut source = mcp_agent_mail_core::disk::open_regular_file_no_follow(sidecar_path)?;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let snapshot = next_startup_sqlite_sidecar_snapshot_path(sidecar_path, &timestamp);
-    std::fs::copy(sidecar_path, &snapshot).map_err(|e| {
+    #[cfg(test)]
+    startup_artifact_before_publication(sidecar_path, &snapshot);
+    verify_startup_held_file_identity(sidecar_path, &source)?;
+    let copy_result = (|| -> std::io::Result<()> {
+        let mut destination =
+            mcp_agent_mail_core::disk::create_new_private_file_no_follow(&snapshot)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        verify_startup_held_file_identity(sidecar_path, &source)?;
+        verify_startup_held_file_identity(&snapshot, &destination)?;
+        sync_startup_artifact_parents(sidecar_path, &snapshot)
+    })();
+    copy_result.map_err(|e| {
         CliError::Other(format!(
-            "failed to snapshot {context} sidecar {} to {}: {e}",
+            "failed to snapshot {context} sidecar {} to {}; any created artifact was preserved for inspection: {e}",
             sidecar_path.display(),
             snapshot.display()
         ))
@@ -16270,23 +16346,44 @@ impl CanonicalSnapshotSource {
         scrub_preset: share::ScrubPreset,
         purpose: share::SnapshotPurpose,
     ) -> Result<share::SnapshotContext, share::ShareError> {
+        self.create_share_snapshot_context_with_observer(
+            snapshot_path,
+            project_filters,
+            scrub_preset,
+            purpose,
+            &mut |_| {},
+        )
+    }
+
+    fn create_share_snapshot_context_with_observer(
+        &self,
+        snapshot_path: &Path,
+        project_filters: &[String],
+        scrub_preset: share::ScrubPreset,
+        purpose: share::SnapshotPurpose,
+        observer: &mut dyn FnMut(share::SnapshotPhaseEvent),
+    ) -> Result<share::SnapshotContext, share::ShareError> {
         match self.kind {
-            CanonicalSnapshotSourceKind::LiveSqlite => share::create_snapshot_context(
-                &self.actual_path,
-                snapshot_path,
-                project_filters,
-                scrub_preset,
-                purpose,
-            ),
-            CanonicalSnapshotSourceKind::LiveSnapshot
-            | CanonicalSnapshotSourceKind::ArchiveSnapshot
-            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
-                share::create_private_canonical_snapshot_context(
+            CanonicalSnapshotSourceKind::LiveSqlite => {
+                share::create_snapshot_context_with_observer(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
                     purpose,
+                    observer,
+                )
+            }
+            CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot
+            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
+                share::create_private_canonical_snapshot_context_with_observer(
+                    &self.actual_path,
+                    snapshot_path,
+                    project_filters,
+                    scrub_preset,
+                    purpose,
+                    observer,
                 )
             }
         }
@@ -22419,6 +22516,98 @@ fn migrate_format_needs_conversion_attempt(
     format.needs_migration() || migrate_format_requires_force(format)
 }
 
+fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
+    db_path: &Path,
+    database_url: &str,
+) -> CliResult<()> {
+    let context = "migration format detection";
+    let franken_admitted = mcp_agent_mail_db::pool::is_franken_admitted_family(db_path, context)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context}: cannot open DB at {} read-only: {error}",
+                db_path.display()
+            ))
+        })?;
+    if franken_admitted {
+        return Ok(());
+    }
+
+    let sqlite_activity_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    let storage_root = resolve_mailbox_activity_storage_root(None);
+    let ownership =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_activity_path, &storage_root);
+
+    let mut lock_candidates = vec![
+        (
+            "sqlite_activity_lock",
+            PathBuf::from(&ownership.sqlite_lock_path),
+        ),
+        (
+            "sqlite_activity_lock",
+            sqlite_sidecar_path(db_path, ".activity.lock"),
+        ),
+    ];
+    if should_lock_mailbox_storage_root(&sqlite_activity_path, &storage_root, None)
+        || should_lock_mailbox_storage_root(db_path, &storage_root, None)
+    {
+        lock_candidates.push((
+            "storage_activity_lock",
+            PathBuf::from(&ownership.storage_lock_path),
+        ));
+    }
+
+    let mut seen_lock_paths = std::collections::BTreeSet::new();
+    for (lock_name, lock_path) in lock_candidates {
+        if !seen_lock_paths.insert(lock_path.clone()) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CliError::Other(format!(
+                    "{context}: refusing non-regular {lock_name} artifact {}",
+                    lock_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "{context}: failed to inspect {lock_name} {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        }
+        if let Some(mode) = infer_lock_mode_by_try_lock(&lock_path) {
+            return Err(CliError::Other(format!(
+                "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while {lock_name} {} is held ({mode}). Safe next command: `am doctor locks --json` (read-only).",
+                db_path.display(),
+                lock_path.display()
+            )));
+        }
+    }
+
+    let recovery_lock = mcp_agent_mail_db::pool::inspect_mailbox_recovery_lock(db_path);
+    if recovery_lock.active {
+        return Err(CliError::Other(format!(
+            "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while recovery lock {} is active ({}). Safe next command: `am doctor locks --json` (read-only).",
+            db_path.display(),
+            recovery_lock.lock_path,
+            recovery_lock.detail
+        )));
+    }
+
+    if ownership.blocks_mutation() {
+        return Err(CliError::Other(format!(
+            "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while mailbox ownership is active ({:?}: {}). Safe next command: `am doctor locks --json` (read-only).",
+            db_path.display(),
+            ownership.disposition,
+            ownership.detail
+        )));
+    }
+
+    Ok(())
+}
+
 fn handle_migrate_cmd(
     check: bool,
     rollback: bool,
@@ -22464,6 +22653,7 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
+    ensure_sidecarless_sqlite_family_offline_for_format_detection(&db_path, &cfg.database_url)?;
     let (format_conn, opened_path) =
         open_live_sqlite_read_only(&resolved_path, "migration format detection")?;
     resolved_path = opened_path;
@@ -23189,6 +23379,24 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     }
     ensure_real_file_target_path(db_path, "restore destination")?;
 
+    // Retention holds this same election. Cover the source copy as well as
+    // promotion so a selected generic backup cannot be reclaimed mid-restore.
+    // Same-path nested promotion reuses admission; an operator's surrounding
+    // breaker bypass still keeps the cross-process election exclusive.
+    match mcp_agent_mail_db::pool::with_automatic_recovery_admission(
+        db_path,
+        "CLI backup restore",
+        || restore_db_from_backup_admitted(db_path, backup_path),
+    ) {
+        Ok(()) => Ok(()),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission { error, .. }) => {
+            Err(CliError::Other(error.to_string()))
+        }
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error)) => Err(error),
+    }
+}
+
+fn restore_db_from_backup_admitted(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     let restore_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let staged_restore =
         next_doctor_artifact_path_with_timestamp(db_path, "restore", "sqlite3", &restore_ts);
@@ -24187,9 +24395,13 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
              releases v0.3.31 and later must publish SHA256SUMS.minisig and the updater refuses unsigned manifests"
         )
     })?;
-    let signer_key_id =
-        release_signing::verify_manifest_signature(&checksum_body, &signature_body, &trusted_keys)
-            .map_err(|e| format!("release manifest signature verification failed: {e}"))?;
+    let signer_key_id = release_signing::verify_release_manifest_signature(
+        &checksum_body,
+        &signature_body,
+        &trusted_keys,
+        &version,
+    )
+    .map_err(|e| format!("release manifest signature verification failed: {e}"))?;
     ftui_runtime::ftui_eprintln!("Manifest signature verified (minisign key {signer_key_id}).");
 
     let checksum_text = String::from_utf8(checksum_body)
@@ -53099,11 +53311,13 @@ http_headers = { Authorization = "Bearer secret" }
                         projects,
                         scrub_preset,
                         label,
+                        diagnostics,
                     },
             } => {
                 assert!(projects.is_empty());
                 assert_eq!(scrub_preset, "archive");
                 assert!(label.is_none());
+                assert!(!diagnostics);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -53123,6 +53337,7 @@ http_headers = { Authorization = "Bearer secret" }
             "strict",
             "-l",
             "nightly",
+            "--diagnostics",
         ])
         .expect("failed to parse archive save flags");
         match cli.command.expect("expected command") {
@@ -53132,11 +53347,13 @@ http_headers = { Authorization = "Bearer secret" }
                         projects,
                         scrub_preset,
                         label,
+                        diagnostics,
                     },
             } => {
                 assert_eq!(projects, vec!["proj1".to_string(), "proj2".to_string()]);
                 assert_eq!(scrub_preset, "strict");
                 assert_eq!(label.as_deref(), Some("nightly"));
+                assert!(diagnostics);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -53707,6 +53924,41 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(std::fs::read(&backup_journal).unwrap(), b"backup-journal");
         assert_eq!(std::fs::read(&backup_wal).unwrap(), b"backup-wal");
         assert_eq!(std::fs::read(&backup_shm).unwrap(), b"backup-shm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_db_from_backup_defers_before_staging_while_retention_owns_election() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let backup = root.join("storage.sqlite3.bak.20260102_000000");
+        write_marker_db(&primary, "live-db");
+        std::fs::copy(&primary, &backup).unwrap();
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let names = || {
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = names();
+        let bytes = std::fs::read(&backup).unwrap();
+        // Explicit operator bypass must still respect retention's election.
+        let _bypass = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+        let error = restore_db_from_backup(&primary, &backup).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery-breaker election lock"),
+            "{error}"
+        );
+        assert_eq!(
+            names(),
+            before,
+            "no restore stage or rollback may be constructed"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+        assert_eq!(std::fs::read(&primary).unwrap(), bytes);
+        guard.revalidate().unwrap();
     }
 
     #[test]
@@ -54468,6 +54720,313 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             quarantine_count, 0,
             "migrate --check should not mutate or quarantine the corrupt database"
+        );
+    }
+
+    #[test]
+    fn migrate_check_and_convert_sidecarless_legacy_text_database() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy-text.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('legacy-proj', '/tmp/legacy-proj', '2026-01-15T10:30:00Z');",
+            )
+            .expect("insert legacy text timestamp row");
+        drop(canonical);
+
+        assert!(
+            !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "canonical-seeded database must start sidecarless"
+        );
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, None)
+                    .expect("migrate --check must succeed on sidecarless legacy text DB");
+
+                for suffix in [
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                    "-wal",
+                    "-shm",
+                    "-journal",
+                    ".activity.lock",
+                ] {
+                    let sidecar = sqlite_sidecar_path(&db_path, suffix);
+                    assert!(
+                        !sidecar.exists(),
+                        "migrate --check must not materialize sidecar {}",
+                        sidecar.display()
+                    );
+                }
+
+                handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
+                    .expect("migrate must convert sidecarless legacy text DB");
+            },
+        );
+
+        let backup_count = std::fs::read_dir(&backup_dir)
+            .expect("read backup dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            backup_count, 1,
+            "migrate should create one pre-conversion backup for legacy TEXT timestamps"
+        );
+
+        let (conn, _opened_path) =
+            open_live_sqlite_read_only(&db_path_text, "post-migrate verification")
+                .expect("reopen migrated db read-only");
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS ty, created_at FROM projects WHERE slug = 'legacy-proj'",
+                &[],
+            )
+            .expect("query migrated project");
+        assert_eq!(rows.len(), 1);
+        let ty: String = rows[0].get_named("ty").expect("ty");
+        let created_at: i64 = rows[0].get_named("created_at").expect("created_at");
+        assert_eq!(ty, "integer");
+        assert!(
+            created_at > 0,
+            "converted timestamp must be positive micros"
+        );
+    }
+
+    #[test]
+    fn migrate_check_and_run_sidecarless_canonical_integer_database_is_noop() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical-int.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('int-proj', '/tmp/int-proj', 1736937000000000);",
+            )
+            .expect("insert integer timestamp row");
+        drop(canonical);
+
+        assert!(
+            !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "canonical-seeded integer database must start sidecarless"
+        );
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, Some(backup_dir.clone()))
+                    .expect("migrate --check must succeed on sidecarless integer DB");
+                handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
+                    .expect("migrate must succeed as no-op conversion on sidecarless integer DB");
+            },
+        );
+
+        let backup_count = std::fs::read_dir(&backup_dir)
+            .expect("read backup dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            backup_count, 0,
+            "integer-timestamp database should not create a timestamp-conversion backup"
+        );
+    }
+
+    #[test]
+    fn migrate_check_preserves_same_process_writer_lock_on_franken_admitted_database() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("franken-live-writer.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let writer = mcp_agent_mail_db::DbConn::open_file(&db_path_text).expect("open franken db");
+        writer
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        writer
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('live-proj', '/tmp/live-proj', 1736937000000000);",
+            )
+            .expect("insert project");
+        assert!(
+            mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "FrankenSQLite database must carry a complete namespace sidecar pair"
+        );
+
+        writer
+            .execute_raw(
+                "BEGIN IMMEDIATE; \
+                 UPDATE projects SET human_key = '/tmp/live-proj-locked' WHERE slug = 'live-proj';",
+            )
+            .expect("begin immediate write transaction");
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, None).expect(
+                    "migrate --check must succeed via bound FrankenSQLite read-only connection",
+                );
+            },
+        );
+
+        let contender =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_text).expect("open contender");
+        contender
+            .execute_raw("PRAGMA busy_timeout = 0;")
+            .expect("set zero busy timeout");
+        let conflict = contender.execute_raw("BEGIN IMMEDIATE;");
+        assert!(
+            conflict.is_err(),
+            "same-process writer lock must remain intact after migrate --check"
+        );
+
+        writer.execute_raw("ROLLBACK;").expect("rollback writer");
+        contender
+            .execute_raw("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("contender should acquire write lock after rollback");
+    }
+
+    #[test]
+    fn migrate_format_detection_refuses_incomplete_namespace_and_active_owner_on_sidecarless_db() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sidecarless-guarded.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let quarantine_dir = dir.path().join("quarantine");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('guarded-proj', '/tmp/guarded-proj', '2026-01-15T10:30:00Z');",
+            )
+            .expect("insert legacy text row");
+        drop(canonical);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        // 1. Holding an active mailbox activity lock on a sidecarless DB must fail closed
+        // before canonical SQLite opens the file.
+        let activity_guard = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire activity lock");
+        let busy_err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_cmd(true, false, false, None),
+        )
+        .expect_err("sidecarless DB with active activity lock must fail closed");
+        assert!(
+            is_resource_busy_cli_error(&busy_err),
+            "expected busy error when activity lock is held, got: {busy_err}"
+        );
+        assert!(
+            busy_err
+                .to_string()
+                .contains("refuses canonical SQLite open on sidecarless database"),
+            "unexpected error detail: {busy_err}"
+        );
+        drop(activity_guard);
+        let lock_artifact = sqlite_sidecar_path(&db_path, ".activity.lock");
+        if lock_artifact.exists() {
+            std::fs::rename(&lock_artifact, quarantine_dir.join("retired.activity.lock"))
+                .expect("quarantine lock artifact");
+        }
+
+        // 2. An incomplete FrankenSQLite namespace sidecar pair must fail closed.
+        let half_gate = sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate");
+        std::fs::write(&half_gate, b"half-admitted").expect("write half namespace gate");
+        let half_err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_cmd(true, false, false, None),
+        )
+        .expect_err("incomplete namespace pair must fail closed");
+        assert!(
+            half_err
+                .to_string()
+                .contains("incomplete FrankenSQLite namespace sidecar pair"),
+            "unexpected incomplete-namespace error: {half_err}"
         );
     }
 
@@ -55790,6 +56349,93 @@ http_headers = { Authorization = "Bearer secret" }
 
         assert!(!db_path.exists());
         assert!(!storage_root.exists());
+    }
+
+    fn capture_archive_diagnostics() -> (ArchiveDiagnostics, Arc<std::sync::Mutex<Vec<String>>>) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&records);
+        let diagnostics = ArchiveDiagnostics::with_test_sink(move |line| {
+            sink.lock().unwrap().push(line.to_owned());
+        });
+        (diagnostics, records)
+    }
+
+    #[test]
+    fn archive_diagnostics_enumeration_failure_preserves_fixture_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let obstruction = root.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve recovery evidence").unwrap();
+        let (diagnostics, records) = capture_archive_diagnostics();
+        diagnostics.start(ArchivePhase::Enumerate);
+        let mut files = Vec::new();
+        let result = collect_files_with_exclusions(
+            root.path(),
+            &obstruction,
+            &BTreeSet::new(),
+            &mut files,
+            &diagnostics,
+        );
+        assert!(matches!(result, Err(CliError::Io(_))));
+        drop(diagnostics);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains("phase=storage_enumeration status=failed"));
+        assert!(records[1].contains("storage_files=0 storage_bytes=0"));
+        assert!(!records[1].contains("not-a-directory"));
+        assert!(files.is_empty());
+        assert_eq!(
+            std::fs::read(obstruction).unwrap(),
+            b"preserve recovery evidence"
+        );
+    }
+
+    #[test]
+    fn archive_diagnostics_publication_failure_keeps_zip_and_destination() {
+        use std::io::{Read, Write};
+
+        let root = tempfile::tempdir().unwrap();
+        let temporary = root.path().join("temporary.zip");
+        let destination = root.path().join("destination.zip");
+        let file = std::fs::File::create(&temporary).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("payload", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"retained archive payload").unwrap();
+        zip.finish().unwrap();
+        let original_zip = std::fs::read(&temporary).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let evidence = destination.join("keep.txt");
+        std::fs::write(&evidence, b"original evidence").unwrap();
+
+        let (diagnostics, records) = capture_archive_diagnostics();
+        assert!(publish_archive_zip(&temporary, &destination, &diagnostics).is_err());
+        drop(diagnostics);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains("phase=publication status=failed"));
+        assert!(!records.iter().any(|line| line.contains("status=completed")));
+        assert_eq!(std::fs::read(&evidence).unwrap(), b"original evidence");
+        assert_eq!(std::fs::read(&temporary).unwrap(), original_zip);
+
+        // The very same prepared ZIP remains usable after the failed attempt;
+        // publish it elsewhere without touching the obstructing evidence.
+        let published = root.path().join("published.zip");
+        let (diagnostics, records) = capture_archive_diagnostics();
+        let bytes = publish_archive_zip(&temporary, &published, &diagnostics).unwrap();
+        drop(diagnostics);
+        assert_eq!(bytes, original_zip.len() as u64);
+        let records = records.lock().unwrap();
+        assert!(records[1].contains("phase=publication status=completed"));
+        assert!(records[1].contains(&format!("archive_bytes={bytes}")));
+        assert!(!temporary.exists());
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(published).unwrap()).unwrap();
+        let mut payload = Vec::new();
+        zip.by_name("payload")
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"retained archive payload");
+        assert_eq!(std::fs::read(evidence).unwrap(), b"original evidence");
     }
 
     #[cfg(unix)]
@@ -77885,6 +78531,264 @@ startup_timeout_sec = 42
         );
     }
 
+    type StartupArtifactPublisher = fn(&Path, &str) -> CliResult<Option<PathBuf>>;
+
+    fn startup_artifact_publishers() -> [(&'static str, StartupArtifactPublisher); 3] {
+        [
+            ("activity-lock", quarantine_stale_activity_lock_if_unheld),
+            ("sidecar", quarantine_startup_sqlite_sidecar_if_exists),
+            ("snapshot", copy_startup_sqlite_sidecar_snapshot),
+        ]
+    }
+
+    #[test]
+    fn startup_artifact_publication_refuses_raced_regular_destination() {
+        for (name, publish) in startup_artifact_publishers() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join(name);
+            std::fs::write(&source, b"original recovery evidence").expect("write source");
+            STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(|_, destination| {
+                    std::fs::write(destination, b"raced destination evidence")
+                        .expect("occupy selected destination");
+                }));
+            });
+
+            publish(&source, "race test").expect_err("occupied destination must refuse");
+
+            assert_eq!(
+                std::fs::read(&source).expect("source retained"),
+                b"original recovery evidence",
+                "{name} must preserve its source when the allocated name is occupied"
+            );
+            let artifacts =
+                quarantined_artifacts_with_prefix(dir.path(), &format!("{name}.startup-"));
+            assert_eq!(
+                artifacts.len(),
+                1,
+                "{name} must not silently retry publication"
+            );
+            assert_eq!(
+                std::fs::read(&artifacts[0]).expect("raced destination retained"),
+                b"raced destination evidence",
+                "{name} must not overwrite another publisher's evidence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_artifact_publication_refuses_raced_dangling_destination() {
+        for (name, publish) in startup_artifact_publishers() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join(name);
+            let missing_target = dir.path().join("missing-target");
+            std::fs::write(&source, b"original recovery evidence").expect("write source");
+            let hook_target = missing_target.clone();
+            STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |_, destination| {
+                    std::os::unix::fs::symlink(&hook_target, destination)
+                        .expect("occupy selected destination with dangling symlink");
+                }));
+            });
+
+            publish(&source, "race test").expect_err("dangling destination must refuse");
+
+            assert_eq!(
+                std::fs::read(&source).expect("source retained"),
+                b"original recovery evidence"
+            );
+            let artifacts =
+                quarantined_artifacts_with_prefix(dir.path(), &format!("{name}.startup-"));
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(
+                std::fs::read_link(&artifacts[0]).expect("raced symlink retained"),
+                missing_target
+            );
+            assert!(
+                !missing_target.exists(),
+                "{name} must not write through the raced destination symlink"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_activity_quarantine_refuses_substituted_locked_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.activity.lock");
+        let retained = dir.path().join("retained-original-lock");
+        std::fs::write(&source, b"original stale lock").expect("write stale lock");
+        let replacement_lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_lock = std::rc::Rc::clone(&replacement_lock);
+        let hook_retained = retained.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                let probe = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+                    .expect("open original lock probe");
+                assert!(
+                    fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+                    "the original file must still be locked at the publication boundary"
+                );
+                drop(probe);
+                std::fs::rename(path, &hook_retained).expect("retain original locked inode");
+                std::fs::write(path, b"new live owner's lock").expect("publish replacement lock");
+                let file = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+                    .expect("open replacement lock");
+                fs2::FileExt::try_lock_exclusive(&file).expect("new owner holds replacement lock");
+                *hook_lock.borrow_mut() = Some(file);
+            }));
+        });
+
+        let error = quarantine_stale_activity_lock_if_unheld(&source, "identity test")
+            .expect_err("a lock on the old inode cannot authorize moving the replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer names the retained file")
+        );
+        drop(replacement_lock.borrow_mut().take());
+        assert_eq!(
+            std::fs::read(&source).expect("replacement lock retained"),
+            b"new live owner's lock"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original locked inode retained"),
+            b"original stale lock"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(dir.path(), "mail.activity.lock.startup-quarantine-")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_refuses_substituted_source_before_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        let retained = dir.path().join("retained-original-wal");
+        std::fs::write(&source, b"original WAL evidence").expect("write WAL");
+        let hook_retained = retained.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                std::fs::rename(path, &hook_retained).expect("retain opened WAL inode");
+                std::fs::write(path, b"replacement WAL evidence").expect("replace source path");
+            }));
+        });
+
+        let error = copy_startup_sqlite_sidecar_snapshot(&source, "identity test")
+            .expect_err("source replacement must refuse before copying");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer names the retained file")
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("replacement WAL retained"),
+            b"replacement WAL evidence"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original WAL retained"),
+            b"original WAL evidence"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(
+                dir.path(),
+                "mail.sqlite3-wal.startup-precheckpoint-"
+            )
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_snapshot_refuses_source_symlink_substitution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        let retained = dir.path().join("retained-original-wal");
+        let outside = dir.path().join("outside-evidence");
+        std::fs::write(&source, b"original WAL evidence").expect("write WAL");
+        std::fs::write(&outside, b"unrelated private evidence").expect("write outside file");
+        let hook_retained = retained.clone();
+        let hook_outside = outside.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                std::fs::rename(path, &hook_retained).expect("retain opened WAL inode");
+                std::os::unix::fs::symlink(&hook_outside, path).expect("substitute source link");
+            }));
+        });
+
+        copy_startup_sqlite_sidecar_snapshot(&source, "identity test")
+            .expect_err("source symlink substitution must refuse");
+        assert_eq!(
+            std::fs::read_link(&source).expect("source link retained"),
+            outside
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("outside file retained"),
+            b"unrelated private evidence"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original WAL retained"),
+            b"original WAL evidence"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(
+                dir.path(),
+                "mail.sqlite3-wal.startup-precheckpoint-"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_creates_private_independent_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        std::fs::write(&source, b"complete WAL evidence").expect("write WAL");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666))
+                .expect("set permissive source mode");
+        }
+
+        let snapshot = copy_startup_sqlite_sidecar_snapshot(&source, "snapshot test")
+            .expect("snapshot")
+            .expect("snapshot path");
+        assert_eq!(
+            std::fs::read(&snapshot).expect("read snapshot"),
+            b"complete WAL evidence"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("source intact"),
+            b"complete WAL evidence"
+        );
+        assert_ne!(
+            same_file::Handle::from_path(&source).expect("source identity"),
+            same_file::Handle::from_path(&snapshot).expect("snapshot identity")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&snapshot)
+                    .expect("snapshot metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&source)
+                    .expect("source metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o666
+            );
+        }
+    }
+
     #[test]
     fn cleanup_stale_db_artifacts_quarantines_header_only_wal_and_orphaned_shm() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -85394,6 +86298,7 @@ fn collect_files_with_exclusions(
     dir: &Path,
     excluded_rel_paths: &std::collections::BTreeSet<PathBuf>,
     out: &mut Vec<PathBuf>,
+    diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -85410,8 +86315,13 @@ fn collect_files_with_exclusions(
             continue;
         }
         if file_type.is_dir() {
-            collect_files_with_exclusions(base, &path, excluded_rel_paths, out)?;
+            collect_files_with_exclusions(base, &path, excluded_rel_paths, out, diagnostics)?;
         } else if file_type.is_file() {
+            if diagnostics.enabled() {
+                // Counter-only metadata is best effort. It must neither add
+                // I/O to the default path nor make an otherwise valid save fail.
+                diagnostics.discovered(entry.metadata().ok().map(|metadata| metadata.len()));
+            }
             out.push(rel);
         }
     }
@@ -85420,7 +86330,13 @@ fn collect_files_with_exclusions(
 
 #[cfg(test)]
 fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
-    collect_files_with_exclusions(base, dir, &std::collections::BTreeSet::new(), out)
+    collect_files_with_exclusions(
+        base,
+        dir,
+        &std::collections::BTreeSet::new(),
+        out,
+        &ArchiveDiagnostics::disabled(),
+    )
 }
 
 fn archive_storage_excluded_relative_paths(
@@ -85527,7 +86443,15 @@ fn archive_save_state(
     scrub_preset: String,
     label: Option<String>,
 ) -> CliResult<PathBuf> {
-    archive_save_state_internal(source_db, storage_root, projects, scrub_preset, label, true)
+    archive_save_state_internal(
+        source_db,
+        storage_root,
+        projects,
+        scrub_preset,
+        label,
+        true,
+        &ArchiveDiagnostics::disabled(),
+    )
 }
 
 fn archive_save_state_locked(
@@ -85544,6 +86468,7 @@ fn archive_save_state_locked(
         scrub_preset,
         label,
         false,
+        &ArchiveDiagnostics::disabled(),
     )
 }
 
@@ -85554,10 +86479,11 @@ fn archive_save_state_internal(
     scrub_preset: String,
     label: Option<String>,
     acquire_mailbox_read_lock: bool,
+    diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<PathBuf> {
     use chrono::Timelike;
-    use std::io::Write;
 
+    diagnostics.start(ArchivePhase::Prepare);
     let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
@@ -85587,6 +86513,8 @@ fn archive_save_state_internal(
     } else {
         None
     };
+    diagnostics.finish();
+    diagnostics.start(ArchivePhase::SnapshotSource);
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
     let source = resolve_canonical_snapshot_source_path(
         &source_db,
@@ -85604,18 +86532,36 @@ fn archive_save_state_internal(
         .prefix("mailbox-archive-")
         .tempdir()?;
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
+    diagnostics.finish();
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
     // A private save: the preset alone decides (the lossless `archive`
     // preset keeps registration tokens so a restore can still send).
-    let context = source.create_share_snapshot_context(
+    let context = source.create_share_snapshot_context_with_observer(
         &snapshot_path,
         &projects,
         preset,
         share::SnapshotPurpose::PrivateArchive,
+        &mut |event| match event {
+            share::SnapshotPhaseEvent::Started(phase) => diagnostics.start(phase.into()),
+            share::SnapshotPhaseEvent::Finished(phase) => {
+                if diagnostics.enabled()
+                    && matches!(
+                        phase,
+                        share::SnapshotPhase::Snapshot | share::SnapshotPhase::Finalize
+                    )
+                    && let Ok(metadata) = std::fs::metadata(&snapshot_path)
+                {
+                    diagnostics.snapshot_bytes(metadata.len());
+                }
+                diagnostics.finish();
+            }
+        },
     )?;
 
+    diagnostics.start(ArchivePhase::Metadata);
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
+    diagnostics.snapshot_bytes(snapshot_size);
     let destination_name = destination
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -85681,10 +86627,12 @@ fn archive_save_state_internal(
         .prefix("mailbox-archive-zip-")
         .tempdir_in(&archive_dir)?;
     let temp_zip_path = zip_dir.path().join("mailbox-state.zip");
+    diagnostics.finish();
 
     use zip::DateTime;
     use zip::write::SimpleFileOptions;
 
+    diagnostics.start(ArchivePhase::Zip);
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -85700,7 +86648,7 @@ fn archive_save_state_internal(
     // metadata.json
     zip.start_file(ARCHIVE_METADATA_FILENAME, base_options)
         .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
-    zip.write_all(metadata_json.as_bytes())?;
+    diagnostics.write_entry(&mut zip, metadata_json.as_bytes())?;
 
     // snapshot/mailbox.sqlite3
     let snapshot_zip_name = ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/");
@@ -85711,9 +86659,11 @@ fn archive_save_state_internal(
     )
     .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
     let mut snapshot_file = std::fs::File::open(&snapshot_path)?;
-    std::io::copy(&mut snapshot_file, &mut zip)?;
+    diagnostics.copy_entry(&mut snapshot_file, &mut zip)?;
+    diagnostics.finish();
 
     // storage_repo/*
+    diagnostics.start(ArchivePhase::Enumerate);
     let mut files = Vec::new();
     let excluded_storage_paths =
         archive_storage_excluded_relative_paths(storage_root, source.reported_path());
@@ -85722,8 +86672,12 @@ fn archive_save_state_internal(
         storage_root,
         &excluded_storage_paths,
         &mut files,
+        diagnostics,
     )?;
     files.sort();
+    diagnostics.finish();
+    // Keep the existing write/enumerate/write order and compression settings.
+    diagnostics.start(ArchivePhase::Zip);
     for rel in files {
         let full_path = storage_root.join(&rel);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -85733,17 +86687,19 @@ fn archive_save_state_internal(
         zip.start_file(zip_name, base_options.unix_permissions(mode))
             .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
         let mut f = std::fs::File::open(&full_path)?;
-        std::io::copy(&mut f, &mut zip)?;
+        diagnostics.copy_entry(&mut f, &mut zip)?;
     }
 
     zip.finish()
         .map_err(|e| CliError::Other(format!("zip finalize error: {e}")))?;
+    if diagnostics.enabled()
+        && let Ok(metadata) = std::fs::metadata(&temp_zip_path)
+    {
+        diagnostics.archive_bytes(metadata.len());
+    }
+    diagnostics.finish();
 
-    std::fs::rename(&temp_zip_path, &destination)?;
-
-    let size_bytes = std::fs::metadata(&destination)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size_bytes = publish_archive_zip(&temp_zip_path, &destination, diagnostics)?;
     let projects_desc = if projects.is_empty() {
         vec!["all".to_string()]
     } else {
@@ -85763,6 +86719,22 @@ fn archive_save_state_internal(
     );
 
     Ok(destination)
+}
+
+fn publish_archive_zip(
+    temp_zip_path: &Path,
+    destination: &Path,
+    diagnostics: &ArchiveDiagnostics,
+) -> CliResult<u64> {
+    diagnostics.start(ArchivePhase::Publish);
+    // Keep publication on the existing same-filesystem atomic rename path.
+    std::fs::rename(temp_zip_path, destination)?;
+    let size_bytes = std::fs::metadata(destination).map(|metadata| metadata.len());
+    if let Ok(bytes) = size_bytes {
+        diagnostics.archive_bytes(bytes);
+    }
+    diagnostics.finish();
+    Ok(size_bytes.unwrap_or(0))
 }
 
 #[allow(dead_code)]
@@ -86093,6 +87065,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             projects,
             scrub_preset,
             label,
+            diagnostics,
         } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let source_path = cfg
@@ -86108,8 +87081,16 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             let config = Config::from_env();
             let storage_root = config.storage_root;
 
-            let _path =
-                archive_save_state(&source_db, &storage_root, projects, scrub_preset, label)?;
+            let diagnostics = ArchiveDiagnostics::new(diagnostics);
+            let _path = archive_save_state_internal(
+                &source_db,
+                &storage_root,
+                projects,
+                scrub_preset,
+                label,
+                true,
+                &diagnostics,
+            )?;
             Ok(())
         }
         ArchiveCommand::List {

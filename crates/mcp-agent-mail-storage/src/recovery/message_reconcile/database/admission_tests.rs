@@ -130,6 +130,222 @@ fn database_evidence(cx: &Cx, pool: &DbPool) -> Value {
     json!({"messages": messages, "receipts": receipts})
 }
 
+/// Run with an actual drain blocked at the archive fence. Backdate only the
+/// enqueue timestamp so the test exercises minutes of lag without sleeping
+/// for minutes; queue accounting, drain, lag sampling and reconciliation are
+/// the production paths. `fixture` isolates their process-global state.
+fn with_queued_archive_lag(config: &Config, age: Duration, test: impl FnOnce()) {
+    crate::wbq_start();
+    // Publication admission is reentrant on its owning thread. Keep the owner
+    // separate from both this caller and the WBQ so real repair attempts must
+    // observe contention instead of inheriting the fixture's authority.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let _fence = crate::ArchiveMutationGuard::begin();
+        ready_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(30))
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let wbq = crate::WBQ.get().unwrap();
+    let sender = wbq.sender.lock().unwrap().as_ref().unwrap().clone();
+    let op = crate::WriteOp::ClearSignal {
+        config: config.clone(),
+        project_slug: "project".into(),
+        agent_name: "GreenStone".into(),
+    };
+    assert!(
+        crate::wbq_try_send_counted(
+            &sender,
+            &wbq.op_depth,
+            crate::WbqMsg::Op(crate::WbqOpEnvelope {
+                enqueued_at: Instant::now().checked_sub(age).unwrap(),
+                op: Box::new(op),
+            }),
+            Some(&wbq.lifecycle),
+        )
+        .is_ok()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lag = crate::archive_lag_snapshot();
+        if lag.wbq_inflight_oldest_age_us >= crate::duration_as_micros_u64(age) {
+            assert!(lag.oldest_unmaterialized_us >= lag.wbq_inflight_oldest_age_us);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WBQ drain never entered its batch"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    test();
+    release_tx.send(()).unwrap();
+    owner.join().unwrap().unwrap();
+    assert_eq!(crate::wbq_flush_status(), crate::WbqFlushOutcome::Drained);
+    crate::wbq_shutdown();
+    assert_eq!(crate::archive_lag_snapshot().oldest_unmaterialized_us, 0);
+}
+
+#[test]
+fn archive_lag_grace_leaves_queued_mail_to_drain_then_reconciles_orphans() {
+    fixture(|cx, pool, config| {
+        let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!("UPDATE messages SET created_ts = {created}"))
+            .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (
+                    report.scanned,
+                    report.repaired,
+                    report.deferred,
+                    report.retry_len
+                ),
+                (0, 0, 0, 0),
+                "still-queued mail must not contend with its drain: {report:?}"
+            );
+            assert!(!report.budget_exhausted);
+            assert_eq!(database_evidence(cx, pool), before);
+        });
+        // No failure ticket was needed: once the actual queue drains, ordinary
+        // scanning must repair same-process orphans on the next bounded pass.
+        let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!((report.repaired, report.deferred), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_does_not_hide_pre_restart_mail() {
+    fixture(|cx, pool, config| {
+        let now = mcp_agent_mail_db::now_micros();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!(
+            "UPDATE messages SET created_ts = {}",
+            now - 60 * 1_000_000
+        ))
+        .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::settled_before(now - 30 * 1_000_000);
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (2, 2, 2),
+                "old-process mail must reach repair despite new-process queue lag"
+            );
+        });
+        let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!((report.repaired, report.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_does_not_hide_known_failed_writes() {
+    fixture(|cx, pool, config| {
+        let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!("UPDATE messages SET created_ts = {created}"))
+            .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let failed = crate::WriteOp::MessageBundle {
+            config: config.clone(),
+            project_slug: prepared.project_slug,
+            message_json: prepared.message,
+            body_md: prepared.body,
+            sender: prepared.sender,
+            recipients: prepared.recipients,
+            extra_paths: Vec::new(),
+        };
+        durability::record_failures(std::iter::once(&failed));
+        assert!(crate::durability_degraded());
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let mut cursor = ReconcileCursor::default();
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (1, 1, 1),
+                "the failed-write lane must bypass normal-scan grace"
+            );
+            assert_eq!(cursor.retries.front().unwrap().id, 901);
+            assert!(crate::durability_degraded());
+        });
+        // Release the refusal only through real archive publication and proof,
+        // never by resetting the ledger or ignoring its retry backoff.
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(report.repaired, 2);
+        assert!(!crate::durability_degraded());
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_is_capped_for_stalled_or_unrelated_work() {
+    fixture(|cx, pool, config| {
+        let now = mcp_agent_mail_db::now_micros();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!(
+            "UPDATE messages SET created_ts = {} WHERE id = 901; \
+             UPDATE messages SET created_ts = {} WHERE id = 902",
+            now - 700 * 1_000_000,
+            now - 60 * 1_000_000,
+        ))
+        .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(3_600), || {
+            let mut cursor = ReconcileCursor::default();
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (1, 1, 1),
+                "an hour of lag may shield recent mail, but not an old orphan"
+            );
+            assert_eq!(cursor.retries.front().unwrap().id, 901);
+        });
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(report.repaired, 2);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_saturates_extreme_measurements_without_losing_startup_anchor() {
+    assert_eq!(normal_archive_cutoff(1_000_000_000, 0, 0), 970_000_000);
+    assert_eq!(
+        normal_archive_cutoff(1_000_000_000, 0, u64::MAX),
+        370_000_000
+    );
+    assert_eq!(
+        normal_archive_cutoff(1_000_000_000, 990_000_000, u64::MAX),
+        990_000_000
+    );
+    assert_eq!(normal_archive_cutoff(i64::MIN, 0, u64::MAX), 0);
+}
+
 fn seed_outbox(config: &Config, prepared: &PreparedMessage) -> (std::path::PathBuf, Vec<u8>) {
     let archive = crate::ensure_archive(config, &prepared.project_slug).unwrap();
     let paths = crate::message_paths_for_bundle(
@@ -317,6 +533,362 @@ fn busy_global_fence_preserves_existing_mail_and_releases_database_admission() {
 #[test]
 fn busy_global_fence_defers_missing_archive_initialization_and_revisits_live_mail() {
     exercise_busy_fence(false);
+}
+
+fn while_publication_fence_is_held<T>(observe: impl FnOnce() -> T) -> T {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        crate::with_archive_snapshot_publication_fence(|| {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20))
+        })
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = observe();
+    let _ = release_tx.send(());
+    assert!(owner.join().unwrap().is_ok(), "fence owner timed out");
+    result
+}
+
+#[test]
+fn complete_bundles_verify_without_acquiring_the_global_publication_fence() {
+    fixture(|cx, pool, config| {
+        let initial = reconcile_message_batch(
+            cx,
+            pool,
+            config,
+            &mut ReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(initial.repaired, 2);
+        crate::flush_async_commits();
+        let before_db = database_evidence(cx, pool);
+        let before = crate::archive_epoch_read_stamp(&config.storage_root)
+            .unwrap()
+            .unwrap();
+        let (report, owner_held, writers) = while_publication_fence_is_held(|| {
+            let report = reconcile_message_batch(
+                cx,
+                pool,
+                config,
+                &mut ReconcileCursor::default(),
+                &AtomicBool::new(false),
+            );
+            (
+                report,
+                crate::archive_publication_fence_holder().is_some(),
+                active_writer_count(),
+            )
+        });
+        let report = report.unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.unchanged,
+                report.repaired,
+                report.deferred
+            ),
+            (2, 2, 0, 0),
+            "{report:?}"
+        );
+        assert!(owner_held);
+        assert_eq!(writers, 0);
+        assert_eq!(database_evidence(cx, pool), before_db);
+        assert_eq!(
+            crate::archive_epoch_read_stamp(&config.storage_root).unwrap(),
+            Some(before)
+        );
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+    });
+}
+
+#[test]
+fn complete_failed_bundle_requires_guarded_verification_before_clearing_durability_debt() {
+    fixture(|cx, pool, config| {
+        durability::clear_by_operator();
+        let stop = AtomicBool::new(false);
+        let initial =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(initial.repaired, 2);
+        crate::flush_async_commits();
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let failed = crate::WriteOp::MessageBundle {
+            config: config.clone(),
+            project_slug: prepared.project_slug.clone(),
+            message_json: prepared.message.clone(),
+            body_md: prepared.body.clone(),
+            sender: prepared.sender.clone(),
+            recipients: prepared.recipients.clone(),
+            extra_paths: Vec::new(),
+        };
+        // The real failure ledger can outlive a completed archive write, for
+        // example when acknowledgement failed after publication. Complete
+        // files do not make its refusal an ordinary read-only observation.
+        durability::record_failures(std::iter::once(&failed));
+        assert!(crate::durability_degraded());
+        assert!(durability::ticket_for(config, &prepared).is_some());
+        let before_db = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let (report, refused, retained) = while_publication_fence_is_held(|| {
+            (
+                reconcile_message_batch(cx, pool, config, &mut cursor, &stop),
+                crate::durability_degraded(),
+                durability::ticket_for(config, &prepared).is_some(),
+            )
+        });
+        let report = report.unwrap();
+        assert_eq!(
+            (report.scanned, report.unchanged, report.deferred_transient),
+            (2, 1, 1),
+            "only the healthy companion may use read-only verification: {report:?}"
+        );
+        assert!(
+            refused && retained,
+            "an observation cannot clear durability debt"
+        );
+        assert_eq!(database_evidence(cx, pool), before_db);
+
+        // Failure-ledger seeding plus the refused attempt owns a cooldown.
+        // Advance only its scheduling hint, without waiting on wall time or
+        // changing the retained ticket/source/archive proof obligations.
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!(resumed.deferred, 0, "{resumed:?}");
+        assert!(resumed.unchanged > 0, "{resumed:?}");
+        assert!(!crate::durability_degraded());
+        assert!(durability::ticket_for(config, &prepared).is_none());
+        assert_eq!(database_evidence(cx, pool), before_db);
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn missing_committed_copy_cannot_be_reported_as_an_unchanged_bundle() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let retained = config.storage_root.join("retained-inbox.md");
+        fs::rename(&paths.inbox[0], &retained).unwrap();
+        let bytes = fs::read(&retained).unwrap();
+        let stop = AtomicBool::new(false);
+        let error = while_publication_fence_is_held(|| {
+            reconcile_prepared_inner(
+                config,
+                &prepared,
+                Some(RepairControl { cx, stop: &stop }),
+                false,
+            )
+        })
+        .unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(!paths.inbox[0].exists());
+        assert_eq!(fs::read(&retained).unwrap(), bytes);
+        assert_eq!(
+            reconcile_prepared(config, &prepared).unwrap().files_created,
+            1
+        );
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn uncommitted_complete_files_still_require_repair_publication_admission() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        crate::flush_async_commits();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let full = crate::render_message_bundle_content(&prepared.message, &prepared.body).unwrap();
+        let inbox = crate::render_message_bundle_content(
+            &crate::redact_message_bcc_for_inbox(&prepared.message),
+            &prepared.body,
+        )
+        .unwrap();
+        for (path, bytes) in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .map(|path| (path, &full))
+            .chain(paths.inbox.iter().map(|path| (path, &inbox)))
+        {
+            crate::ensure_parent_dir(path).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let error = while_publication_fence_is_held(|| {
+            reconcile_prepared_inner(
+                config,
+                &prepared,
+                Some(RepairControl { cx, stop: &stop }),
+                false,
+            )
+        })
+        .unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(
+            CommittedMessages::open(&archive)
+                .unwrap()
+                .file_identity(&archive, &paths.canonical)
+                .is_err()
+        );
+        let repaired = reconcile_prepared(config, &prepared).unwrap();
+        assert_eq!(repaired.files_created, 0);
+        assert!(repaired.git_commit_needed);
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn read_only_verification_keeps_staged_conflicting_identity_visible() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let original = fs::read(&paths.canonical).unwrap();
+        let mut conflicting = prepared.message.clone();
+        conflicting["reply_to"] = json!(701);
+        fs::write(
+            &paths.canonical,
+            crate::render_message_bundle_content(&conflicting, &prepared.body).unwrap(),
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let mut index = repo.index().unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        index.add_path(Path::new(&relative)).unwrap();
+        index.write().unwrap();
+        fs::write(&paths.canonical, &original).unwrap();
+        let before_index = fs::read(repo.path().join("index")).unwrap();
+        let before_head = repo.head().unwrap().target();
+        let error = verify_prepared_without_mutation(config, &prepared, None).unwrap_err();
+        assert!(
+            error.detail.contains("staged canonical payload conflicts"),
+            "{error:?}"
+        );
+        assert!(!error.transient);
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), before_index);
+        assert_eq!(repo.head().unwrap().target(), before_head);
+        assert_eq!(fs::read(&paths.canonical).unwrap(), original);
+    });
+}
+
+#[test]
+fn read_only_verification_retries_when_archive_epoch_changes_during_its_reads() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let root = config.storage_root.clone();
+        let before = crate::archive_epoch_read_stamp(&root).unwrap();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    drop(crate::ArchiveMutationGuard::begin_at(&root));
+                }
+            }));
+        });
+        let stop = AtomicBool::new(false);
+        let result = verify_prepared_without_mutation(
+            config,
+            &prepared,
+            Some(RepairControl { cx, stop: &stop }),
+        );
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        assert!(fired.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert_ne!(
+            crate::archive_epoch_read_stamp(&config.storage_root).unwrap(),
+            before
+        );
+        assert!(verify_prepared_without_mutation(config, &prepared, None).unwrap());
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn read_only_verification_retries_when_head_changes_even_with_identical_tree() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let before = CommittedMessages::open(&archive).unwrap();
+        let root = config.storage_root.clone();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    // An external Git writer need not use our process-local
+                    // mutation counter. Change actual HEAD without changing
+                    // any tree object or on-disk message bytes.
+                    let repo = git2::Repository::open(&root).unwrap();
+                    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+                    let tree = parent.tree().unwrap();
+                    let signature = git2::Signature::now("test", "test@example.invalid").unwrap();
+                    repo.commit(
+                        Some("HEAD"),
+                        &signature,
+                        &signature,
+                        "advance HEAD during read-only verification",
+                        &tree,
+                        &[&parent],
+                    )
+                    .unwrap();
+                }
+            }));
+        });
+        let stop = AtomicBool::new(false);
+        let result = verify_prepared_without_mutation(
+            config,
+            &prepared,
+            Some(RepairControl { cx, stop: &stop }),
+        );
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        assert!(fired.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        let after = CommittedMessages::open(&archive).unwrap();
+        assert_ne!(before.head_id, after.head_id);
+        assert_eq!(before.tree_id, after.tree_id);
+        assert!(verify_prepared_without_mutation(config, &prepared, None).unwrap());
+    });
 }
 
 #[test]

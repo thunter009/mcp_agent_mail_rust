@@ -3485,21 +3485,13 @@ pub async fn force_release_file_reservation(
                 );
                 mcp_agent_mail_db::search_service::note_message_ingested();
                 let all_recipient_names = vec![holder_agent_name.clone()];
-                let msg_json = serde_json::json!({
-                    "id": message_id,
-                    "from": &agent_name,
-                    "to": &all_recipient_names,
-                    "cc": [],
-                    "bcc": [],
-                    "subject": &message.subject,
-                    "created": micros_to_iso(message.created_ts),
-                    "thread_id": &message.thread_id,
-                    "project": &project.human_key,
-                    "project_slug": &project.slug,
-                    "importance": &message.importance,
-                    "ack_required": message.ack_required != 0,
-                    "attachments": [],
-                });
+                let msg_json = crate::messaging::notice_archive_json(
+                    &message,
+                    &agent_name,
+                    &all_recipient_names,
+                    &project.human_key,
+                    &project.slug,
+                );
 
                 try_write_message_archive(
                     &Config::get(),
@@ -4111,10 +4103,10 @@ mod tests {
                 let winner_cx = cx.clone();
                 AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
                     *hook = Some(Box::pin(async move {
-                        let winner_ctx = McpContext::new(winner_cx, 2);
+                        let request_context = McpContext::new(winner_cx, 2);
                         let pressure = ReservationDiskPressure::critical();
                         let winner_error = file_reservation_paths(
-                            &winner_ctx,
+                            &request_context,
                             winner_project,
                             winner_agent,
                             vec!["src/lib.rs".to_string()],

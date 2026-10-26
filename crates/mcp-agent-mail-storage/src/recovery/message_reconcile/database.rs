@@ -42,6 +42,7 @@ const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_DB_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const NORMAL_ARCHIVE_GRACE_US: i64 = 30 * 1_000_000;
+const MAX_ARCHIVE_LAG_GRACE_US: u64 = 10 * 60 * 1_000_000;
 const MAX_RETRY_IDS: usize = 1024;
 const MAX_RETRIES_PER_PASS: usize = 16;
 const MAX_IDS_PER_PASS: usize = 32;
@@ -369,6 +370,23 @@ fn interleave_ids(tail: &[i64], history: &[i64], history_first: bool) -> Vec<(i6
     selected
 }
 
+fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u64) -> i64 {
+    // A fixed grace mistakes still-queued mail for lost mail when WBQ falls
+    // behind. Its repair then competes for the publication fence with the
+    // very drain and reservation writers that need to make progress (br-9ott5).
+    // Lag is a process-wide scheduling hint, never proof that a particular
+    // message is queued. Bound its effect so unrelated or stalled archive
+    // work cannot hide a genuinely lost message indefinitely.
+    let lag_grace_us =
+        i64::try_from(archive_lag_us.min(MAX_ARCHIVE_LAG_GRACE_US)).unwrap_or(i64::MAX);
+    now_us
+        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
+        .saturating_sub(lag_grace_us)
+        // A restarted worker cannot own the prior process's queued mail.
+        // Known failures also bypass this cutoff through the retry lane.
+        .max(settled_before_us)
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -583,18 +601,25 @@ fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
 ) -> Result<ReconcileResult, String> {
-    reconcile_prepared_inner(config, prepared, None).map_err(|error| error.detail)
+    reconcile_prepared_inner(config, prepared, None, false).map_err(|error| error.detail)
 }
 
 fn reconcile_prepared_inner(
     config: &Config,
     prepared: &PreparedMessage,
     control: Option<RepairControl<'_>>,
+    require_guarded_proof: bool,
 ) -> Result<ReconcileResult, ReconcileFailure> {
+    if !require_guarded_proof && verify_prepared_without_mutation(config, prepared, control)? {
+        return Ok(ReconcileResult::default());
+    }
     // Admit before ensure_archive: even creating a missing archive must not
     // wait behind an unrelated publisher while retaining the DB source lease.
-    // Nested bundle publication retains this same native mutation window.
-    let _mutation = control
+    // Keep mutable metadata collection in one native mutation window. Bundle
+    // repair revalidates the captured bytes before publishing, so release this
+    // window before its immutable Git-history proof: scanning old messages must
+    // not exclude unrelated live archive writers.
+    let metadata_mutation = control
         .map(|control| control.begin_at(&config.storage_root))
         .transpose()?;
     let archive = crate::ensure_archive(config, &prepared.project_slug)?;
@@ -707,6 +732,7 @@ fn reconcile_prepared_inner(
         recipients: &prepared.recipients,
         extra_paths: &[],
     };
+    drop(metadata_mutation);
     match control {
         Some(control) => super::reconcile_message_bundle_cancellable(
             control.cx,
@@ -720,10 +746,89 @@ fn reconcile_prepared_inner(
     .map_err(ReconcileFailure::from)
 }
 
+/// Observe an already complete, committed bundle without taking the global
+/// publication fence. This can only report unchanged: every missing, damaged,
+/// uncommitted, or otherwise unproven bundle still uses guarded repair.
+///
+/// Equal stamps detect local mutation windows and observed remote epoch/HEAD
+/// changes. A remote mutation window can span both samples, so this is not a
+/// publication or deletion authorization. A stale unchanged observation merely
+/// leaves repair for a later sweep, as can a write immediately after a fenced
+/// observation. Keep all reads pinned to one HEAD and retain source revalidation.
+fn verify_prepared_without_mutation(
+    config: &Config,
+    prepared: &PreparedMessage,
+    control: Option<RepairControl<'_>>,
+) -> Result<bool, ReconcileFailure> {
+    super::checkpoint(control)?;
+    let Some(archive) = crate::open_archive(config, &prepared.project_slug)? else {
+        return Ok(false);
+    };
+    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
+        return Ok(false);
+    };
+    let changed = || crate::StorageError::LockContention {
+        message: "archive changed during read-only message verification; retry required".into(),
+    };
+    let committed = CommittedMessages::open(&archive)?;
+    if before.generation.head != committed.head_id {
+        return Err(changed().into());
+    }
+    if !matches!(
+        verify_retention_archive_at(&archive, prepared, &mut 0, &committed, control),
+        Ok(Some(_))
+    ) {
+        super::checkpoint(control)?;
+        return Ok(false);
+    }
+    // A staged canonical collision remains conflicting evidence even when
+    // every expected disk/HEAD copy is intact. Reuse the same bounded identity
+    // gate as publication, bracketed by the pinned HEAD checks because its
+    // own preflight opens HEAD independently.
+    if !committed.same_head(&archive)? {
+        return Err(changed().into());
+    }
+    let paths = crate::message_paths_for_bundle(
+        &archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )?
+    .0;
+    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+    let expected = committed.file_identity(&archive, &paths.canonical)?.0;
+    let mut budget = super::CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
+    if !super::identity::preflight(
+        &committed.repo,
+        &archive,
+        prepared.message["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| super::invalid("message has no positive archive identity"))?,
+        &canonical,
+        expected,
+        false,
+        &mut budget,
+    )? {
+        return Ok(false);
+    }
+    super::checkpoint(control)?;
+    if !committed.same_head(&archive)?
+        || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
+    {
+        return Err(changed().into());
+    }
+    Ok(true)
+}
+
 /// Immutable Git observation for all surviving copies of one message.
 /// Holding the tree identity avoids mixing metadata from separate HEADs.
 struct CommittedMessages {
     repo: git2::Repository,
+    head_id: Option<git2::Oid>,
     tree_id: Option<git2::Oid>,
 }
 
@@ -733,19 +838,31 @@ impl CommittedMessages {
             crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let tree_id = match repo.head() {
-            Ok(head) => Some(head.peel_to_tree().map_err(|error| error.to_string())?.id()),
+        let (head_id, tree_id) = match repo.head() {
+            Ok(head) => {
+                let commit = head.peel_to_commit().map_err(|error| error.to_string())?;
+                (Some(commit.id()), Some(commit.tree_id()))
+            }
             Err(error)
                 if matches!(
                     error.code(),
                     git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
                 ) =>
             {
-                None
+                (None, None)
             }
             Err(error) => return Err(error.to_string()),
         };
-        Ok(Self { repo, tree_id })
+        Ok(Self {
+            repo,
+            head_id,
+            tree_id,
+        })
+    }
+
+    fn same_head(&self, archive: &ProjectArchive) -> Result<bool, String> {
+        let current = Self::open(archive)?;
+        Ok(self.head_id == current.head_id && self.tree_id == current.tree_id)
     }
 
     fn file_identity(
@@ -844,7 +961,9 @@ impl CommittedMessages {
 /// archive work per pass. SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
-/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
+/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace
+/// plus observed archive lag, capped at ten additional minutes. Pre-startup
+/// rows and known failed-write retries remain eligible during that grace.
 /// No row, receipt, delivery, notification or thread digest is mutated. Transient
 /// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
 /// with a cooldown. Retries never bypass source or archive authority checks.
@@ -897,9 +1016,11 @@ fn reconcile_message_batch_inner(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
-    let cutoff = mcp_agent_mail_db::now_micros()
-        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
-        .max(cursor.settled_before_us);
+    let cutoff = normal_archive_cutoff(
+        mcp_agent_mail_db::now_micros(),
+        cursor.settled_before_us,
+        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+    );
     let selected = {
         // The selection itself must not enter a pool while promotion owns
         // admission. Refusal leaves both scan positions untouched.
@@ -1013,6 +1134,11 @@ fn reconcile_message_batch_inner(
                         config,
                         &prepared,
                         Some(RepairControl { cx, stop }),
+                        // Clearing a failed-write refusal consumes an archive
+                        // proof, so even unchanged failed mail must retain the
+                        // original guarded verification. The optimistic path
+                        // is only an observation for ordinary maintenance.
+                        ticket.is_some(),
                     );
                     if result.is_ok() {
                         durability::confirm_repaired(
@@ -1079,6 +1205,18 @@ fn verify_retention_archive(
     prepared: &PreparedMessage,
     admitted_bytes: &mut usize,
 ) -> Result<Option<usize>, String> {
+    let committed = CommittedMessages::open(archive)?;
+    verify_retention_archive_at(archive, prepared, admitted_bytes, &committed, None)
+}
+
+fn verify_retention_archive_at(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    admitted_bytes: &mut usize,
+    committed: &CommittedMessages,
+    control: Option<RepairControl<'_>>,
+) -> Result<Option<usize>, String> {
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
         archive,
         &prepared.message,
@@ -1089,7 +1227,6 @@ fn verify_retention_archive(
     .0;
     let attachments = super::attachments::required_paths(archive, &prepared.message)
         .map_err(|error| error.to_string())?;
-    let committed = CommittedMessages::open(archive)?;
     let mut expected = Vec::new();
     let mut bundle_bytes = 0_usize;
     let mut message_bytes = 0_usize;
@@ -1098,6 +1235,7 @@ fn verify_retention_archive(
         .chain(paths.inbox.iter().map(|path| (path, true)))
         .chain(attachments.iter().map(|path| (path, false)))
     {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, size) = committed.file_identity(archive, path)?;
         if message && size > super::MAX_MESSAGE_ARTIFACT_BYTES {
             return Err("retention message exceeds the archive artifact byte bound".into());
@@ -1119,6 +1257,7 @@ fn verify_retention_archive(
     *admitted_bytes += bundle_bytes;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires committed canonical and outbox copies")?;
@@ -1130,6 +1269,7 @@ fn verify_retention_archive(
         )?;
     }
     for path in &paths.inbox {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires every committed recipient inbox copy")?;
@@ -1143,6 +1283,7 @@ fn verify_retention_archive(
     // Reuse attachment path, size and content-digest validation. The preceding
     // inventory requires committed blobs even when repair could use a proven
     // uncommitted original. This verifier never creates or commits files.
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let files = super::attachments::prepare(
         &committed.repo,
         archive,
@@ -1151,6 +1292,7 @@ fn verify_retention_archive(
     )
     .map_err(|error| error.to_string())?;
     for (path, bytes) in files {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, _) = committed.file_identity(archive, &path)?;
         if git2::Oid::hash_object_ext(git2::ObjectType::Blob, &bytes, oid.object_format())
             .map_err(|error| error.to_string())?
@@ -1161,6 +1303,7 @@ fn verify_retention_archive(
     }
     let current = CommittedMessages::open(archive)?;
     for (path, oid) in expected {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         if current.file_identity(archive, path)?.0 != oid {
             return Err("retention archive changed during verification".into());
         }
@@ -1617,6 +1760,129 @@ mod tests {
         let original = prepared();
         let archive = crate::ensure_archive(&config, &original.project_slug).unwrap();
         (temp, config, original, archive)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply() {
+        use super::super::cancellable_tests::{ObserveScan, isolated};
+        use std::fs;
+        use std::sync::atomic::Ordering;
+
+        if isolated() {
+            return;
+        }
+        for replace_survivor in [false, true] {
+            let (_temp, config, original, archive) = git_fixture();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let mut full = original.message.clone();
+            full["reply_to"] = json!(7);
+            full["future_metadata"] = json!({"opaque": ["keep", 42]});
+            let redacted = crate::redact_message_bcc_for_inbox(&full);
+            let survivor_bytes =
+                crate::render_message_bundle_content(&redacted, &original.body).unwrap();
+            crate::ensure_parent_dir(&paths.inbox[0]).unwrap();
+            fs::write(&paths.inbox[0], survivor_bytes.as_bytes()).unwrap();
+            let history = archive.root.join("messages/2025/01/other.md");
+            commit_survivors(&archive, &[(&history, &json!({"id": 99}))], "history");
+            let other = crate::ensure_archive(&config, "reservation-peer").unwrap();
+            let op = crate::WriteOp::FileReservation {
+                project_slug: other.slug.clone(),
+                config: config.clone(),
+                reservations: vec![json!({
+                    "id": 1, "agent": "GreenCastle", "path_pattern": "src/**",
+                    "exclusive": true, "reason": "unrelated reservation",
+                    "created_ts": "2026-10-01T00:00:00Z", "expires_ts": "2030-10-01T00:00:00Z",
+                })],
+            };
+            let mut replacement = redacted.clone();
+            replacement["reply_to"] = json!(8);
+            replacement["future_metadata"] = json!({"concurrent": "preserve"});
+            let replacement_bytes =
+                crate::render_message_bundle_content(&replacement, &original.body).unwrap();
+            let replacement_for_hook = replacement_bytes.clone();
+            let survivor = paths.inbox[0].clone();
+            let visited = std::sync::Arc::new(AtomicBool::new(false));
+            let hook_visited = visited.clone();
+            let observer = ObserveScan::new(move |stage| {
+                if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let op = op.clone();
+                let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
+                    .join()
+                    .unwrap();
+                assert!(
+                    matches!(result, crate::DirectArchiveWrite::Written),
+                    "{result:?}"
+                );
+                crate::flush_async_commits();
+                if replace_survivor {
+                    fs::write(&survivor, replacement_for_hook.as_bytes()).unwrap();
+                }
+            });
+            let cx = Cx::for_testing();
+            let stop = AtomicBool::new(false);
+            let result = reconcile_prepared_inner(
+                &config,
+                &original,
+                Some(RepairControl {
+                    cx: &cx,
+                    stop: &stop,
+                }),
+                true,
+            );
+            drop(observer);
+            assert!(visited.load(Ordering::Acquire));
+            let reservation: Value = serde_json::from_slice(
+                &fs::read(other.root.join("file_reservations/id-1.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reservation["agent"], "GreenCastle");
+            assert_eq!(reservation["path_pattern"], "src/**");
+            if replace_survivor {
+                let error = result.unwrap_err();
+                assert!(error.detail.contains("conflict"), "{}", error.detail);
+                assert!(!paths.canonical.exists());
+                assert!(!paths.outbox.exists());
+                assert!(!paths.inbox[1].exists());
+                assert_eq!(
+                    fs::read(&paths.inbox[0]).unwrap(),
+                    replacement_bytes.as_bytes()
+                );
+            } else {
+                let repaired = result.unwrap();
+                assert_eq!(repaired.files_created, 3);
+                assert!(repaired.git_commit_needed);
+                for path in [&paths.canonical, &paths.outbox] {
+                    let (message, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(message, full);
+                    assert_eq!(body, original.body);
+                }
+                for path in &paths.inbox {
+                    assert_eq!(fs::read(path).unwrap(), survivor_bytes.as_bytes());
+                }
+                let repo = git2::Repository::open(&archive.repo_root).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(paths.inbox.iter())
+                {
+                    let relative =
+                        crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let entry = tree.get_path(std::path::Path::new(&relative)).unwrap();
+                    let blob = repo.find_blob(entry.id()).unwrap();
+                    assert_eq!(blob.content(), fs::read(path).unwrap().as_slice());
+                }
+            }
+        }
     }
 
     #[test]

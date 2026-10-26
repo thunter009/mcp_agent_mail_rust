@@ -136,7 +136,11 @@ migration runner subsequently records the migrations and performs dependent
 work. When columns are added, canonical record materialization preserves
 legacy row values before runtime reads resume. Replay rechecks missing IDs in
 its write transaction and leaves already present messages untouched. If
-post-apply inventories still disagree, startup stops without reconstructing.
+post-apply inventories still disagree, the reconcile fails without
+reconstructing; a primary that passed its health check keeps serving, with the
+drift left pending for the periodic retry. The startup warning says to run
+`am doctor health`, then `am doctor reconstruct --yes` to retry under
+supervision.
 A replay/schema error rolls back and stops reconciliation without
 reconstructing a healthy primary. Existing corruption recovery still has its
 separate health checks and recovery admission controls.
@@ -470,6 +474,18 @@ and payloads for inspection, resume, or restore. Successful move receipts do
 not authorize deletion. Unrecognized material and failed or interrupted backup
 stages remain recovery evidence.
 
+Empty native rotation directories are also removed, including directories
+emptied by the current reclamation pass. This releases directory inodes as well
+as backup-file storage. Cleanup inspects only immediate, strictly named native
+rotation directories and uses an empty-directory removal through retained
+directory handles. Unknown directories, nested trees, manifests, and active
+directory readers or staging operations remain protected. A bounded empty-only
+sweep runs before the full backup inventory, so an old installation with more
+than 16,384 empty rotation directories can drain over successive passes instead
+of remaining permanently blocked by the inventory limit. Each rotation removes
+at most 128 empty directories across its pre-inventory and post-reclamation
+sweeps. Explicit `AM_BACKUP_ROTATION_DELETE=false` also disables this cleanup.
+
 Automatic exporters also have admission limits so refused reclamation cannot
 silently produce unlimited new copies. The periodic count limit is
 `keep_count + 3`, including retained historical periodic files. The projected
@@ -515,26 +531,66 @@ Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
 retention and disables the extra repair export; automatic publication stops at
 the same admission limits when staging cannot release space. Leaving the
 variable unset enables the verified periodic reclamation policy. Setting it
-to `true` also enables the older incident-artifact deletion behavior, so it is
-broader than the default periodic policy.
+to `true` also allows incident-backup reclamation. On Unix, this requires an
+older, standalone SQLite image with a fully verified successor, matching
+mailbox lineage or exact duplicate bytes, and the same pin, reader, hardlink,
+and namespace checks used for periodic generations. Corrupt or insufficiently
+verified incident evidence stays available even with explicit deletion enabled.
+Platforms without the verified descriptor-bound deletion boundary preserve
+incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
+
+Retention also holds the existing database recovery election from selection
+through reclamation. A live recovery, an occupied legacy `.recovery.lock`, or
+an unresolved recovery receipt ending in `.pending` prevents cleanup. The
+verified survivor's inode, links, timestamps, and companion state are checked
+again before each destructive operation. Explicit CLI restore holds the same
+election before copying its backup, so retention cannot remove its source
+during staging. Resolve pending recovery operations through recovery tooling;
+removing their markers does not establish that their evidence is disposable.
 
 Startup and publication logs report `bytes_staged`, `bytes_deleted`,
-`bytes_reclaimed`, and `bytes_retained`. Staged and retained values are logical
-file lengths still occupying storage. Deleted bytes are the logical lengths
-of confirmed removals; reclaimed bytes count the allocated blocks associated
-with verified periodic unlinks. The latter is not a measurement of the
+`bytes_reclaimed`, and `bytes_retained`; scheduled retention also reports
+`empty_directories_deleted` separately from backup payload counts and bytes.
+Staged and retained values are logical file lengths still occupying storage.
+Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
+count the allocated blocks associated with verified backup unlinks. The latter
+is not a measurement of the
 filesystem's free-space delta: filesystem snapshots and shared storage can
 retain blocks independently. Refused operations retain their byte accounting.
-An incomplete inventory refuses mutations and marks totals as lower bounds;
-uncertain moves or unlinks have separate counters rather than being reported
+An incomplete inventory refuses backup-file mutations and marks totals as lower
+bounds; the separately admitted empty-directory sweep can still make progress.
+Uncertain moves or unlinks have separate counters rather than being reported
 as successful reclamation. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
 current database's size. One oversized candidate can still be attempted so a
 large mailbox can make progress. Verifying the pinned restore point adds I/O
 beyond that candidate budget. A shared progress cursor keeps refused older
 files from repeatedly preventing examination of the remaining backlog.
+Explicit incident reclamation has a separate 128-candidate allowance and the
+same candidate-byte limit, so incident verification cannot spend the periodic
+queue's entire cleanup allowance.
 Bounded cleanup passes can leave more work for a later attempt; the publication
 limit remains in force while that work is pending.
+
+`am doctor health` prints a `backup_retention:` line for this state. It reads
+`storage.sqlite3.bak.meta.json` the way a verified backup would and computes
+the producer's count and byte footprint with the same rule as admission. An
+unversioned sidecar written by v0.3.13 through v0.3.30 is a warning: the next
+verified backup keeps it as a `.legacy-<sha256>.json` sibling and replaces it.
+Health fails (exit 1) when verified backups cannot replace the sidecar
+(malformed, foreign, from a newer format, or not a regular file), because
+verified backups then keep failing and rotation keeps every backup generation.
+It also fails when the footprint is at the publication limit, because
+automatic backups are then paused. For an unrecognized sidecar, move it aside
+and keep it as evidence; the next verified backup records fresh metadata.
+While automatic backups are paused, retention can delete superseded
+generations only after a verified backup has recorded current metadata, and
+the server makes at most one verified repair backup while over the limit. If
+health still does not show `snapshot_metadata=current` after the next backup
+attempt, stop the server and remove old `storage.sqlite3.bak.<timestamp>`
+files by hand, keeping `storage.sqlite3.bak` and the newest few. Generations
+that retention cannot tie to this mailbox also stay where they are; if
+`backup_images` stops falling, remove them the same way.
 
 ## 14. Plan archive pack maintenance [read-only]
 
@@ -580,3 +636,108 @@ saved baseline file you can compare later.
 **Troubleshooting:** If you only care about a subset, rerun with `--filter`.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
+
+## 16. Diagnose archive save phases [stateful]
+
+**Goal:** Locate time spent in `archive save` using elapsed times and aggregate
+file/byte counters, without adding mailbox contents or credentials to diagnostic
+records. This addresses the missing phase visibility reported in
+[GH#365](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/365);
+it does not establish the cause of that report's slow saves.
+
+**Build requirement:** `--diagnostics` requires a build containing this change.
+The installed v0.3.39 from the issue does not support the option. Source builds
+may still report package version `0.3.39`, so check the actual binary's command
+help instead of relying on its version string:
+
+```bash
+# From a checkout containing the archive diagnostics change:
+cargo build --locked --release -p mcp-agent-mail-cli --features portable --bin am
+./target/release/am archive save --help
+```
+
+Confirm that the help lists `--diagnostics`. Help does not create an archive.
+Use that exact binary with the existing save command only against a disposable
+replica or within the already approved offline run. Keep its working directory,
+mailbox configuration, supervisor recovery procedure, and timeout unchanged;
+this recipe does not require an additional live-mailbox outage.
+
+```bash
+# Existing offline run or isolated replica only; replace these placeholders.
+/abs/path/checkout/target/release/am archive save \
+  --project /abs/path/project \
+  --scrub-preset archive \
+  --label nightly \
+  --diagnostics 2>/abs/path/archive-save.stderr.log
+```
+
+Keep the archive output directory and the captured log outside `STORAGE_ROOT`.
+The option is off by default. Existing stdout and exit behavior are preserved;
+additional records are written to stderr with the prefix
+`archive_save_diagnostic`. Phase start, completion, and failure records are
+immediate. While a phase is running, there is at most one periodic record per
+five seconds on the reporter's cadence, rather than a line for each file. A
+periodic record may occur close to a phase boundary. `heartbeat=1` means the
+periodic worker started; `heartbeat=0` means it could not start and only phase
+boundaries are available. Times use a monotonic clock: total elapsed
+milliseconds since the save began and elapsed milliseconds in the current
+phase occurrence. Numeric counters and elapsed times saturate rather than
+wrapping on overflow.
+
+| Phase | Work being measured |
+|---|---|
+| `prepare` | Argument, path, and mailbox-lock preparation |
+| `snapshot_source` | Resolve the canonical source, including any existing private-source fallback |
+| `snapshot` | Create the private SQLite snapshot |
+| `filter` | Select projects and remove out-of-scope rows from the snapshot |
+| `scrub` | Apply the requested scrub preset and snapshot-purpose policy |
+| `finalize` | Rebuild snapshot storage, search indexes, views, and statistics |
+| `archive_metadata` | Prepare the existing archive metadata |
+| `zip_writing` | Write and compress ZIP members, then finish the ZIP |
+| `storage_enumeration` | Walk the existing storage selection and sort members |
+| `publication` | Atomically rename the completed temporary ZIP into place |
+
+`zip_writing` can appear before and after `storage_enumeration`: the existing
+save order writes metadata and the snapshot before enumerating the storage
+tree. Elapsed time for each occurrence starts at that occurrence's start.
+
+File and byte-work counters are cumulative within one invocation.
+`snapshot_bytes` and `archive_bytes` are size gauges, reporting the most recent
+observation rather than adding repeated measurements; a snapshot can shrink
+during finalization. A zero size gauge can mean it has not yet been measured.
+Interpret all values with the current phase:
+
+| Counter | Meaning |
+|---|---|
+| `storage_files` | Regular storage files selected by the existing traversal |
+| `storage_bytes` | Sum of known selected-file sizes; incomplete when `storage_size_unknown` is nonzero |
+| `storage_size_unknown` | Selected files whose size could not be obtained for diagnostics |
+| `zip_files` | ZIP entries whose input payload was fully accepted, including metadata and snapshot entries |
+| `zip_bytes` | Uncompressed bytes accepted by the ZIP writer, including a partially written current entry |
+| `snapshot_bytes` | Observed snapshot file size |
+| `archive_bytes` | Observed compressed size of the completed ZIP |
+
+Even after an entry's input is fully accepted, final compression and the ZIP
+central directory may still be pending until `zip_writing` completes.
+
+These are observations, not a completion percentage or an ETA. SQLite work can
+continue while file/byte counters stay unchanged. A heartbeat indicates that
+the diagnostic reporter is running; it does not prove that the current
+operation is advancing, and silence after forced termination cannot produce a
+failure record. Phase timing alone does not prove deadlock, establish a
+reconciliation backlog, or attribute cost to recovery-directory size.
+
+Only the prefixed diagnostic records have the content-free contract: fixed
+phase/status names and numeric times/counters, with no file paths, project
+selectors, labels, message bodies, credentials, SQL, or raw error strings.
+Normal command output and existing errors can still contain paths and other
+operator details. To retain just the phase records for review:
+
+```bash
+rg '^archive_save_diagnostic ' /abs/path/archive-save.stderr.log \
+  > /abs/path/archive-save.diagnostics.log
+```
+
+The flag does not alter locking, project filtering, scrub semantics, compression
+settings, archive members, restore format, or atomic publication. It does not
+exclude or delete recovery evidence, and it does not change the offline limit.
