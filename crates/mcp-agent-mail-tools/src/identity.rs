@@ -177,11 +177,14 @@ async fn register_agent_db_with_retry(
     }
 }
 
-/// Maximum fresh-name draws for a no-name `register_agent` before giving up.
+/// Maximum fresh-name draws for a no-name `register_agent` before the
+/// unused-name scan in [`claim_fresh_auto_named_agent`] takes over.
 ///
-/// The adjective+noun namespace has tens of thousands of combinations, so 16
-/// consecutive collisions only happens when a project's registry is heavily
-/// saturated — at that point a clear error beats an unbounded loop.
+/// The adjective+noun namespace holds 9,900 names (75 adjectives × 132 nouns),
+/// and every registered, retired, or deregistered agent keeps its name. Random
+/// draws are cheap while most names are free, but in a crowded project they
+/// mostly collide: with 95% of the names taken, all 16 draws collide 44% of
+/// the time.
 pub const AUTO_NAME_MAX_DRAWS: u32 = 16;
 
 /// Claim a FRESH auto-generated agent name (GH#213).
@@ -199,7 +202,9 @@ pub const AUTO_NAME_MAX_DRAWS: u32 = 16;
 /// concurrent writer wins the unique `(project_id, name)` constraint — a
 /// SELECT-based/constraint-based detection, deliberately not `changes()`,
 /// which reports 0 under FrankenSQLite). On collision it redraws, bounded by
-/// [`AUTO_NAME_MAX_DRAWS`].
+/// [`AUTO_NAME_MAX_DRAWS`]. When every draw collides, it reads the project
+/// roster and claims the names no row holds yet, so a crowded project still
+/// registers until its last name is gone.
 ///
 /// The registration proof gate is enforced per candidate name, before any row
 /// is written, preserving the "proof is checked against the final agent name"
@@ -220,22 +225,151 @@ pub async fn claim_fresh_auto_named_agent(
     first_candidate: String,
     mut draw_name: impl FnMut() -> String,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    const CREATE_AGENT_TOOL_RETRIES: u32 = 4;
+    let claim = AutoNameClaim {
+        ctx,
+        pool,
+        project_key,
+        project_id,
+        program,
+        model,
+        task_description,
+        attachments_policy,
+        registration_proof,
+    };
     let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut candidate = first_candidate;
     for _draw in 0..AUTO_NAME_MAX_DRAWS {
+        if let Some(row) = claim.try_name(&candidate).await? {
+            return Ok(row);
+        }
+        tracing::info!(
+            project_id,
+            candidate = %candidate,
+            "register_agent: auto-generated name collided with an existing agent; \
+             redrawing instead of merging (GH#213)"
+        );
+        tried.insert(candidate);
+        // Redraw, skipping names this call already saw collide.
+        let mut next = draw_name();
+        for _ in 0..32 {
+            if !tried.contains(&next) {
+                break;
+            }
+            next = draw_name();
+        }
+        candidate = next;
+    }
+
+    // Every draw collided, so the project holds most of the namespace. Claim
+    // from the names no row holds yet. Start at a time-derived offset so
+    // concurrent callers spread across the free names instead of all racing
+    // for the first one.
+    let unused = unused_agent_names(ctx, pool, project_id).await?;
+    let pool_size = mcp_agent_mail_core::models::VALID_ADJECTIVES.len()
+        * mcp_agent_mail_core::models::VALID_NOUNS.len();
+    if unused.is_empty() {
+        return Err(legacy_tool_error(
+            "CONFLICT",
+            format!(
+                "Could not auto-generate an unused agent name: all {pool_size} adjective+noun \
+                 names in this project belong to registered, retired, or deregistered agents, \
+                 so no generated or explicit name can register. Use another project_key, or \
+                 have an operator remove dead agents."
+            ),
+            false,
+            json!({
+                "project_id": project_id,
+                "attempts": AUTO_NAME_MAX_DRAWS,
+                "pool_size": pool_size,
+                "unused_names": 0,
+            }),
+        ));
+    }
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u64, |d| u64::from(d.subsec_nanos()));
+    let start = usize::try_from(now_ns).unwrap_or(0) % unused.len();
+    let scan_len = unused
+        .len()
+        .min(usize::try_from(AUTO_NAME_MAX_DRAWS).unwrap_or(usize::MAX));
+    for candidate in unused.iter().cycle().skip(start).take(scan_len) {
+        if let Some(row) = claim.try_name(candidate).await? {
+            return Ok(row);
+        }
+    }
+
+    Err(legacy_tool_error(
+        "CONFLICT",
+        format!(
+            "Could not auto-generate an unused agent name after {AUTO_NAME_MAX_DRAWS} draws \
+             and {scan_len} unused-name claims; concurrent registrations took each one. Retry."
+        ),
+        true,
+        json!({
+            "project_id": project_id,
+            "attempts": AUTO_NAME_MAX_DRAWS,
+            "pool_size": pool_size,
+            "unused_names": unused.len(),
+        }),
+    ))
+}
+
+/// Valid adjective+noun names that no agent row of the project holds,
+/// in namespace order. Retired and deregistered agents keep their names.
+async fn unused_agent_names(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+) -> McpResult<Vec<String>> {
+    let agents = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), pool, project_id).await,
+    )?;
+    let taken: std::collections::HashSet<String> = agents
+        .iter()
+        .map(|agent| agent.name.to_ascii_lowercase())
+        .collect();
+    Ok(mcp_agent_mail_core::models::VALID_ADJECTIVES
+        .iter()
+        .flat_map(|adjective| {
+            mcp_agent_mail_core::models::VALID_NOUNS
+                .iter()
+                .map(move |noun| format!("{adjective}{noun}"))
+        })
+        .filter(|raw| !taken.contains(&raw.to_ascii_lowercase()))
+        .filter_map(|raw| mcp_agent_mail_core::models::normalize_agent_name(&raw))
+        .collect())
+}
+
+/// The fixed inputs of one auto-named registration.
+struct AutoNameClaim<'a> {
+    ctx: &'a McpContext,
+    pool: &'a mcp_agent_mail_db::DbPool,
+    project_key: &'a str,
+    project_id: i64,
+    program: &'a str,
+    model: &'a str,
+    task_description: Option<&'a str>,
+    attachments_policy: &'a str,
+    registration_proof: Option<&'a str>,
+}
+
+impl AutoNameClaim<'_> {
+    /// Insert a new agent under `candidate`. `Ok(None)` means another row
+    /// already holds the name.
+    async fn try_name(&self, candidate: &str) -> McpResult<Option<mcp_agent_mail_db::AgentRow>> {
+        const CREATE_AGENT_TOOL_RETRIES: u32 = 4;
         // Proof gate per candidate: no-op when disabled, fail-closed (before
         // any DB write) when enabled.
         crate::proof_gate::enforce(
-            ctx.cx(),
-            pool,
+            self.ctx.cx(),
+            self.pool,
             &crate::proof_gate::RegistrationRequest {
-                agent_name: &candidate,
-                project_key,
-                program,
-                model,
+                agent_name: candidate,
+                project_key: self.project_key,
+                program: self.program,
+                model: self.model,
                 granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-                proof: registration_proof,
+                proof: self.registration_proof,
             },
         )
         .await?;
@@ -245,14 +379,14 @@ pub async fn claim_fresh_auto_named_agent(
         let mut busy_attempt: u32 = 0;
         let out = loop {
             let out = mcp_agent_mail_db::queries::create_agent(
-                ctx.cx(),
-                pool,
-                project_id,
-                &candidate,
-                program,
-                model,
-                task_description,
-                Some(attachments_policy),
+                self.ctx.cx(),
+                self.pool,
+                self.project_id,
+                candidate,
+                self.program,
+                self.model,
+                self.task_description,
+                Some(self.attachments_policy),
             )
             .await;
 
@@ -277,49 +411,16 @@ pub async fn claim_fresh_auto_named_agent(
         };
 
         match out {
-            Outcome::Ok(row) => return Ok(row),
-            Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
-                tracing::info!(
-                    project_id,
-                    candidate = %candidate,
-                    "register_agent: auto-generated name collided with an existing agent; \
-                     redrawing instead of merging (GH#213)"
-                );
-                tried.insert(candidate);
-                // Redraw, skipping names this call already saw collide.
-                let mut next = draw_name();
-                for _ in 0..32 {
-                    if !tried.contains(&next) {
-                        break;
-                    }
-                    next = draw_name();
-                }
-                candidate = next;
-            }
-            Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            Outcome::Panicked(p) => {
-                return Err(McpError::internal_error(format!(
-                    "Internal panic: {}",
-                    p.message()
-                )));
-            }
+            Outcome::Ok(row) => Ok(Some(row)),
+            Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => Ok(None),
+            Outcome::Err(other) => Err(db_error_to_mcp_error(other)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+                "Internal panic: {}",
+                p.message()
+            ))),
         }
     }
-
-    Err(legacy_tool_error(
-        "CONFLICT",
-        format!(
-            "Could not auto-generate an unused agent name after {AUTO_NAME_MAX_DRAWS} draws; \
-             this project's adjective+noun namespace is heavily used. \
-             Retry, or pass an explicit unused `name`."
-        ),
-        true,
-        json!({
-            "project_id": project_id,
-            "attempts": AUTO_NAME_MAX_DRAWS,
-        }),
-    ))
 }
 
 /// Build recovery status for the `health_check` response.

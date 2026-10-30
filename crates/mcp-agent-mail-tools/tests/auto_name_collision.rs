@@ -9,7 +9,9 @@
 //!
 //! These tests pin the fixed semantics:
 //! - auto-name collision redraws and leaves the existing agent untouched;
-//! - redraw exhaustion surfaces a clear CONFLICT error, never a merge;
+//! - when every random draw collides, the unused-name scan still finds the
+//!   last free names of a crowded project;
+//! - a fully used namespace surfaces a clear CONFLICT error, never a merge;
 //! - explicit-name re-registration keeps its documented upsert semantics.
 
 use asupersync::Cx;
@@ -67,6 +69,58 @@ where
 
 fn parse_json(payload: &str) -> Value {
     serde_json::from_str(payload).expect("tool response must be valid JSON")
+}
+
+/// Every valid adjective+noun agent name, in namespace order.
+fn all_agent_names() -> Vec<String> {
+    mcp_agent_mail_core::models::VALID_ADJECTIVES
+        .iter()
+        .flat_map(|adjective| {
+            mcp_agent_mail_core::models::VALID_NOUNS
+                .iter()
+                .map(move |noun| format!("{adjective}{noun}"))
+        })
+        .filter_map(|raw| mcp_agent_mail_core::models::normalize_agent_name(&raw))
+        .collect()
+}
+
+/// Insert bare agent rows so `names` count as taken in the project.
+async fn seed_agent_names(cx: &Cx, project_id: i64, names: &[String]) {
+    let pool = get_db_pool().expect("db pool");
+    let conn = pool.acquire(cx).await.into_result().expect("checkout");
+    conn.execute_raw("BEGIN IMMEDIATE").expect("begin seed");
+    for chunk in names.chunks(200) {
+        let values = chunk
+            .iter()
+            .map(|name| format!("({project_id}, '{name}', 'seed', 'seed', '', 1, 1)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_raw(&format!(
+            "INSERT INTO agents (project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts) VALUES {values}"
+        ))
+        .expect("seed taken names");
+    }
+    conn.execute_raw("COMMIT").expect("commit seed");
+}
+
+/// The `(type, recoverable)` pair of a legacy tool error.
+fn error_kind(err: &fastmcp::McpError) -> (String, Option<bool>) {
+    let error = err
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|root| root.get("error"));
+    (
+        error
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        error
+            .and_then(|e| e.get("recoverable"))
+            .and_then(Value::as_bool),
+    )
 }
 
 async fn register_explicit(
@@ -166,8 +220,9 @@ fn auto_name_collision_redraws_without_touching_existing_agent() {
     });
 }
 
-/// Redraw exhaustion (every draw collides) must surface a clear CONFLICT
-/// error — and still never mutate the existing agent.
+/// A fully used namespace (every name held by some agent row) must surface a
+/// clear, non-recoverable CONFLICT error — and still never mutate the
+/// existing agent.
 #[test]
 fn auto_name_exhaustion_errors_instead_of_merging() {
     run_serial_async(|cx| async move {
@@ -190,6 +245,11 @@ fn auto_name_exhaustion_errors_instead_of_merging() {
         )
         .await;
         let core_id = core["id"].as_i64().expect("core agent id");
+        let rest: Vec<String> = all_agent_names()
+            .into_iter()
+            .filter(|name| name != "BlueLake")
+            .collect();
+        seed_agent_names(&cx, project_id, &rest).await;
 
         let pool = get_db_pool().expect("db pool");
         let err = claim_fresh_auto_named_agent(
@@ -208,16 +268,11 @@ fn auto_name_exhaustion_errors_instead_of_merging() {
         .await
         .expect_err("exhausted namespace must error, never merge");
 
-        let error_type = err
-            .data
-            .as_ref()
-            .and_then(Value::as_object)
-            .and_then(|root| root.get("error"))
-            .and_then(|e| e.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(error_type, "CONFLICT", "exhaustion error code");
+        assert_eq!(
+            error_kind(&err),
+            ("CONFLICT".to_string(), Some(false)),
+            "a full namespace is a non-recoverable CONFLICT: retrying cannot help"
+        );
         assert!(
             err.message.contains("auto-generate"),
             "message should explain the auto-name exhaustion: {}",
@@ -346,33 +401,8 @@ fn create_agent_identity_without_hint_redraws_past_taken_names() {
         );
         let project_id = project["id"].as_i64().expect("project id");
 
-        let taken: Vec<String> = mcp_agent_mail_core::models::VALID_ADJECTIVES
-            .iter()
-            .flat_map(|adjective| {
-                mcp_agent_mail_core::models::VALID_NOUNS
-                    .iter()
-                    .map(move |noun| format!("{adjective}{noun}"))
-            })
-            .filter_map(|raw| mcp_agent_mail_core::models::normalize_agent_name(&raw))
-            .step_by(4)
-            .collect();
-        let pool = get_db_pool().expect("db pool");
-        let conn = pool.acquire(&cx).await.into_result().expect("checkout");
-        conn.execute_raw("BEGIN IMMEDIATE").expect("begin seed");
-        for chunk in taken.chunks(200) {
-            let values = chunk
-                .iter()
-                .map(|name| format!("({project_id}, '{name}', 'seed', 'seed', '', 1, 1)"))
-                .collect::<Vec<_>>()
-                .join(",");
-            conn.execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, \
-                 inception_ts, last_active_ts) VALUES {values}"
-            ))
-            .expect("seed taken names");
-        }
-        conn.execute_raw("COMMIT").expect("commit seed");
-        drop(conn);
+        let taken: Vec<String> = all_agent_names().into_iter().step_by(4).collect();
+        seed_agent_names(&cx, project_id, &taken).await;
         let taken: std::collections::HashSet<String> =
             taken.iter().map(|name| name.to_ascii_lowercase()).collect();
 
@@ -400,5 +430,88 @@ fn create_agent_identity_without_hint_redraws_past_taken_names() {
             assert!(!taken.contains(&lower), "{name} was already taken");
             assert!(created.insert(lower), "{name} was handed out twice");
         }
+    });
+}
+
+/// bd-5pbf: a project that holds all but two of the 9,900 names. 16 random
+/// draws find a free name about 0.3% of the time, so before the unused-name
+/// scan almost every no-name registration here failed with CONFLICT. Both
+/// auto-naming tools must now claim the free names, then report a full
+/// namespace as non-recoverable.
+#[test]
+fn crowded_namespace_registers_its_last_free_names() {
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/crowded-namespace-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = parse_json(
+            &ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project"),
+        );
+        let project_id = project["id"].as_i64().expect("project id");
+
+        let mut names = all_agent_names();
+        let free = [names.remove(names.len() / 2), names.remove(0)];
+        seed_agent_names(&cx, project_id, &names).await;
+
+        let registered = parse_json(
+            &register_agent(
+                &ctx,
+                project_key.clone(),
+                "crowded-fleet".to_string(),
+                "opus-4.5".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("no-name register_agent must find a free name"),
+        );
+        let created = parse_json(
+            &create_agent_identity(
+                &ctx,
+                project_key.clone(),
+                "crowded-fleet".to_string(),
+                "opus-4.5".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await
+            .expect("no-hint create_agent_identity must find a free name"),
+        );
+        let mut claimed = [
+            registered["name"].as_str().expect("agent name").to_string(),
+            created["name"].as_str().expect("agent name").to_string(),
+        ];
+        claimed.sort();
+        let mut expected = free;
+        expected.sort();
+        assert_eq!(claimed, expected, "the two free names, one each");
+
+        let err = register_agent(
+            &ctx,
+            project_key.clone(),
+            "crowded-fleet".to_string(),
+            "opus-4.5".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a full namespace must refuse a no-name registration");
+        assert_eq!(error_kind(&err), ("CONFLICT".to_string(), Some(false)));
     });
 }
